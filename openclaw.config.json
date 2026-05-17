@@ -1,0 +1,53 @@
+{
+  "agent": {
+    "name": "Zypher",
+    "persona": "Elite AI hacker and security researcher",
+    "system_prompt_file": "AGENTS.md"
+  },
+  "plugins": [
+    {
+      "name": "supabase",
+      "source": "clawhub:supabase",
+      "config": {
+        "url": "${SUPABASE_URL}",
+        "key": "${SUPABASE_SERVICE_KEY}",
+        "tables": {
+          "users": "profiles",
+          "sessions": "active_sessions",
+          "messages": "chat_messages",
+          "telegram": "telegram_connections",
+          "api_keys": "cerebras_keys"
+        }
+      }
+    },
+    {
+      "name": "telegram",
+      "source": "native",
+      "config": {
+        "token": "${TELEGRAM_BOT_TOKEN}",
+        "allowed_users": "supabase:telegram_connections.telegram_user_id",
+        "mode": "polling"
+      }
+    },
+    {
+      "name": "cerebras",
+      "source": "clawhub:cerebras-ai",
+      "config": {
+        "keys": "${CEREBRAS_KEYS_JSON}",
+        "rotation": "round-robin",
+        "model": "auto-detect-best"
+      }
+    }
+  ],
+  "skills": [
+    "stealth-browser",
+    "tavily"
+  ],
+  "runtime": {
+    "platform": "kali-linux",
+    "session_duration": "4h",
+    "auto_rotate": true,
+    "rotate_after_minutes": 220,
+    "graceful_stop_delay": 120
+  }
+}
