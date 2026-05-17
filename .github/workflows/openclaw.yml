@@ -1,0 +1,177 @@
+name: Zypher OpenClaw Agent
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_number:
+        description: 'Instance number for tracking'
+        required: false
+        default: '1'
+  schedule:
+    - cron: '0 */4 * * *'
+
+jobs:
+  run-agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 235
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Kali Linux repositories and tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            nmap nikto sqlmap gobuster dirb hydra \
+            curl wget git jq netcat-openbsd whois dnsutils \
+            python3 python3-pip python3-venv \
+            openssl libssl-dev build-essential \
+            net-tools iputils-ping traceroute \
+            john hashcat wordlists 2>/dev/null || true
+          echo "Kali tools installed"
+
+      - name: Install OpenClaw
+        run: |
+          npm install -g openclaw 2>/dev/null || npm install -g @openclaw/cli 2>/dev/null || true
+          # Fallback: use npx
+          npx openclaw --version 2>/dev/null || true
+          echo "OpenClaw setup done"
+
+      - name: Install ClawHub skills
+        run: |
+          mkdir -p ~/.openclaw/skills
+          # Install stealth-browser skill
+          npx openclaw plugins install clawhub:stealth-browser 2>/dev/null || \
+          npx clawhub install stealth-browser 2>/dev/null || \
+          npm install -g clawhub 2>/dev/null || true
+          # Install tavily skill
+          npx openclaw plugins install clawhub:tavily 2>/dev/null || true
+          echo "Skills installation attempted"
+
+      - name: Install Python dependencies for Telegram bridge
+        run: |
+          pip3 install -q \
+            python-telegram-bot==20.7 \
+            cerebras-cloud-sdk \
+            tavily-python \
+            supabase \
+            httpx \
+            requests 2>/dev/null || \
+          pip3 install -q \
+            python-telegram-bot \
+            supabase \
+            httpx \
+            requests 2>/dev/null || true
+
+      - name: Copy AGENTS.md
+        run: cp AGENTS.md ~/.openclaw/AGENTS.md 2>/dev/null || true
+
+      - name: Register session in Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          curl -s -X POST "$SUPABASE_URL/rest/v1/active_sessions" \
+            -H "apikey: $SUPABASE_SERVICE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"github_run_id\": \"$GITHUB_RUN_ID\",
+              \"workflow_name\": \"openclaw.yml\",
+              \"instance_number\": ${{ github.event.inputs.instance_number || 1 }},
+              \"is_active\": true,
+              \"expires_at\": \"$(date -u -d '+4 hours' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -v+4H '+%Y-%m-%dT%H:%M:%SZ')\"
+            }" || echo "Session registration failed (non-critical)"
+
+      - name: Configure OpenClaw agent
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          CEREBRAS_KEY_1: ${{ secrets.CEREBRAS_KEY_1 }}
+          CEREBRAS_KEY_2: ${{ secrets.CEREBRAS_KEY_2 }}
+          CEREBRAS_KEY_3: ${{ secrets.CEREBRAS_KEY_3 }}
+          CEREBRAS_KEY_4: ${{ secrets.CEREBRAS_KEY_4 }}
+          CEREBRAS_KEY_5: ${{ secrets.CEREBRAS_KEY_5 }}
+          TAVILY_KEY_1: ${{ secrets.TAVILY_KEY_1 }}
+          TAVILY_KEY_2: ${{ secrets.TAVILY_KEY_2 }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          mkdir -p ~/.openclaw
+          cat > ~/.openclaw/config.json << CONF
+          {
+            "telegram": {
+              "token": "$TELEGRAM_BOT_TOKEN",
+              "enabled": true
+            },
+            "supabase": {
+              "url": "$SUPABASE_URL",
+              "key": "$SUPABASE_SERVICE_KEY"
+            },
+            "ai": {
+              "provider": "cerebras",
+              "keys": ["$CEREBRAS_KEY_1","$CEREBRAS_KEY_2","$CEREBRAS_KEY_3","$CEREBRAS_KEY_4","$CEREBRAS_KEY_5"],
+              "rotation": "round-robin"
+            },
+            "search": {
+              "provider": "tavily",
+              "keys": ["$TAVILY_KEY_1","$TAVILY_KEY_2"]
+            },
+            "agents_file": "AGENTS.md",
+            "session_id": "$GITHUB_RUN_ID"
+          }
+          CONF
+
+      - name: Start Zypher Telegram Agent
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          CEREBRAS_KEY_1: ${{ secrets.CEREBRAS_KEY_1 }}
+          CEREBRAS_KEY_2: ${{ secrets.CEREBRAS_KEY_2 }}
+          CEREBRAS_KEY_3: ${{ secrets.CEREBRAS_KEY_3 }}
+          CEREBRAS_KEY_4: ${{ secrets.CEREBRAS_KEY_4 }}
+          CEREBRAS_KEY_5: ${{ secrets.CEREBRAS_KEY_5 }}
+          TAVILY_KEY_1: ${{ secrets.TAVILY_KEY_1 }}
+          TAVILY_KEY_2: ${{ secrets.TAVILY_KEY_2 }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+          GITHUB_REPO: ${{ github.repository }}
+          INSTANCE_NUMBER: ${{ github.event.inputs.instance_number || 1 }}
+        run: |
+          python3 scripts/zypher_agent.py &
+          AGENT_PID=$!
+          echo "Agent started with PID $AGENT_PID"
+
+          # Wait 3h40m then trigger rotation
+          sleep 13200
+
+          echo "Triggering rotation workflow..."
+          NEXT_INSTANCE=$(( ${{ github.event.inputs.instance_number || 1 }} + 1 ))
+          curl -s -X POST \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/$GITHUB_REPO/actions/workflows/openclaw.yml/dispatches" \
+            -d "{\"ref\":\"main\",\"inputs\":{\"instance_number\":\"$NEXT_INSTANCE\"}}"
+
+          # Give new instance 2 min to start
+          sleep 120
+
+          # Mark this session as done in Supabase
+          curl -s -X PATCH "$SUPABASE_URL/rest/v1/active_sessions?github_run_id=eq.$GITHUB_RUN_ID" \
+            -H "apikey: $SUPABASE_SERVICE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+            -H "Content-Type: application/json" \
+            -d '{"is_active": false}' || true
+
+          # Stop the old agent gracefully
+          kill -TERM $AGENT_PID 2>/dev/null || true
+          wait $AGENT_PID 2>/dev/null || true
+          echo "Agent stopped, new instance running"
