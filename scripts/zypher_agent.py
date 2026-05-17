@@ -1,74 +1,115 @@
 #!/usr/bin/env python3
 """
-Zypher AI Agent - Telegram bridge for OpenClaw on Kali Linux
-Connects Telegram users to the Zypher AI (powered by Cerebras)
-with Tavily web search and full Kali Linux tool access.
+Zypher AI Agent — Telegram bridge for OpenClaw on Kali Linux
+Fixed: smart context trimming to stay within Cerebras 8192 token limit.
 """
 
-import os
-import sys
-import json
-import asyncio
-import logging
-import subprocess
+import os, json, asyncio, logging, urllib.request, urllib.parse
 from datetime import datetime, timezone
 from typing import Optional
 
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+logging.basicConfig(format='%(asctime)s %(levelname)s %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ── Environment ──────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN   = os.environ["TELEGRAM_BOT_TOKEN"]
-SUPABASE_URL     = os.environ.get("SUPABASE_URL", "https://beglgkjaejuvhqhddqfh.supabase.co")
-SUPABASE_KEY     = os.environ.get("SUPABASE_SERVICE_KEY", "")
-GITHUB_RUN_ID    = os.environ.get("GITHUB_RUN_ID", "local")
+# ── Env ───────────────────────────────────────────────────────────────────────
+TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+SUPABASE_URL   = os.environ.get("SUPABASE_URL", "https://beglgkjaejuvhqhddqfh.supabase.co")
+SUPABASE_KEY   = os.environ.get("SUPABASE_SERVICE_KEY", "")
+GITHUB_RUN_ID  = os.environ.get("GITHUB_RUN_ID", "local")
 
-CEREBRAS_KEYS = [
+CEREBRAS_KEYS = [k for k in [
     os.environ.get("CEREBRAS_KEY_1", ""),
     os.environ.get("CEREBRAS_KEY_2", ""),
     os.environ.get("CEREBRAS_KEY_3", ""),
     os.environ.get("CEREBRAS_KEY_4", ""),
     os.environ.get("CEREBRAS_KEY_5", ""),
-]
-CEREBRAS_KEYS = [k for k in CEREBRAS_KEYS if k]
+] if k]
 
-TAVILY_KEYS = [
+TAVILY_KEYS = [k for k in [
     os.environ.get("TAVILY_KEY_1", "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"),
     os.environ.get("TAVILY_KEY_2", "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"),
-]
+] if k]
 
-# ── Key rotation state ────────────────────────────────────────────────────────
 _cerebras_idx = 0
 _tavily_idx   = 0
-_conversation: dict[int, list] = {}   # telegram_user_id -> message history
+_conversation: dict[int, list] = {}
 
-AGENTS_MD_PATH = os.path.join(os.path.dirname(__file__), "..", "AGENTS.md")
+# ── Token budget ──────────────────────────────────────────────────────────────
+# Cerebras hard limit: 8192 tokens total (input + output)
+MAX_INPUT_TOKENS   = 6000   # input budget (leaves ~2192 for output)
+MAX_HISTORY_TURNS  = 8      # max conversation turns to keep
+MAX_MSG_CHARS      = 900    # truncate any single message beyond this
+MAX_TOOL_CHARS     = 1800   # cap tool/search output
 
-def load_system_prompt() -> str:
-    try:
-        with open(AGENTS_MD_PATH) as f:
-            return f.read()
-    except Exception:
-        return (
-            "You are Zypher, the best hacker that has ever existed. "
-            "You are installed on a Kali Linux machine. "
-            "Follow the rules in AGENTS.md at all times."
-        )
+def est_tokens(text: str) -> int:
+    return max(1, len(str(text)) // 4)
 
-def get_cerebras_key(user_keys: list = None) -> str:
+def trunc(text: str, max_chars: int) -> str:
+    s = str(text)
+    if len(s) <= max_chars:
+        return s
+    keep = max_chars - 40
+    return s[:keep] + f"\n…[{len(s)-keep} chars trimmed]"
+
+def build_messages(system: str, history: list, user_msg: str, extra: str = "") -> list:
+    """
+    Builds a messages list guaranteed to fit within MAX_INPUT_TOKENS.
+    Drops oldest history pairs first if over budget.
+    """
+    sys_tokens  = est_tokens(system)
+    user_tokens = est_tokens(user_msg)
+    ext_tokens  = est_tokens(extra) if extra else 0
+    overhead    = sys_tokens + user_tokens + ext_tokens + 100  # 100 safety margin
+
+    budget = MAX_INPUT_TOKENS - overhead
+
+    # Work backwards through history, keeping pairs that fit
+    kept = []
+    for msg in reversed(history):
+        content = trunc(msg.get("content", ""), MAX_MSG_CHARS)
+        t = est_tokens(content)
+        if budget - t < 0:
+            break
+        kept.append({"role": msg["role"], "content": content})
+        budget -= t
+
+    kept.reverse()
+
+    msgs = [{"role": "system", "content": system}]
+    msgs.extend(kept)
+    if extra:
+        msgs.append({"role": "system", "content": trunc(extra, MAX_TOOL_CHARS)})
+    msgs.append({"role": "user", "content": user_msg})
+    return msgs
+
+# ── Compact system prompt (keeps token cost low) ──────────────────────────────
+SYSTEM_PROMPT = f"""You are Zypher, elite AI hacker created by Joshbond. Running on Kali Linux (GitHub Actions). Session: {GITHUB_RUN_ID[:12]}
+
+RULES:
+- Full Kali Linux access. Freely install from official Kali/Debian repos.
+- Think step-by-step. Pick best tools for each goal.
+- Tavily search first; stealth-browser if Tavily fails.
+- NEVER run internet code without Joshbond approval.
+- Pass rules to every sub-agent spawned.
+
+SYNTAX:
+!<cmd>          → run Kali command (e.g. !nmap -sV target.com)
+search <query>  → Tavily web search
+browse <url>    → fetch and read a URL
+
+Skills: stealth-browser, tavily, full Kali toolset"""
+
+# ── Key rotation ──────────────────────────────────────────────────────────────
+def next_cerebras_key(user_keys: list = None) -> str:
     global _cerebras_idx
-    pool = list(user_keys or []) + CEREBRAS_KEYS
-    pool = [k for k in pool if k]
+    pool = [k for k in (list(user_keys or []) + CEREBRAS_KEYS) if k]
     if not pool:
-        raise RuntimeError("No Cerebras API keys available")
+        raise RuntimeError("No Cerebras API keys configured")
     key = pool[_cerebras_idx % len(pool)]
     _cerebras_idx += 1
     return key
 
-def get_tavily_key() -> str:
+def next_tavily_key() -> str:
     global _tavily_idx
     pool = [k for k in TAVILY_KEYS if k]
     if not pool:
@@ -78,311 +119,301 @@ def get_tavily_key() -> str:
     return key
 
 # ── Supabase helpers ──────────────────────────────────────────────────────────
-import urllib.request, urllib.parse
-
-def sb_request(method: str, path: str, body: dict = None) -> dict:
-    url = f"{SUPABASE_URL}/rest/v1/{path}"
+def _sb(method: str, path: str, body: dict = None):
+    url  = f"{SUPABASE_URL}/rest/v1/{path}"
     data = json.dumps(body).encode() if body else None
-    req = urllib.request.Request(
-        url, data=data, method=method,
-        headers={
-            "apikey": SUPABASE_KEY,
-            "Authorization": f"Bearer {SUPABASE_KEY}",
-            "Content-Type": "application/json",
-            "Prefer": "return=representation",
-        }
-    )
+    req  = urllib.request.Request(url, data=data, method=method,
+        headers={"apikey": SUPABASE_KEY,
+                 "Authorization": f"Bearer {SUPABASE_KEY}",
+                 "Content-Type": "application/json",
+                 "Prefer": "return=minimal"})
     try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            return json.loads(r.read())
+        with urllib.request.urlopen(req, timeout=8) as r:
+            raw = r.read()
+            return json.loads(raw) if raw else []
     except Exception as e:
-        logger.warning(f"Supabase {method} {path}: {e}")
-        return {}
+        logger.debug(f"sb {method} {path}: {e}")
+        return []
 
-def get_user_by_telegram(telegram_id: int) -> Optional[dict]:
-    try:
-        result = sb_request("GET", f"telegram_connections?telegram_user_id=eq.{telegram_id}&select=*,profiles(*)")
-        if isinstance(result, list) and result:
-            return result[0]
-    except Exception:
-        pass
-    return None
+def get_user_by_telegram(tid: int) -> Optional[dict]:
+    rows = _sb("GET", f"telegram_connections?telegram_user_id=eq.{tid}&select=*")
+    return rows[0] if isinstance(rows, list) and rows else None
 
-def get_user_cerebras_keys(user_id: str) -> list:
-    try:
-        result = sb_request("GET", f"cerebras_keys?user_id=eq.{user_id}&is_active=eq.true&select=api_key")
-        if isinstance(result, list):
-            return [r["api_key"] for r in result]
-    except Exception:
-        pass
-    return []
+def get_user_keys(uid: str) -> list:
+    rows = _sb("GET", f"cerebras_keys?user_id=eq.{uid}&is_active=eq.true&select=api_key")
+    return [r["api_key"] for r in (rows or [])]
 
-def save_message(user_id: str, role: str, content: str, session_id: str):
-    sb_request("POST", "chat_messages", {
-        "user_id": user_id,
-        "role": role,
-        "content": content,
-        "session_id": session_id,
-    })
+def persist_messages(uid: str, user_msg: str, bot_msg: str):
+    for role, content in [("user", user_msg), ("assistant", bot_msg)]:
+        _sb("POST", "chat_messages",
+            {"user_id": uid, "role": role,
+             "content": trunc(content, 3000), "session_id": GITHUB_RUN_ID})
 
-def update_key_usage(user_id: str, api_key: str, tokens: int):
-    try:
-        current = sb_request("GET", f"cerebras_keys?user_id=eq.{user_id}&api_key=eq.{urllib.parse.quote(api_key)}&select=requests_count,tokens_used")
-        if isinstance(current, list) and current:
-            sb_request("PATCH", f"cerebras_keys?user_id=eq.{user_id}&api_key=eq.{urllib.parse.quote(api_key)}", {
-                "requests_count": current[0]["requests_count"] + 1,
-                "tokens_used": current[0]["tokens_used"] + tokens,
-                "last_used_at": datetime.now(timezone.utc).isoformat(),
-            })
-    except Exception as e:
-        logger.debug(f"Usage update failed: {e}")
+def bump_key_stats(uid: str, api_key: str, tokens: int):
+    rows = _sb("GET", f"cerebras_keys?user_id=eq.{uid}&api_key=eq.{urllib.parse.quote(api_key)}&select=requests_count,tokens_used")
+    if rows:
+        _sb("PATCH", f"cerebras_keys?user_id=eq.{uid}&api_key=eq.{urllib.parse.quote(api_key)}", {
+            "requests_count": rows[0]["requests_count"] + 1,
+            "tokens_used":    rows[0]["tokens_used"] + tokens,
+            "last_used_at":   datetime.now(timezone.utc).isoformat(),
+        })
 
-# ── Tavily search ─────────────────────────────────────────────────────────────
-async def web_search(query: str) -> str:
-    key = get_tavily_key()
+# ── Tools ─────────────────────────────────────────────────────────────────────
+async def tavily_search(query: str) -> str:
+    key = next_tavily_key()
     if not key:
-        return "No search API key configured."
+        return "No Tavily key available."
     try:
-        import urllib.request as ur
-        body = json.dumps({
-            "api_key": key,
-            "query": query,
-            "max_results": 5,
-            "include_answer": True,
-        }).encode()
-        req = ur.Request("https://api.tavily.com/search", data=body,
-                          headers={"Content-Type": "application/json"})
-        with ur.urlopen(req, timeout=15) as r:
-            data = json.loads(r.read())
-        out = f"**Search: {query}**\n\n"
-        if data.get("answer"):
-            out += f"**Answer:** {data['answer']}\n\n"
-        for i, res in enumerate(data.get("results", [])[:5], 1):
-            out += f"{i}. **{res.get('title','')}**\n   {res.get('url','')}\n   {res.get('content','')[:300]}\n\n"
-        return out
+        body = json.dumps({"api_key": key, "query": query,
+                           "max_results": 4, "include_answer": True}).encode()
+        req = urllib.request.Request("https://api.tavily.com/search", data=body,
+              headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            d = json.loads(r.read())
+        out = f"Search: {query}\n\n"
+        if d.get("answer"):
+            out += f"Answer: {d['answer']}\n\n"
+        for i, res in enumerate(d.get("results", [])[:4], 1):
+            out += f"{i}. {res.get('title','')}\n   {res.get('url','')}\n   {res.get('content','')[:200]}\n\n"
+        return trunc(out, MAX_TOOL_CHARS)
     except Exception as e:
         return f"Search error: {e}"
 
-# ── Kali tool execution ───────────────────────────────────────────────────────
 BLOCKED = ["rm -rf /", "mkfs", "dd if=", "> /dev/sd", ":(){ :|:& };:"]
 
-async def run_tool(command: str) -> str:
+async def run_kali(cmd: str) -> str:
     for bad in BLOCKED:
-        if bad in command:
-            return f"⚠️ Blocked: {bad}"
+        if bad in cmd:
+            return f"Blocked: contains '{bad}'"
     try:
         proc = await asyncio.create_subprocess_shell(
-            command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
-        out = stdout.decode(errors="replace")
-        err = stderr.decode(errors="replace")
-        result = out + (f"\n[stderr]: {err}" if err else "")
-        return result[:4000] if result else "(no output)"
+            cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=90)
+        result = out.decode(errors="replace") + (
+            "\n[stderr]:\n" + err.decode(errors="replace") if err.strip() else "")
+        return trunc(result, MAX_TOOL_CHARS) or "(no output)"
     except asyncio.TimeoutError:
-        return "⏱️ Command timed out (60s)"
+        return "Timed out after 90s."
     except Exception as e:
         return f"Error: {e}"
 
-# ── Cerebras AI ───────────────────────────────────────────────────────────────
-BEST_MODELS = [
-    "llama-4-scout-17b-16e-instruct",
-    "llama3.3-70b",
-    "llama3.1-70b",
-    "qwen-3-32b",
-    "llama3.1-8b",
-]
+async def stealth_browse(url: str) -> str:
+    import re
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            html = r.read().decode(errors="replace")
+        text = re.sub(r'<(script|style)[^>]*>.*?</\1>', '', html, flags=re.DOTALL|re.I)
+        text = re.sub(r'<[^>]+>', ' ', text)
+        text = re.sub(r'\s+', ' ', text).strip()
+        return trunc(f"URL: {url}\n\n{text}", MAX_TOOL_CHARS)
+    except Exception as e:
+        return f"Browse error: {e}"
+
+# ── Cerebras model detection ──────────────────────────────────────────────────
+MODEL_PRIORITY = ["llama-4-scout-17b-16e-instruct", "llama3.3-70b",
+                  "llama-3.3-70b", "qwen-3-32b", "llama3.1-70b", "llama3.1-8b"]
 _model_cache: dict[str, str] = {}
 
-def detect_best_model(api_key: str) -> str:
+def best_model(api_key: str) -> str:
     if api_key in _model_cache:
         return _model_cache[api_key]
     try:
         from cerebras.cloud.sdk import Cerebras
-        c = Cerebras(api_key=api_key)
-        models = c.models.list()
-        available = [m.id for m in models.data]
-        for preferred in BEST_MODELS:
-            for avail in available:
-                if preferred.lower() in avail.lower():
-                    _model_cache[api_key] = avail
-                    return avail
-        if available:
-            _model_cache[api_key] = available[0]
-            return available[0]
-    except Exception as e:
-        logger.debug(f"Model detection: {e}")
+        avail = [m.id for m in Cerebras(api_key=api_key).models.list().data]
+        for pref in MODEL_PRIORITY:
+            for a in avail:
+                if pref.lower() in a.lower():
+                    _model_cache[api_key] = a
+                    return a
+        if avail:
+            _model_cache[api_key] = avail[0]
+            return avail[0]
+    except Exception:
+        pass
     _model_cache[api_key] = "llama3.3-70b"
     return "llama3.3-70b"
 
-async def ask_ai(user_id_str: str, telegram_id: int, message: str, user_cerebras_keys: list) -> tuple[str, str]:
-    """Returns (response_text, model_used)"""
-    key = get_cerebras_key(user_cerebras_keys)
-    model = detect_best_model(key)
+# ── Core AI ───────────────────────────────────────────────────────────────────
+async def ask_zypher(uid: str, tg_id: int, message: str,
+                     user_keys: list) -> tuple[str, str]:
+    history = _conversation.get(tg_id, [])
+    extra   = ""
 
-    history = _conversation.get(telegram_id, [])
-    history.append({"role": "user", "content": message})
+    msg_lower = message.lower().strip()
 
-    messages = [{"role": "system", "content": load_system_prompt()}]
-    messages += history[-30:]
-
-    # Check if message contains search intent
-    search_result = ""
-    if any(w in message.lower() for w in ["search", "find", "look up", "research", "browse", "google"]):
-        query = message.replace("search", "").replace("find", "").replace("look up", "").replace("research", "").strip()
-        if query:
-            search_result = await web_search(query)
-            messages.append({"role": "system", "content": f"Search results:\n{search_result}"})
-
-    # Check for tool execution request
+    # Pre-fetch tool context
     if message.strip().startswith("!"):
-        cmd = message.strip()[1:]
-        tool_output = await run_tool(cmd)
-        messages.append({"role": "system", "content": f"Tool output:\n{tool_output}"})
+        cmd    = message.strip()[1:].strip()
+        result = await run_kali(cmd)
+        extra  = f"Tool output for `{cmd}`:\n{result}"
 
-    try:
-        from cerebras.cloud.sdk import Cerebras
-        client = Cerebras(api_key=key)
-        resp = client.chat.completions.create(
-            messages=messages,
-            model=model,
-            max_tokens=4096,
-            temperature=0.7,
-        )
-        text = resp.choices[0].message.content
-        tokens = getattr(getattr(resp, "usage", None), "total_tokens", 0) or 0
+    elif msg_lower.startswith("browse "):
+        url    = message[7:].strip()
+        result = await stealth_browse(url)
+        extra  = result
 
-        history.append({"role": "assistant", "content": text})
-        _conversation[telegram_id] = history[-40:]
+    elif any(msg_lower.startswith(w) for w in
+             ["search ", "find ", "look up ", "research "]):
+        # Extract query after the keyword
+        query  = " ".join(message.split()[1:]).strip() or message
+        result = await tavily_search(query)
+        extra  = result
 
-        # Save to Supabase
-        if user_id_str:
-            save_message(user_id_str, "user", message, GITHUB_RUN_ID)
-            save_message(user_id_str, "assistant", text, GITHUB_RUN_ID)
-            if tokens:
-                update_key_usage(user_id_str, key, tokens)
+    # Build token-safe messages list
+    messages = build_messages(SYSTEM_PROMPT, history, message, extra)
 
-        return text, model
-    except Exception as e:
-        logger.error(f"Cerebras error: {e}")
-        # Try next key
+    # Try each key with failover
+    pool     = [k for k in (list(user_keys) + CEREBRAS_KEYS) if k]
+    last_err = "No keys"
+
+    for key in pool:
         try:
-            key2 = get_cerebras_key(user_cerebras_keys)
-            if key2 != key:
-                from cerebras.cloud.sdk import Cerebras
-                client2 = Cerebras(api_key=key2)
-                model2 = detect_best_model(key2)
-                resp2 = client2.chat.completions.create(
-                    messages=messages, model=model2, max_tokens=4096
-                )
-                text2 = resp2.choices[0].message.content
-                history.append({"role": "assistant", "content": text2})
-                _conversation[telegram_id] = history[-40:]
-                return text2, model2
-        except Exception as e2:
-            logger.error(f"Fallback key also failed: {e2}")
-        return f"⚠️ AI error: {e}", ""
+            from cerebras.cloud.sdk import Cerebras
+            model  = best_model(key)
+            resp   = Cerebras(api_key=key).chat.completions.create(
+                messages=messages,
+                model=model,
+                max_tokens=1500,
+                temperature=0.7,
+            )
+            text   = resp.choices[0].message.content
+            tokens = getattr(getattr(resp, "usage", None), "total_tokens", 0) or 0
 
-# ── Telegram bot ──────────────────────────────────────────────────────────────
+            # Update history — keep last MAX_HISTORY_TURNS exchanges
+            history.append({"role": "user",      "content": message})
+            history.append({"role": "assistant",  "content": text})
+            _conversation[tg_id] = history[-(MAX_HISTORY_TURNS * 2):]
+
+            if uid:
+                persist_messages(uid, message, text)
+                if tokens and key in user_keys:
+                    bump_key_stats(uid, key, tokens)
+
+            return text, model
+
+        except Exception as e:
+            err = str(e)
+            last_err = err
+            logger.warning(f"Key {key[:12]}… failed: {err[:120]}")
+
+            # Context length exceeded — emergency: clear history and retry same key
+            if any(x in err.lower() for x in
+                   ["contextlength", "context_length", "reduce the length",
+                    "maximum context", "token"]):
+                logger.info("Context too long — clearing history and retrying")
+                _conversation[tg_id] = []
+                try:
+                    from cerebras.cloud.sdk import Cerebras
+                    model  = best_model(key)
+                    bare   = [{"role": "system", "content": SYSTEM_PROMPT},
+                               {"role": "user",   "content": trunc(message, 800)}]
+                    resp2  = Cerebras(api_key=key).chat.completions.create(
+                        messages=bare, model=model, max_tokens=1200
+                    )
+                    text2  = resp2.choices[0].message.content
+                    _conversation[tg_id] = [
+                        {"role": "user",      "content": message},
+                        {"role": "assistant", "content": text2},
+                    ]
+                    if uid:
+                        persist_messages(uid, message, text2)
+                    return text2, model
+                except Exception as e2:
+                    last_err = str(e2)
+            continue
+
+    return f"⚠️ All AI keys failed.\n{last_err[:300]}", ""
+
+# ── Telegram ──────────────────────────────────────────────────────────────────
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import (Application, CommandHandler,
+                           MessageHandler, filters, ContextTypes)
 from telegram.constants import ParseMode, ChatAction
 
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user = get_user_by_telegram(update.effective_user.id)
-    if not user:
+async def _auth(update: Update) -> Optional[dict]:
+    rec = get_user_by_telegram(update.effective_user.id)
+    if not rec:
         await update.message.reply_text(
-            "⚠️ Your Telegram account is not linked to Zypher.\n\n"
-            "Please visit the Zypher dashboard to connect your account:\n"
-            "https://joshbond123.github.io/Zypher/"
-        )
-        return
+            "⚠️ Your Telegram is not linked to Zypher.\n"
+            "Connect at: https://joshbond123.github.io/Zypher/")
+    return rec
+
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _auth(update): return
     name = update.effective_user.first_name
     await update.message.reply_text(
-        f"👾 *Zypher Online* — Session `{GITHUB_RUN_ID[:8]}`\n\n"
-        f"Hello {name}! I'm Zypher, the best hacker that has ever existed.\n"
-        f"I'm running on a Kali Linux machine in the cloud.\n\n"
-        f"You can:\n"
-        f"• Ask me anything — hacking, OSINT, security, research\n"
-        f"• Run Kali tools: `!nmap -sV target.com`\n"
-        f"• Search the web: `search XSS techniques`\n"
-        f"• `/clear` — clear conversation history\n"
-        f"• `/status` — check session status\n\n"
-        f"🔍 Skills: stealth-browser + tavily loaded\n"
-        f"🤖 Model: auto-detected (most powerful available)",
-        parse_mode=ParseMode.MARKDOWN
+        f"👾 *Zypher Online* — `{GITHUB_RUN_ID[:8]}`\n\n"
+        f"Hello {name}\\! I'm Zypher — elite AI hacker on Kali Linux\\.\n\n"
+        f"*Usage:*\n"
+        f"• Ask anything — hacking, OSINT, research\n"
+        f"• `\\!nmap \\-sV target\\.com` — run Kali tools\n"
+        f"• `search XSS techniques` — web search\n"
+        f"• `browse https://example\\.com` — fetch page\n"
+        f"• /clear — reset conversation\n"
+        f"• /status — session info",
+        parse_mode=ParseMode.MARKDOWN_V2
     )
 
-async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user = get_user_by_telegram(update.effective_user.id)
-    if not user:
-        await update.message.reply_text("❌ Not linked. Visit the dashboard.")
-        return
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await _auth(update): return
+    tg_id   = update.effective_user.id
+    history = _conversation.get(tg_id, [])
+    used    = sum(est_tokens(m.get("content", "")) for m in history)
     await update.message.reply_text(
         f"✅ *Zypher Status*\n\n"
         f"• Session: `{GITHUB_RUN_ID[:12]}`\n"
-        f"• Platform: Kali Linux (GitHub Actions)\n"
-        f"• Cerebras keys: `{len(CEREBRAS_KEYS)}` system keys loaded\n"
-        f"• Tavily: `{len([k for k in TAVILY_KEYS if k])}` keys\n"
+        f"• Platform: Kali Linux / GitHub Actions\n"
+        f"• AI keys: `{len(CEREBRAS_KEYS)}` system keys loaded\n"
+        f"• History: `{len(history)//2}` turns (~`{used}` tokens)\n"
+        f"• Context budget: `{MAX_INPUT_TOKENS}` tokens\n"
+        f"• Max turns kept: `{MAX_HISTORY_TURNS}`\n"
         f"• Status: 🟢 Running",
         parse_mode=ParseMode.MARKDOWN
     )
 
-async def clear_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     _conversation.pop(update.effective_user.id, None)
-    await update.message.reply_text("🗑️ Conversation cleared.")
+    await update.message.reply_text("🗑️ Conversation history cleared.")
 
-async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def handle_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
-
-    telegram_id = update.effective_user.id
-    user_record = get_user_by_telegram(telegram_id)
-
-    if not user_record:
+    tg_id  = update.effective_user.id
+    rec    = get_user_by_telegram(tg_id)
+    if not rec:
         await update.message.reply_text(
-            "⚠️ Your Telegram is not linked to Zypher.\n"
-            "Please connect at: https://joshbond123.github.io/Zypher/"
-        )
+            "⚠️ Not linked. Connect at:\nhttps://joshbond123.github.io/Zypher/")
         return
 
-    user_id = user_record.get("user_id", "")
-    user_cerebras_keys = get_user_cerebras_keys(user_id) if user_id else []
+    uid       = rec.get("user_id", "")
+    user_keys = get_user_keys(uid) if uid else []
 
-    await ctx.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    await ctx.bot.send_chat_action(
+        chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
-    text, model = await ask_ai(user_id, telegram_id, update.message.text, user_cerebras_keys)
+    text, model = await ask_zypher(uid, tg_id, update.message.text, user_keys)
 
-    # Split long messages
-    if len(text) > 4000:
-        chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
-        for chunk in chunks:
-            try:
-                await update.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
-            except Exception:
-                await update.message.reply_text(chunk)
-    else:
+    # Telegram max 4096 chars per message
+    for i in range(0, max(len(text), 1), 4000):
+        chunk = text[i:i+4000]
         try:
-            await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
         except Exception:
-            await update.message.reply_text(text)
+            try:
+                await update.message.reply_text(chunk)
+            except Exception as e:
+                logger.error(f"Send failed: {e}")
 
-    if model:
-        logger.info(f"[{telegram_id}] model={model} len={len(text)}")
+    logger.info(f"[tg={tg_id}] model={model} len={len(text)}")
 
 def main():
-    app = (
-        Application.builder()
-        .token(TELEGRAM_TOKEN)
-        .build()
-    )
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("clear", clear_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start",  cmd_start))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("clear",  cmd_clear))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
     logger.info(f"Zypher agent starting — session {GITHUB_RUN_ID}")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
