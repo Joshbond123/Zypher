@@ -8,6 +8,26 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
     <meta name="description" content="Zypher — Elite AI hacking and research platform powered by OpenClaw on Kali Linux" />
+    <!-- SPA routing fix for GitHub Pages -->
+    <script>
+      (function(l) {
+        if (l.search[1] === 'p' || l.search.indexOf('?p=/') !== -1) {
+          var r = l.search.slice(1).split('&');
+          var path = '';
+          var query = '';
+          r.forEach(function(part) {
+            if (part.startsWith('p=')) path = part.slice(2);
+            if (part.startsWith('q=')) query = '?' + part.slice(2).replace(/~and~/g, '&');
+          });
+          if (path) {
+            window.history.replaceState(
+              null, null,
+              l.pathname.replace(/\/?$/, '') + '/' + path.replace(/^\//, '') + query + l.hash
+            );
+          }
+        }
+      }(window.location));
+    </script>
   </head>
   <body>
     <div id="root"></div>
