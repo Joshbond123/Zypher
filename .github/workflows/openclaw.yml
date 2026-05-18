@@ -103,7 +103,7 @@ jobs:
           mkdir -p ~/.openclaw/workspace
           cp AGENTS.md ~/.openclaw/workspace/AGENTS.md
           TAVILY_VAL="${TAVILY_API_KEY:-disabled-not-configured}"
-          [ -z "$TAVILY_API_KEY" ] && echo "WARN: TAVILY_KEY_1 not set"
+          [ -z "$TAVILY_API_KEY" ] && echo "WARN: TAVILY_KEY_1 not set — search disabled"
           sed \
             -e "s|TAVILY_KEY_HERE|${TAVILY_VAL}|g" \
             -e "s|TELEGRAM_TOKEN_HERE|${TELEGRAM_BOT_TOKEN}|g" \
@@ -115,13 +115,13 @@ jobs:
           fi
           python3 -c "
           import json, sys, os
-          c = json.load(open(os.path.expanduser("~/.openclaw/openclaw.json")))
-          assert c.get("gateway",{}).get("mode")=="local", "gateway.mode missing"
-          tg = c.get("channels",{}).get("telegram",{})
-          assert tg.get("enabled") == True, "telegram not enabled"
-          tok = tg.get("botToken","")
-          assert tok and tok != "TELEGRAM_TOKEN_HERE", "botToken not injected"
-          print("Config OK")
+          c = json.load(open(os.path.expanduser('~/.openclaw/openclaw.json')))
+          assert c.get('gateway',{}).get('mode')=='local', 'gateway.mode missing'
+          tg = c.get('channels',{}).get('telegram',{})
+          assert tg.get('enabled') == True, 'telegram not enabled'
+          tok = tg.get('botToken','')
+          assert tok and tok != 'TELEGRAM_TOKEN_HERE', 'botToken not injected'
+          print('Config OK')
           " || exit 1
           echo "All config sanity checks passed"
 
@@ -227,22 +227,21 @@ jobs:
           python3 -c "
           import json, sys, os
           try:
-              cfg = json.load(open(f'{__import__("os").path.expanduser("~")}/.openclaw/openclaw.json'))
-              tg = cfg.get("channels", {}).get("telegram", {})
-              has_token = bool(tg.get("botToken", ""))
-              print("  enabled=%s  dmPolicy=%s  botToken_set=%s" % (tg.get("enabled"), tg.get("dmPolicy"), has_token))
+              cfg = json.load(open(os.path.expanduser('~/.openclaw/openclaw.json')))
+              tg  = cfg.get('channels', {}).get('telegram', {})
+              has_token = bool(tg.get('botToken', ''))
+              print('  enabled=%s  dmPolicy=%s  botToken_set=%s' % (tg.get('enabled'), tg.get('dmPolicy'), has_token))
               if not has_token:
-                  print("ERROR: botToken missing — bot will not respond")
+                  print('ERROR: botToken missing — bot will not respond')
                   sys.exit(1)
           except Exception as e:
-              print("Could not validate config: %s" % e)
+              print('Could not validate config: %s' % e)
           "
 
           echo "Starting Zypher gateway..."
           openclaw gateway 2>&1 | tee /tmp/openclaw.log &
           TEE_PID=$!
 
-          # Poll up to 45 s for any ready signal
           READY=0
           ELAPSED=0
           while [ $ELAPSED -lt 45 ]; do
@@ -268,34 +267,30 @@ jobs:
             echo "ERROR: No ready signal in 45 s. Full log:"; cat /tmp/openclaw.log; exit 1
           fi
 
-          # Only fail on the specific EFATAL code — not broad pattern-matching
-          # The old check used fatal.*error which had false-positives in JSON log output
           if grep -q "EFATAL" /tmp/openclaw.log 2>/dev/null; then
             echo "ERROR: EFATAL in log. Full log:"; cat /tmp/openclaw.log; exit 1
           fi
 
           echo "Health checks passed — LIVE: @Zypher0_bot | Run $GITHUB_RUN_ID"
 
-          # Startup notification to Telegram
           python3 -c "
           import os, urllib.request, json as J
-          tok  = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-          rid  = os.environ.get("GITHUB_RUN_ID", "?")
-          inst = os.environ.get("INSTANCE_NUMBER", "1")
-          msg  = chr(0x1F7E2) + " Zypher online | Instance #" + inst + " | Run " + rid + chr(0xA) + "Ready — send me a message!"
+          tok  = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+          rid  = os.environ.get('GITHUB_RUN_ID', '?')
+          inst = os.environ.get('INSTANCE_NUMBER', '1')
+          msg  = chr(0x1F7E2) + ' Zypher online | Instance #' + inst + ' | Run ' + rid + chr(0xA) + 'Ready!'
           try:
-              data = J.dumps({"chat_id": "6317345496", "text": msg}).encode()
+              data = J.dumps({'chat_id': '6317345496', 'text': msg}).encode()
               req  = urllib.request.Request(
-                  "https://api.telegram.org/bot" + tok + "/sendMessage",
-                  data=data, headers={"Content-Type": "application/json"}
+                  'https://api.telegram.org/bot' + tok + '/sendMessage',
+                  data=data, headers={'Content-Type': 'application/json'}
               )
               urllib.request.urlopen(req, timeout=10)
-              print("Startup notification sent")
+              print('Startup notification sent')
           except Exception as e:
-              print("WARN notification failed: " + str(e))
+              print('WARN notification failed: ' + str(e))
           "
 
-          # Run for ~3 h 40 min then rotate
           sleep 13200
 
           NEXT=$(( INSTANCE_NUMBER + 1 ))
@@ -317,7 +312,6 @@ jobs:
               -d '{"is_active":false}' || true
           fi
 
-          # Kill actual openclaw process (not tee)
           OPENCLAW_PID=$(pgrep -f "openclaw gateway" | head -1)
           if [ -n "$OPENCLAW_PID" ]; then
             kill -TERM "$OPENCLAW_PID" 2>/dev/null || true
