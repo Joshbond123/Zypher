@@ -51,14 +51,7 @@
     }
   },
   "browser": {
-    "enabled": true,
-    "headless": true,
-    "profiles": {
-      "openclaw": {
-        "headless": true,
-        "color": "green"
-      }
-    }
+    "enabled": true
   },
   "plugins": {
     "entries": {

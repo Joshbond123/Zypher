@@ -124,15 +124,13 @@ jobs:
             echo "ERROR: gateway.mode=local missing from openclaw.json"
             exit 1
           fi
-          # Sanity: confirm browser.profiles.openclaw.color is a string
+          # Sanity: confirm browser.enabled is true
           python3 -c "
           import json, sys
           c = json.load(open('$HOME/.openclaw/openclaw.json'))
-          color = c.get('browser',{}).get('profiles',{}).get('openclaw',{}).get('color','')
-          if not isinstance(color, str) or not color:
-              print('ERROR: browser.profiles.openclaw.color is missing or not a string')
-              sys.exit(1)
-          print(f'browser.profiles.openclaw.color = {color!r}  OK')
+          assert c.get('browser',{}).get('enabled') == True, 'browser.enabled must be true'
+          assert c.get('channels',{}).get('telegram',{}).get('enabled') == True, 'telegram not enabled'
+          print('browser.enabled=True  telegram.enabled=True  OK')
           "
           echo "All template sanity checks passed"
 
