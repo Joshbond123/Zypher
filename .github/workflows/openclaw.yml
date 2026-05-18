@@ -58,6 +58,7 @@ jobs:
             --auth-choice cerebras-api-key \
             --cerebras-api-key "$CEREBRAS_API_KEY" \
             --accept-risk \
+            --skip-health \
             --skip-bootstrap
           echo "✓ OpenClaw onboarded with Cerebras"
 
