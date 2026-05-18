@@ -101,7 +101,7 @@ jobs:
 
           echo "=== Start gateway (90s verbose) ==="
           timeout 90 openclaw gateway \
-            --config ~/.openclaw/openclaw.json \
+            ~/.openclaw/openclaw.json \
             --verbose \
             2>&1 | tee /tmp/gw_debug.log || true
 
