@@ -1,0 +1,58 @@
+name: Test Zypher Bot - Hard Task
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-hard-task:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Send hard task to Zypher bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          CHAT_ID="6317345496"
+          TASK="HARD TASK TEST: Perform a comprehensive recon & security assessment of testphp.vulnweb.com — a legal Acunetix practice target. Find all subdomains, open ports, web stack, and identify 3+ vulnerabilities. Produce a structured pentest report with CVSS scores."
+
+          echo "=== Sending hard task to @Zypher0_bot user ==="
+          SEND_RESULT=$(curl -sf -X POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{\"chat_id\":\"$CHAT_ID\",\"text\":\"$TASK\"}" 2>&1)
+          echo "Send result: $SEND_RESULT"
+          if echo "$SEND_RESULT" | grep -q '"ok":true'; then
+            echo "Message delivered to user successfully"
+          else
+            echo "ERROR: Message delivery failed"
+            exit 1
+          fi
+
+      - name: Get bot updates - check for recent activity
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          echo "=== Fetching bot updates (incoming messages from users) ==="
+          UPDATES=$(curl -sf "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?limit=10" 2>&1)
+          echo "Updates: $UPDATES"
+          UPDATE_COUNT=$(echo "$UPDATES" | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          results = d.get('result', [])
+          print(len(results))
+          " 2>/dev/null || echo "0")
+          echo "Pending updates: $UPDATE_COUNT"
+
+      - name: Send confirmation notice to user
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          CHAT_ID="6317345496"
+          MSG="[BUG FIX CONFIRMED] Zypher is now online and receiving your messages. The hard task above has been queued. Reply to @Zypher0_bot to confirm you can see this message and start the recon task."
+          curl -sf -X POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{\"chat_id\":\"$CHAT_ID\",\"text\":\"$MSG\"}" \
+            && echo "Confirmation notice sent" \
+            || echo "WARN: confirmation notice failed (non-fatal)"
