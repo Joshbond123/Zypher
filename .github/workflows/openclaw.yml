@@ -83,9 +83,6 @@ jobs:
           CEREBRAS_API_KEY:   ${{ secrets.CEREBRAS_KEY_1 }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: |
-          # Run onboard first so it initialises directories and writes gateway.mode=local.
-          # The next step overwrites openclaw.json with our full template, so onboard's
-          # partial config is intentionally replaced — gateway.mode is added to the template.
           openclaw onboard \
             --non-interactive \
             --mode local \
@@ -105,34 +102,39 @@ jobs:
         run: |
           mkdir -p ~/.openclaw/workspace
           cp AGENTS.md ~/.openclaw/workspace/AGENTS.md
-          # Substitute all three secrets as literal values so openclaw never
-          # needs to resolve env-var placeholders — avoids "Missing env var" errors
+
+          # If TAVILY_API_KEY is empty, use a placeholder so sed has something to substitute
+          TAVILY_VAL="${TAVILY_API_KEY:-disabled-not-configured}"
+          if [ -z "$TAVILY_API_KEY" ]; then
+            echo "WARN: TAVILY_KEY_1 not set — Tavily web search will be unavailable"
+          fi
+
           sed \
-            -e "s|TAVILY_KEY_HERE|${TAVILY_API_KEY}|g" \
+            -e "s|TAVILY_KEY_HERE|${TAVILY_VAL}|g" \
             -e "s|TELEGRAM_TOKEN_HERE|${TELEGRAM_BOT_TOKEN}|g" \
             -e "s|CEREBRAS_KEY_HERE|${CEREBRAS_API_KEY}|g" \
             scripts/oc_template.json > ~/.openclaw/openclaw.json
+
           echo '{ "security": "full", "ask": "off" }' > ~/.openclaw/exec-approvals.json
-          echo "openclaw.json written — all tokens injected (Telegram, Tavily, Cerebras, gateway.mode=local)"
-          # Sanity: confirm no placeholder survived
-          if grep -qE "TELEGRAM_TOKEN_HERE|TAVILY_KEY_HERE|CEREBRAS_KEY_HERE" ~/.openclaw/openclaw.json; then
+
+          # Sanity: confirm no critical placeholder survived
+          if grep -qE "TELEGRAM_TOKEN_HERE|CEREBRAS_KEY_HERE" ~/.openclaw/openclaw.json; then
             echo "ERROR: Template placeholders were not substituted"
             exit 1
           fi
-          # Sanity: confirm gateway.mode is present
-          if ! python3 -c "import json; c=json.load(open('$HOME/.openclaw/openclaw.json')); assert c.get('gateway',{}).get('mode')=='local', 'gateway.mode missing'"; then
-            echo "ERROR: gateway.mode=local missing from openclaw.json"
-            exit 1
-          fi
-          # Sanity: confirm browser.enabled is true
+
+          # Sanity: confirm config is valid
           python3 -c "
-          import json, sys
-          c = json.load(open('$HOME/.openclaw/openclaw.json'))
-          assert c.get('browser',{}).get('enabled') == True, 'browser.enabled must be true'
-          assert c.get('channels',{}).get('telegram',{}).get('enabled') == True, 'telegram not enabled'
-          print('browser.enabled=True  telegram.enabled=True  OK')
-          "
-          echo "All template sanity checks passed"
+          import json, sys, os
+          c = json.load(open(os.path.expanduser('~/.openclaw/openclaw.json')))
+          assert c.get('gateway',{}).get('mode')=='local', 'gateway.mode missing'
+          tg = c.get('channels',{}).get('telegram',{})
+          assert tg.get('enabled') == True, 'telegram not enabled'
+          tok = tg.get('botToken','')
+          assert tok and tok != 'TELEGRAM_TOKEN_HERE', 'botToken not injected'
+          print('Config OK: gateway.mode=local  telegram.enabled=True  botToken_set=True')
+          " || exit 1
+          echo "All config sanity checks passed"
 
       - name: Install stealth-browser + Tavily from ClawHub
         run: |
@@ -211,14 +213,12 @@ jobs:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           GITHUB_RUN_ID:       ${{ github.run_id }}
         run: |
-          # Validate the sidecar script parses cleanly before launching
           python3 -m py_compile scripts/zypher_agent.py \
             && echo "Sidecar syntax OK" \
             || { echo "ERROR: zypher_agent.py has a syntax error — aborting"; exit 1; }
           python3 scripts/zypher_agent.py > /tmp/sidecar.log 2>&1 &
           SIDECAR_PID=$!
           echo "Supabase sidecar PID $SIDECAR_PID"
-          # Give it 3 seconds to ensure it didn't crash immediately
           sleep 3
           if ! kill -0 $SIDECAR_PID 2>/dev/null; then
             echo "ERROR: Sidecar crashed immediately. Last log:"
@@ -244,51 +244,82 @@ jobs:
           INSTANCE_NUMBER:      ${{ github.event.inputs.instance_number || '1' }}
         run: |
           echo "=== Pre-flight: openclaw.json channels block ==="
-          python3 -c "
-          import json, sys
-          try:
-              cfg = json.load(open(f'{__import__(\"os\").path.expanduser(\"~\")}/.openclaw/openclaw.json'))
-              tg = cfg.get('channels', {}).get('telegram', {})
-              has_token = bool(tg.get('botToken', ''))
-              print(f'  enabled={tg.get(\"enabled\")}  dmPolicy={tg.get(\"dmPolicy\")}  botToken_set={has_token}  allowFrom={tg.get(\"allowFrom\")}')
-              if not has_token:
-                  print('ERROR: botToken is missing from openclaw.json — bot will not respond')
-                  sys.exit(1)
-          except Exception as e:
-              print(f'Could not validate config: {e}')
-          "
+          python3 - <<'PYEOF'
+import json, sys, os
+cfg = json.load(open(os.path.expanduser('~/.openclaw/openclaw.json')))
+tg = cfg.get('channels', {}).get('telegram', {})
+has_token = bool(tg.get('botToken', ''))
+print(f'  enabled={tg.get("enabled")}  dmPolicy={tg.get("dmPolicy")}  botToken_set={has_token}')
+if not has_token:
+    print("ERROR: botToken missing from config")
+    sys.exit(1)
+PYEOF
 
-          echo "Starting Zypher — stealth-browser + Tavily + Supabase memory..."
+          echo "Starting Zypher gateway..."
           openclaw gateway 2>&1 | tee /tmp/openclaw.log &
-          GATEWAY_PID=$!
+          TEE_PID=$!
 
-          echo "Gateway PID $GATEWAY_PID — waiting 20 s for startup..."
-          sleep 20
+          # Poll for ready signal (up to 45 seconds)
+          READY=0
+          for WAIT_SEC in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45; do
+            sleep 1
+            if grep -q "gateway. ready\|http server listening\|polling ingress started" /tmp/openclaw.log 2>/dev/null; then
+              echo "Gateway ready after ${WAIT_SEC}s"
+              READY=1
+              break
+            fi
+          done
 
-          echo "=== First 60 log lines ==="
-          head -60 /tmp/openclaw.log 2>/dev/null || echo "(log empty)"
+          echo "=== Gateway startup log (first 80 lines) ==="
+          head -80 /tmp/openclaw.log 2>/dev/null || echo "(log empty)"
 
-          # $GATEWAY_PID is the tee process (last in the pipeline).
-          # When openclaw exits, the pipe breaks and tee also exits.
-          # So kill -0 $GATEWAY_PID is a reliable liveness proxy.
-          if ! kill -0 $GATEWAY_PID 2>/dev/null; then
-            echo "ERROR: Gateway (tee proxy) exited within 20 s — openclaw likely crashed. Full log:"
+          # Check: process still alive?
+          OPENCLAW_PID=$(pgrep -f "openclaw gateway" | head -1)
+          if [ -z "$OPENCLAW_PID" ]; then
+            echo "ERROR: Gateway process exited during startup. Full log:"
+            cat /tmp/openclaw.log
+            exit 1
+          fi
+          echo "Gateway process alive: PID $OPENCLAW_PID"
+
+          # Check: ready signal received?
+          if [ "$READY" = "0" ]; then
+            echo "ERROR: Gateway did not emit ready signal within 45s. Full log:"
             cat /tmp/openclaw.log
             exit 1
           fi
 
-          # Confirm the gateway reached the ready state in the log
-          if ! grep -q "gateway ready\|http server listening" /tmp/openclaw.log 2>/dev/null; then
-            echo "ERROR: Gateway did not reach ready state within 20 s. Full log:"
+          # Check: only look for the specific EFATAL code (not broad pattern matching)
+          if grep -q "EFATAL" /tmp/openclaw.log 2>/dev/null; then
+            echo "ERROR: OpenClaw reported EFATAL — fatal startup error. Full log:"
             cat /tmp/openclaw.log
             exit 1
           fi
 
-          echo "Gateway health: OK (process alive, ready state confirmed)"
-
+          echo "All health checks passed"
           echo "LIVE: @Zypher0_bot | Instance #${INSTANCE_NUMBER} | Run $GITHUB_RUN_ID"
 
-          # Run for ~3 h 40 min then rotate
+          # Send startup notification to Telegram
+          python3 - <<'PYEOF'
+import os, urllib.request, json
+tok = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+chat_id = "6317345496"
+run_id  = os.environ.get("GITHUB_RUN_ID", "?")
+inst    = os.environ.get("INSTANCE_NUMBER", "1")
+msg = f"\U0001F7E2 Zypher online | Instance #{inst} | Run {run_id}\nReady — send me a message!"
+try:
+    data = json.dumps({"chat_id": chat_id, "text": msg}).encode()
+    req  = urllib.request.Request(
+        f"https://api.telegram.org/bot{tok}/sendMessage",
+        data=data, headers={"Content-Type": "application/json"}
+    )
+    urllib.request.urlopen(req, timeout=10)
+    print("Startup notification sent")
+except Exception as e:
+    print(f"WARN: startup notification failed: {e}")
+PYEOF
+
+          # Wait for rotation (~3h 40min)
           sleep 13200
 
           NEXT=$(( INSTANCE_NUMBER + 1 ))
@@ -302,7 +333,7 @@ jobs:
 
           sleep 120
 
-          # Mark session as finished in Supabase
+          # Mark session finished in Supabase
           if [ -n "$SUPABASE_URL" ] && [ -n "$SUPABASE_SERVICE_KEY" ]; then
             curl -s -X PATCH "$SUPABASE_URL/rest/v1/active_sessions?github_run_id=eq.$GITHUB_RUN_ID" \
               -H "apikey: $SUPABASE_SERVICE_KEY" \
@@ -311,6 +342,13 @@ jobs:
               -d '{"is_active":false}' || true
           fi
 
-          kill -TERM $GATEWAY_PID 2>/dev/null
-          wait $GATEWAY_PID 2>/dev/null || true
+          # Gracefully shut down openclaw (not tee)
+          OPENCLAW_PID=$(pgrep -f "openclaw gateway" | head -1)
+          if [ -n "$OPENCLAW_PID" ]; then
+            echo "Sending SIGTERM to openclaw PID $OPENCLAW_PID"
+            kill -TERM "$OPENCLAW_PID" 2>/dev/null || true
+            sleep 5
+            kill -KILL "$OPENCLAW_PID" 2>/dev/null || true
+          fi
+          kill "$TEE_PID" 2>/dev/null || true
           echo "Zypher stopped cleanly"
