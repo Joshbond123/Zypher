@@ -119,14 +119,12 @@ jobs:
             scripts/oc_template.json > ~/.openclaw/openclaw.json
 
           # --- Tavily: use KEY_2 as fallback or disable cleanly ---
-          # If KEY_1 is absent but KEY_2 is present, use KEY_2
           if [ -z "$TAVILY_API_KEY" ] && [ -n "$TAVILY_API_KEY_2" ]; then
             echo "INFO: TAVILY_KEY_1 absent — using TAVILY_KEY_2 as primary"
             jq ".tools.web.search.apiKey = \"${TAVILY_API_KEY_2}\" | .plugins.entries.tavily.enabled = true" \
               ~/.openclaw/openclaw.json > /tmp/oc_patched.json \
               && mv /tmp/oc_patched.json ~/.openclaw/openclaw.json
           elif [ -z "$TAVILY_API_KEY" ]; then
-            # No key at all — disable Tavily completely so it doesn't error
             echo "WARN: No Tavily key — disabling search provider"
             jq '.tools.web.search = {"provider": null, "enabled": false} | .plugins.entries.tavily.enabled = false' \
               ~/.openclaw/openclaw.json > /tmp/oc_patched.json \
@@ -149,12 +147,12 @@ jobs:
           assert tg.get('enabled') == True, 'telegram not enabled'
           tok = tg.get('botToken','')
           assert tok and tok != 'TELEGRAM_TOKEN_HERE', 'botToken not injected'
-          primary = c.get('agents',{}).get('defaults',{}).get('model',{}).get('primary','')
+          model_cfg = c.get('agents',{}).get('defaults',{}).get('model',{})
+          primary = model_cfg.get('primary','')
           assert primary, 'model.primary not configured'
-          sb = c.get('plugins',{}).get('entries',{}).get('supabase',{})
-          sb_url = sb.get('config',{}).get('url','')
-          sb_ok = bool(sb_url) and sb_url != 'SUPABASE_URL_HERE'
-          print('Config OK — model.primary=%s supabase_plugin=%s' % (primary, sb_ok))
+          fallbacks = model_cfg.get('fallbacks', [])
+          assert len(fallbacks) > 0, 'model.fallbacks empty — requests will fail if primary is unavailable'
+          print('Config OK — model.primary=%s fallbacks=%s' % (primary, fallbacks))
           " || exit 1
           echo "All config sanity checks passed"
           echo "=== Final config (keys masked) ==="
@@ -165,6 +163,12 @@ jobs:
           print(masked[:2000])
           "
 
+      - name: Run openclaw doctor --fix
+        run: |
+          echo "=== Running openclaw doctor --fix to auto-correct any remaining config issues ==="
+          openclaw doctor --fix 2>&1 || true
+          echo "=== Doctor check complete ==="
+
       - name: Install stealth-browser + Tavily from ClawHub
         run: |
           openclaw skills install clawhub:stealth-browser 2>&1 \
@@ -173,8 +177,11 @@ jobs:
           openclaw skills install clawhub:tavily 2>&1 \
             || openclaw plugins install npm:@openclaw/tavily 2>&1 \
             || echo "tavily skill install skipped (key-based config in use)"
-          openclaw plugins install clawhub:supabase 2>&1 \
-            || echo "supabase plugin install skipped (REST-API fallback active)"
+          # NOTE: clawhub:supabase is intentionally NOT installed here.
+          # Supabase persistence is handled by zypher_agent.py sidecar.
+          # Having supabase plugin enabled=true but not installed caused
+          # plugin hook failures during message processing — root cause of
+          # "Something went wrong". Plugin is now set to enabled=false.
           openclaw plugins list 2>/dev/null || true
           openclaw skills list  2>/dev/null || true
 
@@ -229,7 +236,6 @@ jobs:
           if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_SERVICE_KEY" ]; then
             echo "Supabase not configured — skipping"; exit 0
           fi
-          # Use Python for portable +4h timestamp (GNU date -d may not be available)
           EXPIRES=$(python3 -c "
           from datetime import datetime, timezone, timedelta
           print((datetime.now(timezone.utc)+timedelta(hours=4)).strftime('%Y-%m-%dT%H:%M:%SZ'))
@@ -284,14 +290,17 @@ jobs:
               cfg = json.load(open(os.path.expanduser('~/.openclaw/openclaw.json')))
               tg  = cfg.get('channels', {}).get('telegram', {})
               has_token = bool(tg.get('botToken', ''))
-              primary = cfg.get('agents', {}).get('defaults', {}).get('model', {}).get('primary', 'NOT SET')
-              sb = cfg.get('plugins', {}).get('entries', {}).get('supabase', {})
-              sb_ok = bool(sb.get('config', {}).get('url', ''))
-              print('  telegram_enabled=%s  botToken_set=%s  model.primary=%s  supabase=%s' % (
-                  tg.get('enabled'), has_token, primary, sb_ok))
+              model_cfg = cfg.get('agents', {}).get('defaults', {}).get('model', {})
+              primary = model_cfg.get('primary', 'NOT SET')
+              fallbacks = model_cfg.get('fallbacks', [])
+              sb_enabled = cfg.get('plugins', {}).get('entries', {}).get('supabase', {}).get('enabled', False)
+              print('  telegram_enabled=%s  botToken_set=%s  model.primary=%s  fallbacks=%s  supabase_plugin=%s' % (
+                  tg.get('enabled'), has_token, primary, fallbacks, sb_enabled))
               if not has_token:
                   print('ERROR: botToken missing — bot will not respond')
                   sys.exit(1)
+              if not fallbacks:
+                  print('WARN: No model fallbacks — requests will fail if primary model is unavailable')
           except Exception as e:
               print('Could not validate config: %s' % e)
               sys.exit(1)
@@ -306,13 +315,11 @@ jobs:
           while [ $ELAPSED -lt 60 ]; do
             sleep 1
             ELAPSED=$(( ELAPSED + 1 ))
-            # Match any of the known openclaw ready signals (varies by version)
             if grep -qiE "ready|listening|started|telegram.*poll|gateway.*up|ingress|bot.*online|connected" /tmp/openclaw.log 2>/dev/null; then
               echo "Ready signal detected after ${ELAPSED}s"
               READY=1
               break
             fi
-            # Also check: if the process is still running after 15s with output, assume it's up
             if [ $ELAPSED -eq 20 ] && [ -s /tmp/openclaw.log ]; then
               LINES=$(wc -l < /tmp/openclaw.log)
               echo "No ready signal yet after 20s but log has ${LINES} lines — checking for errors..."
@@ -354,7 +361,7 @@ jobs:
           tok  = os.environ.get('TELEGRAM_BOT_TOKEN', '')
           rid  = os.environ.get('GITHUB_RUN_ID', '?')
           inst = os.environ.get('INSTANCE_NUMBER', '1')
-          msg  = chr(0x1F7E2) + ' Zypher online | Instance #' + inst + ' | Run ' + rid + chr(0xA) + 'Ready to respond!'
+          msg  = chr(0x1F7E2) + ' Zypher online | Instance #' + inst + ' | Run ' + rid + chr(0xA) + 'Ready! (v5: model fallbacks active)'
           try:
               data = J.dumps({'chat_id': '6317345496', 'text': msg}).encode()
               req  = urllib.request.Request(
@@ -368,10 +375,9 @@ jobs:
           "
 
           # Run for 215 minutes — triggers next instance 5 min before this one ends
-          # (was 220/13200s — reduced to 215/12900s to eliminate handoff gap)
           sleep 12900
 
-          # Trigger next instance (seamless handoff — new instance starts before this one stops)
+          # Trigger next instance (seamless handoff)
           NEXT=$(( INSTANCE_NUMBER + 1 ))
           curl -s -X POST \
             -H "Authorization: token $GITHUB_TOKEN" \
@@ -381,7 +387,7 @@ jobs:
             && echo "Rotated to instance #$NEXT (5-min overlap handoff)" \
             || echo "WARN: Rotation failed — next schedule will start fresh"
 
-          # 5-minute overlap: both old and new instance are alive during handoff
+          # 5-minute overlap: both old and new instance alive during handoff
           sleep 300
 
           # Mark session inactive in Supabase
