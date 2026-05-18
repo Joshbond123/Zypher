@@ -1,12 +1,18 @@
 {
   "gateway": {
-    "mode": "local"
+    "mode": "local",
+    "session": {
+      "errorRecovery": "soft-reset",
+      "maxRetries": 2,
+      "retryDelayMs": 1500
+    }
   },
   "agents": {
     "defaults": {
       "workspace": "~/.openclaw/workspace",
       "model": {
-        "primary": "cerebras/llama-3.3-70b"
+        "primary": "cerebras/llama-3.3-70b",
+        "fallback": "cerebras/llama3.1-8b"
       }
     },
     "list": [
@@ -70,9 +76,6 @@
         "maxChars": 60000
       }
     }
-  },
-  "browser": {
-    "enabled": true
   },
   "plugins": {
     "entries": {
