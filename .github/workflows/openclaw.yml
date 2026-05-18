@@ -110,12 +110,10 @@ jobs:
           mkdir -p ~/.openclaw/workspace/memory
           cp AGENTS.md ~/.openclaw/workspace/AGENTS.md
 
-          # Use KEY_1 as fallback for any missing numbered keys
           K2="${CEREBRAS_API_KEY_2:-$CEREBRAS_API_KEY}"
           K3="${CEREBRAS_API_KEY_3:-$CEREBRAS_API_KEY}"
           K4="${CEREBRAS_API_KEY_4:-$CEREBRAS_API_KEY}"
 
-          # Token substitution — 4 Cerebras provider placeholders
           sed \
             -e "s|TELEGRAM_TOKEN_HERE|${TELEGRAM_BOT_TOKEN}|g" \
             -e "s|CEREBRAS_KEY_1_HERE|${CEREBRAS_API_KEY}|g" \
@@ -127,56 +125,41 @@ jobs:
             -e "s|SUPABASE_KEY_HERE|${SUPABASE_SERVICE_KEY}|g" \
             scripts/oc_template.json > ~/.openclaw/openclaw.json
 
-          # Tavily: use KEY_2 as fallback or disable cleanly
           if [ -z "$TAVILY_API_KEY" ] && [ -n "$TAVILY_API_KEY_2" ]; then
-            echo "INFO: TAVILY_KEY_1 absent — using TAVILY_KEY_2 as primary"
             jq ".tools.web.search.apiKey = \"${TAVILY_API_KEY_2}\" | .plugins.entries.tavily.enabled = true" \
               ~/.openclaw/openclaw.json > /tmp/oc_patched.json \
               && mv /tmp/oc_patched.json ~/.openclaw/openclaw.json
           elif [ -z "$TAVILY_API_KEY" ]; then
-            echo "WARN: No Tavily key — disabling search provider"
             jq '.tools.web.search = {"provider": null, "enabled": false} | .plugins.entries.tavily.enabled = false' \
               ~/.openclaw/openclaw.json > /tmp/oc_patched.json \
               && mv /tmp/oc_patched.json ~/.openclaw/openclaw.json
-          else
-            echo "Tavily KEY_1 active"
           fi
 
           echo '{ "security": "full", "ask": "off" }' > ~/.openclaw/exec-approvals.json
 
-          # Sanity check — no unfilled placeholders
           if grep -qE "TELEGRAM_TOKEN_HERE|CEREBRAS_KEY_[0-9]_HERE" ~/.openclaw/openclaw.json; then
             echo "ERROR: Template placeholders not substituted"
-            grep -E "TELEGRAM_TOKEN_HERE|CEREBRAS_KEY_[0-9]_HERE" ~/.openclaw/openclaw.json
             exit 1
           fi
 
           python3 -c "
-          import json, sys, os
-          c = json.load(open(os.path.expanduser('~/.openclaw/openclaw.json')))
-          tg = c.get('channels',{}).get('telegram',{})
-          assert tg.get('enabled') == True, 'telegram not enabled'
-          tok = tg.get('botToken','')
-          assert tok and tok != 'TELEGRAM_TOKEN_HERE', 'botToken not injected'
-          model_cfg = c.get('agents',{}).get('defaults',{}).get('model',{})
-          primary = model_cfg.get('primary','')
-          fallbacks = model_cfg.get('fallbacks', [])
-          assert primary, 'model.primary not configured'
-          assert len(fallbacks) > 0, 'model.fallbacks empty'
-          providers = c.get('models',{}).get('providers',{})
-          num_providers = len([p for p in providers if 'cerebras' in p.lower()])
-          print('Config OK — primary=%s fallbacks=%d providers=%d streaming=%s' % (
-              primary, len(fallbacks), num_providers,
-              tg.get('streaming',{}).get('mode','off')))
-          " || exit 1
+import json, sys, os
+c = json.load(open(os.path.expanduser('~/.openclaw/openclaw.json')))
+tg = c.get('channels',{}).get('telegram',{})
+assert tg.get('enabled') == True, 'telegram not enabled'
+tok = tg.get('botToken','')
+assert tok and tok != 'TELEGRAM_TOKEN_HERE', 'botToken not injected'
+model_cfg = c.get('agents',{}).get('defaults',{}).get('model',{})
+primary = model_cfg.get('primary','')
+fallbacks = model_cfg.get('fallbacks', [])
+assert primary, 'model.primary not configured'
+assert len(fallbacks) > 0, 'model.fallbacks empty'
+providers = c.get('models',{}).get('providers',{})
+num_providers = len([p for p in providers if 'cerebras' in p.lower()])
+streaming = tg.get('streaming',{}).get('mode','off')
+print('Config OK: primary=%s fallbacks=%d providers=%d streaming=%s' % (primary, len(fallbacks), num_providers, streaming))
+" || exit 1
           echo "All config sanity checks passed"
-          echo "=== Config preview (keys masked) ==="
-          python3 -c "
-          import json, os, re
-          raw = open(os.path.expanduser('~/.openclaw/openclaw.json')).read()
-          masked = re.sub(r'(\"apiKey\"|\"botToken\")\s*:\s*\"[^\"]{8,}\"', r'\1: \"***\"', raw)
-          print(masked[:2500])
-          "
 
       - name: Run cerebras_key_rotator.py (round-robin key selection)
         env:
@@ -206,8 +189,6 @@ jobs:
           openclaw skills install clawhub:tavily 2>&1 \
             || openclaw plugins install npm:@openclaw/tavily 2>&1 \
             || echo "tavily skill install skipped"
-          # NOTE: clawhub:supabase intentionally NOT installed.
-          # supabase plugin is disabled in config; sidecar handles persistence.
           openclaw plugins list 2>/dev/null || true
           openclaw skills list  2>/dev/null || true
 
@@ -260,18 +241,15 @@ jobs:
           if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_SERVICE_KEY" ]; then
             echo "Supabase not configured — skipping"; exit 0
           fi
-          EXPIRES=$(python3 -c "
-          from datetime import datetime, timezone, timedelta
-          print((datetime.now(timezone.utc)+timedelta(hours=4)).strftime('%Y-%m-%dT%H:%M:%SZ'))
-          ")
+          EXPIRES=$(python3 -c "from datetime import datetime,timezone,timedelta; print((datetime.now(timezone.utc)+timedelta(hours=4)).strftime('%Y-%m-%dT%H:%M:%SZ'))")
           curl -s -X POST "$SUPABASE_URL/rest/v1/active_sessions" \
             -H "apikey: $SUPABASE_SERVICE_KEY" \
             -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
             -H "Content-Type: application/json" \
             -H "Prefer: return=minimal" \
             -d "{\"github_run_id\":\"$GITHUB_RUN_ID\",\"workflow_name\":\"openclaw.yml\",\"instance_number\":$INSTANCE_NUMBER,\"is_active\":true,\"expires_at\":\"$EXPIRES\"}" \
-            && echo "Session registered (expires $EXPIRES)" \
-            || echo "WARN: Session registration failed (non-fatal)"
+            && echo "Session registered" \
+            || echo "WARN: Session registration failed"
 
       - name: Start Supabase bridge sidecar
         env:
@@ -308,50 +286,38 @@ jobs:
         run: |
           echo "=== Pre-flight: openclaw.json validation ==="
           python3 -c "
-          import json, sys, os
-          try:
-              cfg = json.load(open(os.path.expanduser('~/.openclaw/openclaw.json')))
-              tg  = cfg.get('channels', {}).get('telegram', {})
-              model_cfg = cfg.get('agents', {}).get('defaults', {}).get('model', {})
-              primary = model_cfg.get('primary', 'NOT SET')
-              fallbacks = model_cfg.get('fallbacks', [])
-              providers = cfg.get('models', {}).get('providers', {})
-              cerebras_providers = [p for p in providers if 'cerebras' in p.lower()]
-              streaming = tg.get('streaming', {}).get('mode', 'off')
-              sb_enabled = cfg.get('plugins', {}).get('entries', {}).get('supabase', {}).get('enabled', False)
-              print('  telegram=%s  botToken_set=%s  streaming=%s' % (tg.get('enabled'), bool(tg.get('botToken','')), streaming))
-              print('  model.primary=%s  fallbacks=%d  providers=%s  supabase_plugin=%s' % (
-                  primary, len(fallbacks), cerebras_providers, sb_enabled))
-              if not tg.get('botToken',''):
-                  print('ERROR: botToken missing')
-                  sys.exit(1)
-              if not fallbacks:
-                  print('WARN: No fallbacks configured')
-          except Exception as e:
-              print('Config error: %s' % e)
-              sys.exit(1)
-          "
+import json, sys, os
+try:
+    cfg = json.load(open(os.path.expanduser('~/.openclaw/openclaw.json')))
+    tg  = cfg.get('channels', {}).get('telegram', {})
+    model_cfg = cfg.get('agents', {}).get('defaults', {}).get('model', {})
+    primary = model_cfg.get('primary', 'NOT SET')
+    fallbacks = model_cfg.get('fallbacks', [])
+    providers = cfg.get('models', {}).get('providers', {})
+    cerebras_providers = [p for p in providers if 'cerebras' in p.lower()]
+    streaming = tg.get('streaming', {}).get('mode', 'off')
+    sb_enabled = cfg.get('plugins', {}).get('entries', {}).get('supabase', {}).get('enabled', False)
+    print('  telegram=%s botToken_set=%s streaming=%s' % (tg.get('enabled'), bool(tg.get('botToken','')), streaming))
+    print('  model.primary=%s fallbacks=%d providers=%s supabase_plugin=%s' % (primary, len(fallbacks), cerebras_providers, sb_enabled))
+    if not tg.get('botToken',''):
+        print('ERROR: botToken missing')
+        sys.exit(1)
+    if not fallbacks:
+        print('WARN: No fallbacks configured')
+except Exception as e:
+    print('Config error: %s' % e)
+    sys.exit(1)
+"
 
-          # Start periodic doctor (every 30 min) in background
-          (
-            while true; do
-              sleep 1800
-              echo "[$(date -u +%H:%M:%SZ)] Running scheduled openclaw doctor check..."
-              openclaw doctor 2>&1 | tail -5 || true
-              echo "[$(date -u +%H:%M:%SZ)] Key rotator stats:"
-              python3 scripts/cerebras_key_rotator.py --stats 2>&1 \
-                || python3 /dev/stdin << 'PYSTATS'
-import json, os, time
-sf = os.path.expanduser('~/.openclaw/cerebras_key_stats.json')
-if os.path.exists(sf):
-    stats = json.load(open(sf))
-    for kid, st in stats.items():
-        print(f"  {kid}: requests={st.get('request_count',0)} rate_limits={st.get('rate_limit_events',0)}")
-else:
-    print("  No stats file yet")
-PYSTATS
-            done
-          ) &
+          # Periodic doctor: every 30 min, run openclaw doctor and print key stats
+          (while true; do
+            sleep 1800
+            echo "[$(date -u +%H:%M:%SZ)] Scheduled doctor check..."
+            openclaw doctor 2>&1 | tail -5 || true
+            echo "[$(date -u +%H:%M:%SZ)] Key stats:"
+            python3 scripts/cerebras_key_rotator.py --stats 2>&1 \
+              || python3 -c "import json,os; sf=os.path.expanduser('~/.openclaw/cerebras_key_stats.json'); [print(' ',k,st) for k,st in (json.load(open(sf)).items() if os.path.exists(sf) else {}.items())]" 2>&1 || true
+          done) &
           DOCTOR_PID=$!
           echo "Periodic doctor started (PID $DOCTOR_PID, every 30 min)"
 
@@ -371,7 +337,7 @@ PYSTATS
             fi
             if [ $ELAPSED -eq 20 ] && [ -s /tmp/openclaw.log ]; then
               if ! grep -qiE "fatal|crash|EFATAL|ECRITICAL|exited|refused|failed to start" /tmp/openclaw.log; then
-                echo "No ready signal but no fatal errors at 20s — assuming startup in progress"
+                echo "No fatal errors at 20s — assuming startup in progress"
                 READY=1
                 break
               fi
@@ -391,29 +357,23 @@ PYSTATS
 
           echo "LIVE: @Zypher0_bot | Run $GITHUB_RUN_ID | Instance #$INSTANCE_NUMBER"
 
-          # Startup notification
           python3 -c "
-          import os, urllib.request, json as J
-          tok  = os.environ.get('TELEGRAM_BOT_TOKEN', '')
-          rid  = os.environ.get('GITHUB_RUN_ID', '?')
-          inst = os.environ.get('INSTANCE_NUMBER', '1')
-          msg  = chr(0x1F7E2) + ' Zypher online | Instance #' + inst + ' | Run ' + rid + chr(0xA) + 'Ready! (4 Cerebras keys, 11-entry fallback chain, streaming active)'
-          try:
-              data = J.dumps({'chat_id': '6317345496', 'text': msg}).encode()
-              req  = urllib.request.Request(
-                  'https://api.telegram.org/bot' + tok + '/sendMessage',
-                  data=data, headers={'Content-Type': 'application/json'}
-              )
-              urllib.request.urlopen(req, timeout=10)
-              print('Startup notification sent')
-          except Exception as e:
-              print('WARN notification failed: ' + str(e))
-          "
+import os, urllib.request, json as J
+tok  = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+rid  = os.environ.get('GITHUB_RUN_ID', '?')
+inst = os.environ.get('INSTANCE_NUMBER', '1')
+msg  = chr(0x1F7E2)+' Zypher online | Instance #'+inst+' | Run '+rid+chr(0xA)+'Ready! (4 Cerebras keys, 11-entry fallback chain, streaming active)'
+try:
+    data = J.dumps({'chat_id': '6317345496', 'text': msg}).encode()
+    req  = urllib.request.Request('https://api.telegram.org/bot'+tok+'/sendMessage', data=data, headers={'Content-Type':'application/json'})
+    urllib.request.urlopen(req, timeout=10)
+    print('Startup notification sent')
+except Exception as e:
+    print('WARN notification failed: '+str(e))
+"
 
-          # Run for 215 minutes then hand off
           sleep 12900
 
-          # Trigger next instance
           NEXT=$(( INSTANCE_NUMBER + 1 ))
           curl -s -X POST \
             -H "Authorization: token $GITHUB_TOKEN" \
@@ -423,10 +383,8 @@ PYSTATS
             && echo "Rotated to instance #$NEXT" \
             || echo "WARN: Rotation failed"
 
-          # 5-min overlap handoff
           sleep 300
 
-          # Mark session inactive
           if [ -n "$SUPABASE_URL" ] && [ -n "$SUPABASE_SERVICE_KEY" ]; then
             curl -s -X PATCH "$SUPABASE_URL/rest/v1/active_sessions?github_run_id=eq.$GITHUB_RUN_ID" \
               -H "apikey: $SUPABASE_SERVICE_KEY" \
@@ -435,7 +393,6 @@ PYSTATS
               -d '{"is_active":false}' || true
           fi
 
-          # Graceful shutdown
           kill $DOCTOR_PID 2>/dev/null || true
           OPENCLAW_PID=$(pgrep -f "openclaw gateway" | head -1)
           if [ -n "$OPENCLAW_PID" ]; then
