@@ -31,7 +31,7 @@
     "providers": {
       "cerebras": {
         "baseUrl": "https://api.cerebras.ai/v1",
-        "apiKey": "${CEREBRAS_API_KEY}",
+        "apiKey": "CEREBRAS_KEY_HERE",
         "api": "openai-completions",
         "models": [
           { "id": "qwen3-32b",     "name": "Qwen3 32B" },
@@ -53,7 +53,12 @@
   "browser": {
     "enabled": true,
     "headless": true,
-    "profiles": { "openclaw": { "headless": true } }
+    "profiles": {
+      "openclaw": {
+        "headless": true,
+        "color": "green"
+      }
+    }
   },
   "plugins": {
     "entries": {

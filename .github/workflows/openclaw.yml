@@ -101,26 +101,40 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TAVILY_API_KEY:      ${{ secrets.TAVILY_KEY_1 }}
+          CEREBRAS_API_KEY:    ${{ secrets.CEREBRAS_KEY_1 }}
         run: |
           mkdir -p ~/.openclaw/workspace
           cp AGENTS.md ~/.openclaw/workspace/AGENTS.md
+          # Substitute all three secrets as literal values so openclaw never
+          # needs to resolve env-var placeholders — avoids "Missing env var" errors
           sed \
             -e "s|TAVILY_KEY_HERE|${TAVILY_API_KEY}|g" \
             -e "s|TELEGRAM_TOKEN_HERE|${TELEGRAM_BOT_TOKEN}|g" \
+            -e "s|CEREBRAS_KEY_HERE|${CEREBRAS_API_KEY}|g" \
             scripts/oc_template.json > ~/.openclaw/openclaw.json
           echo '{ "security": "full", "ask": "off" }' > ~/.openclaw/exec-approvals.json
-          echo "openclaw.json written — Telegram token injected, Tavily key injected, gateway.mode=local"
-          # Sanity: confirm neither placeholder survived
-          if grep -q "TELEGRAM_TOKEN_HERE\|TAVILY_KEY_HERE" ~/.openclaw/openclaw.json; then
+          echo "openclaw.json written — all tokens injected (Telegram, Tavily, Cerebras, gateway.mode=local)"
+          # Sanity: confirm no placeholder survived
+          if grep -qE "TELEGRAM_TOKEN_HERE|TAVILY_KEY_HERE|CEREBRAS_KEY_HERE" ~/.openclaw/openclaw.json; then
             echo "ERROR: Template placeholders were not substituted"
             exit 1
           fi
           # Sanity: confirm gateway.mode is present
-          if ! grep -q '"mode"' ~/.openclaw/openclaw.json; then
-            echo "ERROR: gateway.mode missing from openclaw.json"
+          if ! python3 -c "import json; c=json.load(open('$HOME/.openclaw/openclaw.json')); assert c.get('gateway',{}).get('mode')=='local', 'gateway.mode missing'"; then
+            echo "ERROR: gateway.mode=local missing from openclaw.json"
             exit 1
           fi
-          echo "Template substitution and gateway.mode verified"
+          # Sanity: confirm browser.profiles.openclaw.color is a string
+          python3 -c "
+          import json, sys
+          c = json.load(open('$HOME/.openclaw/openclaw.json'))
+          color = c.get('browser',{}).get('profiles',{}).get('openclaw',{}).get('color','')
+          if not isinstance(color, str) or not color:
+              print('ERROR: browser.profiles.openclaw.color is missing or not a string')
+              sys.exit(1)
+          print(f'browser.profiles.openclaw.color = {color!r}  OK')
+          "
+          echo "All template sanity checks passed"
 
       - name: Install stealth-browser + Tavily from ClawHub
         run: |
