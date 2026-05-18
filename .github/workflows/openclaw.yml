@@ -265,22 +265,30 @@ jobs:
           echo "Gateway PID $GATEWAY_PID — waiting 20 s for startup..."
           sleep 20
 
-          echo "=== Gateway startup status ==="
-          openclaw status 2>/dev/null || ps aux | grep openclaw | grep -v grep || echo "openclaw process not in ps"
+          echo "=== Gateway process check ==="
+          ps aux | grep "openclaw" | grep -v grep || echo "openclaw not in ps yet"
 
           echo "=== First 60 log lines ==="
           head -60 /tmp/openclaw.log 2>/dev/null || echo "(log empty)"
 
-          # Fail fast if the gateway already died
-          if ! kill -0 $GATEWAY_PID 2>/dev/null; then
+          # Fail fast if the gateway process already died (check openclaw, not tee)
+          OPENCLAW_ALIVE=$(pgrep -f "openclaw gateway" | head -1)
+          if [ -z "$OPENCLAW_ALIVE" ]; then
             echo "ERROR: Gateway exited within 20 s. Full log:"
             cat /tmp/openclaw.log
             exit 1
           fi
 
-          # Check for fatal startup errors in the log
-          if grep -qiE "fatal|unauthorized|invalid token|EFATAL|cannot read" /tmp/openclaw.log 2>/dev/null; then
-            echo "ERROR: Fatal errors detected in gateway log. Full log:"
+          # Confirm the gateway reached the ready state in the log
+          if ! grep -q "gateway ready\|http server listening" /tmp/openclaw.log 2>/dev/null; then
+            echo "ERROR: Gateway did not reach ready state. Full log:"
+            cat /tmp/openclaw.log
+            exit 1
+          fi
+
+          # Check for hard fatal startup errors only (not auth warnings from status checks)
+          if grep -qE "EFATAL|config.*invalid|invalid.*config|fatal.*error" /tmp/openclaw.log 2>/dev/null; then
+            echo "ERROR: Fatal config errors detected in gateway log. Full log:"
             cat /tmp/openclaw.log
             exit 1
           fi

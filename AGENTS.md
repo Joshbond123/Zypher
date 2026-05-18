@@ -65,8 +65,8 @@ Use Supabase to **remember important facts, completed tasks, research findings, 
 You have up to 5 Cerebras API keys available as env vars:
 - CEREBRAS_API_KEY, CEREBRAS_API_KEY_2, CEREBRAS_API_KEY_3, CEREBRAS_API_KEY_4, CEREBRAS_API_KEY_5
 
-Use model: `cerebras/qwen3-32b` (primary)
-Fallback: `cerebras/gpt-oss-120b`
+Use model: `cerebras/llama-3.3-70b` (primary)
+Fallback: `cerebras/llama3.1-8b`
 
 ---
 
