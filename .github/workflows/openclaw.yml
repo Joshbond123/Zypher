@@ -47,9 +47,9 @@ jobs:
 
       - name: Validate secrets are present
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          CEREBRAS_API_KEY:   ${{ secrets.CEREBRAS_KEY_1 }}
-          SUPABASE_URL:       ${{ secrets.SUPABASE_URL }}
+          TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CEREBRAS_API_KEY:     ${{ secrets.CEREBRAS_KEY_1 }}
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: |
           MISSING=0
@@ -102,14 +102,33 @@ jobs:
         run: |
           mkdir -p ~/.openclaw/workspace
           cp AGENTS.md ~/.openclaw/workspace/AGENTS.md
-          TAVILY_VAL="${TAVILY_API_KEY:-disabled-not-configured}"
-          [ -z "$TAVILY_API_KEY" ] && echo "WARN: TAVILY_KEY_1 not set — search disabled"
+
+          # --- Token substitution ---
           sed \
-            -e "s|TAVILY_KEY_HERE|${TAVILY_VAL}|g" \
             -e "s|TELEGRAM_TOKEN_HERE|${TELEGRAM_BOT_TOKEN}|g" \
             -e "s|CEREBRAS_KEY_HERE|${CEREBRAS_API_KEY}|g" \
+            -e "s|TAVILY_KEY_HERE|${TAVILY_API_KEY}|g" \
             scripts/oc_template.json > ~/.openclaw/openclaw.json
+
+          # --- Tavily: disable cleanly when no key is provided ---
+          # An invalid/empty apiKey with enabled:true causes auth failures that
+          # bubble up to the user as "Something went wrong". Disable the whole
+          # search provider when the key is absent.
+          if [ -z "$TAVILY_API_KEY" ]; then
+            echo "WARN: TAVILY_KEY_1 not set — disabling Tavily search provider"
+            jq '
+              .tools.web.search = {"provider": null, "enabled": false} |
+              .plugins.entries.tavily.enabled = false
+            ' ~/.openclaw/openclaw.json > /tmp/openclaw_patched.json \
+              && mv /tmp/openclaw_patched.json ~/.openclaw/openclaw.json \
+              || echo "WARN: jq patch failed — Tavily may error (non-fatal)"
+          else
+            echo "Tavily enabled with provided key"
+          fi
+
           echo '{ "security": "full", "ask": "off" }' > ~/.openclaw/exec-approvals.json
+
+          # --- Sanity checks ---
           if grep -qE "TELEGRAM_TOKEN_HERE|CEREBRAS_KEY_HERE" ~/.openclaw/openclaw.json; then
             echo "ERROR: Template placeholders not substituted"; exit 1
           fi
@@ -121,7 +140,11 @@ jobs:
           assert tg.get('enabled') == True, 'telegram not enabled'
           tok = tg.get('botToken','')
           assert tok and tok != 'TELEGRAM_TOKEN_HERE', 'botToken not injected'
-          print('Config OK')
+          recovery = c.get('gateway',{}).get('session',{}).get('errorRecovery','')
+          assert recovery == 'soft-reset', 'session.errorRecovery not set'
+          fallback = c.get('agents',{}).get('defaults',{}).get('model',{}).get('fallback','')
+          assert fallback, 'model fallback not configured'
+          print('Config OK — recovery=%s fallback=%s' % (recovery, fallback))
           " || exit 1
           echo "All config sanity checks passed"
 
@@ -180,7 +203,8 @@ jobs:
           if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_SERVICE_KEY" ]; then
             echo "Supabase not configured — skipping"; exit 0
           fi
-          EXPIRES=$(date -u -d '+4 hours' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u '+%Y-%m-%dT%H:%M:%SZ')
+          EXPIRES=$(date -u -d '+4 hours' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+            || python3 -c "from datetime import datetime,timezone,timedelta; print((datetime.now(timezone.utc)+timedelta(hours=4)).strftime('%Y-%m-%dT%H:%M:%SZ'))")
           curl -s -X POST "$SUPABASE_URL/rest/v1/active_sessions" \
             -H "apikey: $SUPABASE_SERVICE_KEY" \
             -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
@@ -230,16 +254,20 @@ jobs:
               cfg = json.load(open(os.path.expanduser('~/.openclaw/openclaw.json')))
               tg  = cfg.get('channels', {}).get('telegram', {})
               has_token = bool(tg.get('botToken', ''))
-              print('  enabled=%s  dmPolicy=%s  botToken_set=%s' % (tg.get('enabled'), tg.get('dmPolicy'), has_token))
+              rec = cfg.get('gateway', {}).get('session', {}).get('errorRecovery', 'NOT SET')
+              fallback = cfg.get('agents', {}).get('defaults', {}).get('model', {}).get('fallback', 'NOT SET')
+              print('  enabled=%s  dmPolicy=%s  botToken_set=%s  recovery=%s  fallback=%s' % (
+                  tg.get('enabled'), tg.get('dmPolicy'), has_token, rec, fallback))
               if not has_token:
                   print('ERROR: botToken missing — bot will not respond')
                   sys.exit(1)
           except Exception as e:
               print('Could not validate config: %s' % e)
+              sys.exit(1)
           "
 
           echo "Starting Zypher gateway..."
-          openclaw gateway 2>&1 | tee /tmp/openclaw.log &
+          openclaw gateway --config ~/.openclaw/openclaw.json 2>&1 | tee /tmp/openclaw.log &
           TEE_PID=$!
 
           READY=0
@@ -273,6 +301,7 @@ jobs:
 
           echo "Health checks passed — LIVE: @Zypher0_bot | Run $GITHUB_RUN_ID"
 
+          # Send startup notification to Telegram
           python3 -c "
           import os, urllib.request, json as J
           tok  = os.environ.get('TELEGRAM_BOT_TOKEN', '')
@@ -291,8 +320,10 @@ jobs:
               print('WARN notification failed: ' + str(e))
           "
 
+          # Run for 220 minutes (session_duration - graceful_stop buffer)
           sleep 13200
 
+          # Trigger next instance before this one stops (seamless handoff)
           NEXT=$(( INSTANCE_NUMBER + 1 ))
           curl -s -X POST \
             -H "Authorization: token $GITHUB_TOKEN" \
@@ -304,6 +335,7 @@ jobs:
 
           sleep 120
 
+          # Mark session inactive in Supabase
           if [ -n "$SUPABASE_URL" ] && [ -n "$SUPABASE_SERVICE_KEY" ]; then
             curl -s -X PATCH "$SUPABASE_URL/rest/v1/active_sessions?github_run_id=eq.$GITHUB_RUN_ID" \
               -H "apikey: $SUPABASE_SERVICE_KEY" \
@@ -312,6 +344,7 @@ jobs:
               -d '{"is_active":false}' || true
           fi
 
+          # Graceful shutdown
           OPENCLAW_PID=$(pgrep -f "openclaw gateway" | head -1)
           if [ -n "$OPENCLAW_PID" ]; then
             kill -TERM "$OPENCLAW_PID" 2>/dev/null || true
