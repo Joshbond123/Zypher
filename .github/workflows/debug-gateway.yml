@@ -25,7 +25,6 @@ jobs:
           CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_KEY_1 }}
         run: |
           echo "=== Cerebras key test ==="
-          echo "Key length: ${#CEREBRAS_API_KEY} | prefix: ${CEREBRAS_API_KEY:0:12}..."
           HTTP=$(curl -s -o /tmp/cb_resp.json -w "%{http_code}" \
             -H "Authorization: Bearer $CEREBRAS_API_KEY" \
             https://api.cerebras.ai/v1/models)
@@ -57,7 +56,42 @@ jobs:
           except Exception as e: print('Parse error:', e, sys.stdin.read()[:200])
           " 2>/dev/null
 
-      - name: Build config + start gateway (verbose, 90s)
+      - name: Dump onboard-generated default config
+        env:
+          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_KEY_1 }}
+        run: |
+          echo "=== Running openclaw onboard to see default config structure ==="
+          openclaw onboard \
+            --non-interactive \
+            --mode local \
+            --auth-choice cerebras-api-key \
+            --cerebras-api-key "$CEREBRAS_API_KEY" \
+            --accept-risk \
+            --skip-health \
+            --skip-bootstrap \
+            2>&1 || true
+
+          echo "=== openclaw onboard generated config (structure only, keys masked) ==="
+          python3 -c "
+          import json, re, os
+          f = os.path.expanduser('~/.openclaw/openclaw.json')
+          if os.path.exists(f):
+              raw = open(f).read()
+              masked = re.sub(r'\"(apiKey|botToken|key|token)\"\s*:\s*\"[^\"]{4,}\"', '\"\\\\1\": \"***\"', raw)
+              print(masked)
+          else:
+              print('FILE NOT FOUND:', f)
+          "
+
+          echo ""
+          echo "=== openclaw gateway help ==="
+          openclaw gateway --help 2>&1 || true
+
+          echo ""
+          echo "=== openclaw configure --section agents --help (if exists) ==="
+          openclaw configure --help 2>&1 || true
+
+      - name: Test gateway with onboard-default config (90s)
         env:
           TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CEREBRAS_API_KEY:     ${{ secrets.CEREBRAS_KEY_1 }}
@@ -65,38 +99,18 @@ jobs:
           SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: |
-          mkdir -p ~/.openclaw/workspace/memory
-          printf "# Memory\nFresh debug session\n" > ~/.openclaw/workspace/MEMORY.md
-          echo '{"security":"full","ask":"off"}' > ~/.openclaw/exec-approvals.json
-
-          # Build config from template
-          sed \
-            -e "s|TELEGRAM_TOKEN_HERE|${TELEGRAM_BOT_TOKEN}|g" \
-            -e "s|CEREBRAS_KEY_HERE|${CEREBRAS_API_KEY}|g" \
-            -e "s|TAVILY_KEY_HERE|${TAVILY_API_KEY:-disabled}|g" \
-            -e "s|SUPABASE_URL_HERE|${SUPABASE_URL:-disabled}|g" \
-            -e "s|SUPABASE_KEY_HERE|${SUPABASE_SERVICE_KEY:-disabled}|g" \
-            scripts/oc_template.json > ~/.openclaw/openclaw.json
-
-          # If Tavily key is "disabled", turn off search
-          if grep -q '"apiKey": "disabled"' ~/.openclaw/openclaw.json; then
-            python3 -c "
-          import json,os
-          f=os.path.expanduser('~/.openclaw/openclaw.json')
-          c=json.load(open(f))
-          c['tools']['web']['search']={'provider':None,'enabled':False}
-          c['plugins']['entries']['tavily']['enabled']=False
-          json.dump(c,open(f,'w'),indent=2)
-          print('Tavily disabled')
-          "
-          fi
-
-          echo "=== Config (masked) ==="
+          # Inject just the telegram token + cerebras key into the onboard-generated config
+          # This uses the minimal config the onboard step already wrote
           python3 -c "
-          import json,re,os
-          raw=open(os.path.expanduser('~/.openclaw/openclaw.json')).read()
-          m=re.sub(r'\"(apiKey|botToken|key)\"\s*:\s*\"[^\"]{6,}\"','\"\\\\1\": \"***\"',raw)
-          print(m)
+          import json, os
+          f = os.path.expanduser('~/.openclaw/openclaw.json')
+          c = json.load(open(f))
+          print('TOP-LEVEL KEYS:', list(c.keys()))
+          print('agents keys:', list(c.get('agents', {}).keys()))
+          print('agents.defaults keys:', list(c.get('agents', {}).get('defaults', {}).keys()))
+          print('gateway keys:', list(c.get('gateway', {}).keys()))
+          print('channels keys:', list(c.get('channels', {}).keys()))
+          print('models keys:', list(c.get('models', {}).keys()))
           "
 
           echo "=== Start gateway (90s verbose) ==="
@@ -107,5 +121,5 @@ jobs:
           cat /tmp/gw_debug.log
 
           echo ""
-          echo "=== ERROR LINES ==="
-          grep -i "error\|fatal\|fail\|wrong\|invalid\|401\|403\|auth" /tmp/gw_debug.log || echo "(no error lines)"
+          echo "=== ERROR/WARNING LINES ==="
+          grep -iE "error|fatal|fail|wrong|invalid|unrecog|warn" /tmp/gw_debug.log || echo "(no error lines)"
