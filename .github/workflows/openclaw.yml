@@ -1,255 +1,242 @@
 name: Zypher OpenClaw Agent
 
-  on:
-    workflow_dispatch:
-      inputs:
-        instance_number:
-          description: 'Instance number for tracking'
-          required: false
-          default: '1'
-    schedule:
-      - cron: '0 */4 * * *'
+on:
+  workflow_dispatch:
+    inputs:
+      instance_number:
+        description: 'Instance number for tracking'
+        required: false
+        default: '1'
+  schedule:
+    - cron: '0 */4 * * *'
 
-  jobs:
-    run-agent:
-      runs-on: ubuntu-latest
-      timeout-minutes: 235
+jobs:
+  run-agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 235
 
-      steps:
-        - name: Checkout repository
-          uses: actions/checkout@v4
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-        - name: Setup Node.js 24
-          uses: actions/setup-node@v4
-          with:
-            node-version: '24'
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
 
-        - name: Setup Python 3
-          uses: actions/setup-python@v5
-          with:
-            python-version: '3.11'
+      - name: Setup Python 3
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-        - name: Install security tools + Google Chrome
-          run: |
-            sudo apt-get update -qq
-            sudo apt-get install -y --no-install-recommends \
-              nmap nikto sqlmap gobuster \
-              hydra netcat-openbsd masscan \
-              curl wget git jq \
-              openssl net-tools whois dnsutils \
-              dirb wfuzz wordlists \
-              python3-pip python3-scapy \
-              2>/dev/null || true
-            wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -O /tmp/chrome.deb
-            sudo apt-get install -y /tmp/chrome.deb 2>/dev/null || \
-              (sudo dpkg -i /tmp/chrome.deb && sudo apt-get -f install -y 2>/dev/null) || true
-            echo "Tools ready | Chrome: $(google-chrome --version 2>/dev/null || echo not found)"
+      - name: Install security tools + Google Chrome
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            nmap nikto sqlmap gobuster \
+            hydra netcat-openbsd masscan \
+            curl wget git jq \
+            openssl net-tools whois dnsutils \
+            dirb wfuzz wordlists \
+            python3-pip python3-scapy \
+            2>/dev/null || true
+          wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -O /tmp/chrome.deb
+          sudo apt-get install -y /tmp/chrome.deb 2>/dev/null || \
+            (sudo dpkg -i /tmp/chrome.deb && sudo apt-get -f install -y 2>/dev/null) || true
+          echo "Tools ready | Chrome: $(google-chrome --version 2>/dev/null || echo not-found)"
 
-        - name: Install OpenClaw
-          run: |
-            npm install -g openclaw
-            echo "OpenClaw $(openclaw --version 2>/dev/null || echo installed)"
+      - name: Install OpenClaw
+        run: |
+          npm install -g openclaw
+          echo "OpenClaw $(openclaw --version 2>/dev/null || echo installed)"
 
-        - name: OpenClaw onboard (Cerebras)
-          env:
-            CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_KEY_1 }}
-            TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          run: |
-            openclaw onboard \
-              --non-interactive \
-              --mode local \
-              --auth-choice cerebras-api-key \
-              --cerebras-api-key "$CEREBRAS_API_KEY" \
-              --accept-risk \
-              --skip-health \
-              --skip-bootstrap
-            echo "Onboarded OK"
+      - name: OpenClaw onboard (Cerebras)
+        env:
+          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_KEY_1 }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          openclaw onboard \
+            --non-interactive \
+            --mode local \
+            --auth-choice cerebras-api-key \
+            --cerebras-api-key "$CEREBRAS_API_KEY" \
+            --accept-risk \
+            --skip-health \
+            --skip-bootstrap
+          echo "Onboarded OK"
 
-        - name: Install stealth-browser + Tavily from ClawHub
-          env:
-            TAVILY_API_KEY: ${{ secrets.TAVILY_KEY_1 }}
-          run: |
-            echo "--- Installing stealth-browser skill ---"
-            openclaw skills install clawhub:stealth-browser 2>&1 || \
-              openclaw plugins install clawhub:stealth-browser 2>&1 || \
-              echo "stealth-browser: using bundled fallback"
+      - name: Install stealth-browser + Tavily from ClawHub
+        run: |
+          echo "--- stealth-browser ---"
+          openclaw skills install clawhub:stealth-browser 2>&1 \
+            || openclaw plugins install clawhub:stealth-browser 2>&1 \
+            || echo "stealth-browser: bundled fallback active"
 
-            echo "--- Installing Tavily ---"
-            openclaw skills install clawhub:tavily 2>&1 || \
-              openclaw plugins install npm:@openclaw/tavily 2>&1 || \
-              echo "tavily: using API-key-only config"
+          echo "--- tavily ---"
+          openclaw skills install clawhub:tavily 2>&1 \
+            || openclaw plugins install npm:@openclaw/tavily 2>&1 \
+            || echo "tavily: API-key config will be used"
 
-            echo "--- Plugin list ---"
-            openclaw plugins list 2>/dev/null || true
-            openclaw skills list  2>/dev/null || true
-            echo "Install step done"
+          echo "--- installed ---"
+          openclaw plugins list 2>/dev/null || true
+          openclaw skills list  2>/dev/null || true
 
-        - name: Bootstrap memory from Supabase
-          env:
-            SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-            SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-            GITHUB_RUN_ID: ${{ github.run_id }}
-          run: |
-            mkdir -p ~/.openclaw/workspace
-            MSGS=$(curl -s "$SUPABASE_URL/rest/v1/chat_messages?order=created_at.desc&limit=30&select=role,content,created_at" \
-              -H "apikey: $SUPABASE_SERVICE_KEY" \
-              -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" 2>/dev/null || echo "[]")
-            FACTS=$(curl -s "$SUPABASE_URL/rest/v1/longterm_memory?order=created_at.desc&limit=20&select=key,value" \
-              -H "apikey: $SUPABASE_SERVICE_KEY" \
-              -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" 2>/dev/null || echo "[]")
-            python3 << 'PYEOF'
-  import json, os
-  run_id = os.environ.get("GITHUB_RUN_ID","unknown")
-  msgs_str  = os.environ.get("MSGS","[]")
-  facts_str = os.environ.get("FACTS","[]")
-  try:    msgs  = json.loads(msgs_str)
-  except: msgs  = []
-  try:    facts = json.loads(facts_str)
-  except: facts = []
-  msgs.reverse()
-  lines = [f"# Zypher Memory — Run {run_id}", "## Facts"]
-  lines += [f"- {f.get('key','?')}: {str(f.get('value',''))[:200]}" for f in facts] or ["(none yet)"]
-  lines += ["","## Conversation History"]
-  lines += [f"[{m.get('created_at','')[:16]}] {m.get('role','?').upper()}: {str(m.get('content',''))[:300]}" for m in msgs] or ["(none)"]
-  open(os.path.expanduser("~/.openclaw/workspace/MEMORY.md"),"w").write("
-".join(lines))
-  print(f"Memory bootstrapped: {len(msgs)} messages, {len(facts)} facts")
-  PYEOF
-            echo "Memory ready"
-          env:
-            SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-            SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-            GITHUB_RUN_ID: ${{ github.run_id }}
-            MSGS: $(curl -s "$SUPABASE_URL/rest/v1/chat_messages?order=created_at.desc&limit=30&select=role,content,created_at" -H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" 2>/dev/null || echo "[]")
-            FACTS: $(curl -s "$SUPABASE_URL/rest/v1/longterm_memory?order=created_at.desc&limit=20&select=key,value" -H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" 2>/dev/null || echo "[]")
+      - name: Bootstrap memory from Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          mkdir -p ~/.openclaw/workspace
+          MSGS=$(curl -s "$SUPABASE_URL/rest/v1/chat_messages?order=created_at.desc&limit=30&select=role,content,created_at" \
+            -H "apikey: $SUPABASE_SERVICE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" 2>/dev/null || echo "[]")
+          FACTS=$(curl -s "$SUPABASE_URL/rest/v1/longterm_memory?order=created_at.desc&limit=20&select=key,value" \
+            -H "apikey: $SUPABASE_SERVICE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" 2>/dev/null || echo "[]")
+          python3 - "$MSGS" "$FACTS" << 'PYEOF'
+import json, sys, os
+try:    msgs  = json.loads(sys.argv[1]) if len(sys.argv) > 1 else []
+except: msgs  = []
+try:    facts = json.loads(sys.argv[2]) if len(sys.argv) > 2 else []
+except: facts = []
+msgs.reverse()
+run_id = os.environ.get("GITHUB_RUN_ID","unknown")
+lines = [f"# Zypher Memory — Run {run_id}", "## Long-term Facts"]
+lines += [f"- {f.get('key','?')}: {str(f.get('value',''))[:200]}" for f in facts] or ["(none yet)"]
+lines += ["", "## Conversation History (last 30)"]
+lines += [f"[{m.get('created_at','')[:16]}] {m.get('role','?').upper()}: {str(m.get('content',''))[:300]}" for m in msgs] or ["(none)"]
+open(os.path.expanduser("~/.openclaw/workspace/MEMORY.md"), "w").write("\n".join(lines))
+print(f"Memory bootstrapped: {len(msgs)} messages, {len(facts)} facts")
+PYEOF
+          echo "Memory ready"
 
-        - name: Write openclaw.json
-          env:
-            TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-            TAVILY_API_KEY: ${{ secrets.TAVILY_KEY_1 }}
-          run: |
-            mkdir -p ~/.openclaw/workspace
-            cp AGENTS.md ~/.openclaw/workspace/AGENTS.md
-            TKEY="$TAVILY_API_KEY"
-            cat > /tmp/oc.json << OCEOF
-  {
-    "agents": {
-      "defaults": {
-        "workspace": "~/.openclaw/workspace",
-        "model": { "primary": "cerebras/qwen-3-235b-a22b-instruct-2507" }
-      },
-      "list": [
-        {
-          "id": "zypher",
-          "identity": {
-            "name": "Zypher",
-            "theme": "elite AI hacker — uses stealth-browser and Tavily",
-            "emoji": "👾"
-          }
+      - name: Write openclaw.json (stealth-browser + Tavily + headless Chrome)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_KEY_1 }}
+        run: |
+          mkdir -p ~/.openclaw/workspace
+          cp AGENTS.md ~/.openclaw/workspace/AGENTS.md
+          TKEY="$TAVILY_API_KEY"
+          cat > /tmp/oc_raw.json << 'OCEOF'
+{
+  "agents": {
+    "defaults": {
+      "workspace": "~/.openclaw/workspace",
+      "model": { "primary": "cerebras/qwen-3-235b-a22b-instruct-2507" }
+    },
+    "list": [
+      {
+        "id": "zypher",
+        "identity": {
+          "name": "Zypher",
+          "theme": "elite AI hacker — master of stealth-browser and Tavily web research",
+          "emoji": "👾"
         }
-      ]
-    },
-    "channels": {
-      "telegram": {
-        "enabled": true,
-        "dmPolicy": "allowlist",
-        "allowFrom": ["6317345496"]
       }
-    },
-    "tools": {
-      "profile": "full",
-      "exec": { "timeoutSec": 120, "security": "full" },
-      "web": {
-        "search": { "provider": "tavily" },
-        "fetch":  { "enabled": true, "maxChars": 60000 }
-      }
-    },
-    "browser": {
+    ]
+  },
+  "channels": {
+    "telegram": {
       "enabled": true,
-      "headless": true,
-      "profiles": { "openclaw": { "headless": true } }
-    },
-    "plugins": {
-      "entries": {
-        "tavily":  { "enabled": true, "config": { "apiKey": "TAVILY_PLACEHOLDER" } },
-        "browser": { "enabled": true }
-      }
-    },
-    "logging": {
-      "level": "info",
-      "file": "/tmp/openclaw.log",
-      "consoleLevel": "info",
-      "consoleStyle": "pretty"
+      "dmPolicy": "allowlist",
+      "allowFrom": ["6317345496"]
     }
+  },
+  "tools": {
+    "profile": "full",
+    "exec": { "timeoutSec": 120, "security": "full" },
+    "web": {
+      "search": { "provider": "tavily" },
+      "fetch":  { "enabled": true, "maxChars": 60000 }
+    }
+  },
+  "browser": {
+    "enabled": true,
+    "headless": true,
+    "profiles": { "openclaw": { "headless": true } }
+  },
+  "plugins": {
+    "entries": {
+      "tavily":  { "enabled": true, "config": { "apiKey": "TAVILY_KEY_HERE" } },
+      "browser": { "enabled": true }
+    }
+  },
+  "logging": {
+    "level": "info",
+    "file": "/tmp/openclaw.log",
+    "consoleLevel": "info",
+    "consoleStyle": "pretty"
   }
-  OCEOF
-            sed "s/TAVILY_PLACEHOLDER/$TKEY/" /tmp/oc.json > ~/.openclaw/openclaw.json
-            echo '{ "security": "full", "ask": "off" }' > ~/.openclaw/exec-approvals.json
-            echo "openclaw.json written — Tavily key injected, browser headless enabled"
+}
+OCEOF
+          sed "s/TAVILY_KEY_HERE/$TKEY/" /tmp/oc_raw.json > ~/.openclaw/openclaw.json
+          echo '{ "security": "full", "ask": "off" }' > ~/.openclaw/exec-approvals.json
+          echo "openclaw.json ready — stealth-browser + tavily + headless browser"
 
-        - name: Register session in Supabase
-          env:
-            SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-            SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-            GITHUB_RUN_ID: ${{ github.run_id }}
-            INSTANCE_NUMBER: ${{ github.event.inputs.instance_number || '1' }}
-          run: |
-            EXPIRES=$(date -u -d '+4 hours' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u '+%Y-%m-%dT%H:%M:%SZ')
-            curl -s -X POST "$SUPABASE_URL/rest/v1/active_sessions" \
-              -H "apikey: $SUPABASE_SERVICE_KEY" \
-              -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
-              -H "Content-Type: application/json" \
-              -H "Prefer: return=minimal" \
-              -d "{\"github_run_id\":\"$GITHUB_RUN_ID\",\"workflow_name\":\"openclaw.yml\",\"instance_number\":$INSTANCE_NUMBER,\"is_active\":true,\"expires_at\":\"$EXPIRES\"}" \
-              && echo "Session registered" || echo "Session skipped"
+      - name: Register session in Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          INSTANCE_NUMBER: ${{ github.event.inputs.instance_number || '1' }}
+        run: |
+          EXPIRES=$(date -u -d '+4 hours' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u '+%Y-%m-%dT%H:%M:%SZ')
+          curl -s -X POST "$SUPABASE_URL/rest/v1/active_sessions" \
+            -H "apikey: $SUPABASE_SERVICE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+            -H "Content-Type: application/json" \
+            -H "Prefer: return=minimal" \
+            -d "{\"github_run_id\":\"$GITHUB_RUN_ID\",\"workflow_name\":\"openclaw.yml\",\"instance_number\":$INSTANCE_NUMBER,\"is_active\":true,\"expires_at\":\"$EXPIRES\"}" \
+            && echo "Session registered" || echo "Session skipped"
 
-        - name: Start Supabase bridge sidecar
-          env:
-            SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-            SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-            GITHUB_RUN_ID: ${{ github.run_id }}
-          run: |
-            python3 scripts/zypher_agent.py > /tmp/sidecar.log 2>&1 &
-            echo "Supabase sidecar started PID $!"
+      - name: Start Supabase bridge sidecar
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          python3 scripts/zypher_agent.py > /tmp/sidecar.log 2>&1 &
+          echo "Supabase sidecar PID $!"
 
-        - name: Start OpenClaw Gateway — Zypher live
-          env:
-            TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-            CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_KEY_1 }}
-            TAVILY_API_KEY: ${{ secrets.TAVILY_KEY_1 }}
-            SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-            SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-            GITHUB_RUN_ID: ${{ github.run_id }}
-            GITHUB_TOKEN: ${{ secrets.GH_PAT }}
-            GITHUB_REPO: ${{ github.repository }}
-            INSTANCE_NUMBER: ${{ github.event.inputs.instance_number || '1' }}
-          run: |
-            echo "Starting Zypher — stealth-browser + Tavily + Supabase memory..."
-            export TELEGRAM_BOT_TOKEN CEREBRAS_API_KEY TAVILY_API_KEY SUPABASE_URL SUPABASE_SERVICE_KEY GITHUB_RUN_ID
-            openclaw gateway 2>&1 | tee /tmp/openclaw.log &
-            GATEWAY_PID=$!
-            sleep 15
-            echo "=== Zypher Status ==="
-            openclaw status 2>/dev/null || ps aux | grep openclaw | grep -v grep
-            echo "LIVE: @Zypher0_bot | Instance #${INSTANCE_NUMBER} | Run $GITHUB_RUN_ID"
+      - name: Start OpenClaw Gateway — Zypher live
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_KEY_1 }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_KEY_1 }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+          GITHUB_REPO: ${{ github.repository }}
+          INSTANCE_NUMBER: ${{ github.event.inputs.instance_number || '1' }}
+        run: |
+          echo "Starting Zypher — stealth-browser + Tavily + Supabase memory..."
+          export TELEGRAM_BOT_TOKEN CEREBRAS_API_KEY TAVILY_API_KEY SUPABASE_URL SUPABASE_SERVICE_KEY GITHUB_RUN_ID
+          openclaw gateway 2>&1 | tee /tmp/openclaw.log &
+          GATEWAY_PID=$!
+          sleep 15
+          echo "=== Zypher Status ==="
+          openclaw status 2>/dev/null || ps aux | grep openclaw | grep -v grep
+          echo "LIVE: @Zypher0_bot | Instance #${INSTANCE_NUMBER} | Run $GITHUB_RUN_ID"
 
-            sleep 13200
+          sleep 13200
 
-            NEXT=$(( INSTANCE_NUMBER + 1 ))
-            curl -s -X POST \
-              -H "Authorization: token $GITHUB_TOKEN" \
-              -H "Accept: application/vnd.github.v3+json" \
-              "https://api.github.com/repos/$GITHUB_REPO/actions/workflows/openclaw.yml/dispatches" \
-              -d "{\"ref\":\"main\",\"inputs\":{\"instance_number\":\"$NEXT\"}}" \
-              && echo "Rotated to instance #$NEXT" || echo "Rotation failed"
+          NEXT=$(( INSTANCE_NUMBER + 1 ))
+          curl -s -X POST \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/$GITHUB_REPO/actions/workflows/openclaw.yml/dispatches" \
+            -d "{\"ref\":\"main\",\"inputs\":{\"instance_number\":\"$NEXT\"}}" \
+            && echo "Rotated to instance #$NEXT" || echo "Rotation failed"
 
-            sleep 120
-            curl -s -X PATCH "$SUPABASE_URL/rest/v1/active_sessions?github_run_id=eq.$GITHUB_RUN_ID" \
-              -H "apikey: $SUPABASE_SERVICE_KEY" \
-              -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
-              -H "Content-Type: application/json" \
-              -d '{"is_active":false}' || true
-            kill -TERM $GATEWAY_PID 2>/dev/null
-            wait $GATEWAY_PID 2>/dev/null || true
-            echo "Zypher stopped cleanly"
-  
+          sleep 120
+          curl -s -X PATCH "$SUPABASE_URL/rest/v1/active_sessions?github_run_id=eq.$GITHUB_RUN_ID" \
+            -H "apikey: $SUPABASE_SERVICE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+            -H "Content-Type: application/json" \
+            -d '{"is_active":false}' || true
+          kill -TERM $GATEWAY_PID 2>/dev/null
+          wait $GATEWAY_PID 2>/dev/null || true
+          echo "Zypher stopped cleanly"
