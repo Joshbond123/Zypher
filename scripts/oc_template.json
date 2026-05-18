@@ -84,6 +84,19 @@
       },
       "browser": {
         "enabled": true
+      },
+      "supabase": {
+        "enabled": true,
+        "config": {
+          "url": "SUPABASE_URL_HERE",
+          "key": "SUPABASE_KEY_HERE",
+          "schema": "public",
+          "tables": {
+            "messages": "chat_messages",
+            "memory":   "longterm_memory",
+            "sessions": "active_sessions"
+          }
+        }
       }
     }
   },
