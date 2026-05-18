@@ -96,11 +96,14 @@ jobs:
 
       - name: Write openclaw.json from template
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TAVILY_API_KEY:      ${{ secrets.TAVILY_KEY_1 }}
-          CEREBRAS_API_KEY:    ${{ secrets.CEREBRAS_KEY_1 }}
+          TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TAVILY_API_KEY:       ${{ secrets.TAVILY_KEY_1 }}
+          TAVILY_API_KEY_2:     ${{ secrets.TAVILY_KEY_2 }}
+          CEREBRAS_API_KEY:     ${{ secrets.CEREBRAS_KEY_1 }}
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: |
-          mkdir -p ~/.openclaw/workspace
+          mkdir -p ~/.openclaw/workspace/memory
           cp AGENTS.md ~/.openclaw/workspace/AGENTS.md
 
           # --- Token substitution ---
@@ -108,22 +111,25 @@ jobs:
             -e "s|TELEGRAM_TOKEN_HERE|${TELEGRAM_BOT_TOKEN}|g" \
             -e "s|CEREBRAS_KEY_HERE|${CEREBRAS_API_KEY}|g" \
             -e "s|TAVILY_KEY_HERE|${TAVILY_API_KEY}|g" \
+            -e "s|SUPABASE_URL_HERE|${SUPABASE_URL}|g" \
+            -e "s|SUPABASE_KEY_HERE|${SUPABASE_SERVICE_KEY}|g" \
             scripts/oc_template.json > ~/.openclaw/openclaw.json
 
-          # --- Tavily: disable cleanly when no key is provided ---
-          # An invalid/empty apiKey with enabled:true causes auth failures that
-          # bubble up to the user as "Something went wrong". Disable the whole
-          # search provider when the key is absent.
-          if [ -z "$TAVILY_API_KEY" ]; then
-            echo "WARN: TAVILY_KEY_1 not set — disabling Tavily search provider"
-            jq '
-              .tools.web.search = {"provider": null, "enabled": false} |
-              .plugins.entries.tavily.enabled = false
-            ' ~/.openclaw/openclaw.json > /tmp/openclaw_patched.json \
-              && mv /tmp/openclaw_patched.json ~/.openclaw/openclaw.json \
-              || echo "WARN: jq patch failed — Tavily may error (non-fatal)"
+          # --- Tavily: use KEY_2 as fallback or disable cleanly ---
+          # If KEY_1 is absent but KEY_2 is present, use KEY_2
+          if [ -z "$TAVILY_API_KEY" ] && [ -n "$TAVILY_API_KEY_2" ]; then
+            echo "INFO: TAVILY_KEY_1 absent — using TAVILY_KEY_2 as primary"
+            jq ".tools.web.search.apiKey = \"${TAVILY_API_KEY_2}\" | .plugins.entries.tavily.enabled = true" \
+              ~/.openclaw/openclaw.json > /tmp/oc_patched.json \
+              && mv /tmp/oc_patched.json ~/.openclaw/openclaw.json
+          elif [ -z "$TAVILY_API_KEY" ]; then
+            # No key at all — disable Tavily completely so it doesn't error
+            echo "WARN: No Tavily key — disabling search provider"
+            jq '.tools.web.search = {"provider": null, "enabled": false} | .plugins.entries.tavily.enabled = false' \
+              ~/.openclaw/openclaw.json > /tmp/oc_patched.json \
+              && mv /tmp/oc_patched.json ~/.openclaw/openclaw.json
           else
-            echo "Tavily enabled with provided key"
+            echo "Tavily KEY_1 active"
           fi
 
           echo '{ "security": "full", "ask": "off" }' > ~/.openclaw/exec-approvals.json
@@ -144,9 +150,19 @@ jobs:
           assert recovery == 'soft-reset', 'session.errorRecovery not set'
           fallback = c.get('agents',{}).get('defaults',{}).get('model',{}).get('fallback','')
           assert fallback, 'model fallback not configured'
-          print('Config OK — recovery=%s fallback=%s' % (recovery, fallback))
+          sb = c.get('plugins',{}).get('entries',{}).get('supabase',{})
+          sb_url = sb.get('config',{}).get('url','')
+          sb_ok = bool(sb_url) and sb_url != 'SUPABASE_URL_HERE'
+          print('Config OK — recovery=%s fallback=%s supabase_plugin=%s' % (recovery, fallback, sb_ok))
           " || exit 1
           echo "All config sanity checks passed"
+          echo "=== Final config (keys masked) ==="
+          python3 -c "
+          import json, os, re
+          raw = open(os.path.expanduser('~/.openclaw/openclaw.json')).read()
+          masked = re.sub(r'(\"apiKey\"|\"botToken\"|\"key\")\s*:\s*\"[^\"]{8,}\"', r'\1: \"***\"', raw)
+          print(masked[:2000])
+          "
 
       - name: Install stealth-browser + Tavily from ClawHub
         run: |
@@ -155,17 +171,19 @@ jobs:
             || echo "stealth-browser bundled fallback active"
           openclaw skills install clawhub:tavily 2>&1 \
             || openclaw plugins install npm:@openclaw/tavily 2>&1 \
-            || echo "tavily API-key config will be used"
+            || echo "tavily skill install skipped (key-based config in use)"
+          openclaw plugins install clawhub:supabase 2>&1 \
+            || echo "supabase plugin install skipped (REST-API fallback active)"
           openclaw plugins list 2>/dev/null || true
           openclaw skills list  2>/dev/null || true
 
       - name: Bootstrap memory from Supabase
         env:
-          SUPABASE_URL:        ${{ secrets.SUPABASE_URL }}
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-          GITHUB_RUN_ID:       ${{ github.run_id }}
+          GITHUB_RUN_ID:        ${{ github.run_id }}
         run: |
-          mkdir -p ~/.openclaw/workspace
+          mkdir -p ~/.openclaw/workspace/memory
           echo "[]" > /tmp/sb_msgs.json
           echo "[]" > /tmp/sb_facts.json
           if [ -n "$SUPABASE_URL" ] && [ -n "$SUPABASE_SERVICE_KEY" ]; then
@@ -192,33 +210,43 @@ jobs:
             && echo "Memory bootstrapped" \
             || { echo "Bootstrap error — using blank memory"; \
                  printf "# Zypher Memory\nFresh session\n" > ~/.openclaw/workspace/MEMORY.md; }
+          # Write today's daily note placeholder (OpenClaw reads memory/YYYY-MM-DD.md)
+          TODAY=$(date -u '+%Y-%m-%d')
+          DAILY_NOTE=~/.openclaw/workspace/memory/${TODAY}.md
+          if [ ! -f "$DAILY_NOTE" ]; then
+            printf "# Zypher Daily Notes — %s\nSession: %s\n" "$TODAY" "$GITHUB_RUN_ID" > "$DAILY_NOTE"
+            echo "Daily note created: $DAILY_NOTE"
+          fi
 
       - name: Register session in Supabase
         env:
-          SUPABASE_URL:        ${{ secrets.SUPABASE_URL }}
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-          GITHUB_RUN_ID:       ${{ github.run_id }}
-          INSTANCE_NUMBER:     ${{ github.event.inputs.instance_number || '1' }}
+          GITHUB_RUN_ID:        ${{ github.run_id }}
+          INSTANCE_NUMBER:      ${{ github.event.inputs.instance_number || '1' }}
         run: |
           if [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_SERVICE_KEY" ]; then
             echo "Supabase not configured — skipping"; exit 0
           fi
-          EXPIRES=$(date -u -d '+4 hours' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
-            || python3 -c "from datetime import datetime,timezone,timedelta; print((datetime.now(timezone.utc)+timedelta(hours=4)).strftime('%Y-%m-%dT%H:%M:%SZ'))")
+          # Use Python for portable +4h timestamp (GNU date -d may not be available)
+          EXPIRES=$(python3 -c "
+          from datetime import datetime, timezone, timedelta
+          print((datetime.now(timezone.utc)+timedelta(hours=4)).strftime('%Y-%m-%dT%H:%M:%SZ'))
+          ")
           curl -s -X POST "$SUPABASE_URL/rest/v1/active_sessions" \
             -H "apikey: $SUPABASE_SERVICE_KEY" \
             -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
             -H "Content-Type: application/json" \
             -H "Prefer: return=minimal" \
             -d "{\"github_run_id\":\"$GITHUB_RUN_ID\",\"workflow_name\":\"openclaw.yml\",\"instance_number\":$INSTANCE_NUMBER,\"is_active\":true,\"expires_at\":\"$EXPIRES\"}" \
-            && echo "Session registered" \
+            && echo "Session registered (expires $EXPIRES)" \
             || echo "WARN: Session registration failed (non-fatal)"
 
       - name: Start Supabase bridge sidecar
         env:
-          SUPABASE_URL:        ${{ secrets.SUPABASE_URL }}
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-          GITHUB_RUN_ID:       ${{ github.run_id }}
+          GITHUB_RUN_ID:        ${{ github.run_id }}
         run: |
           python3 -m py_compile scripts/zypher_agent.py \
             && echo "Sidecar syntax OK" \
@@ -240,6 +268,7 @@ jobs:
           CEREBRAS_API_KEY_4:   ${{ secrets.CEREBRAS_KEY_4 }}
           CEREBRAS_API_KEY_5:   ${{ secrets.CEREBRAS_KEY_5 }}
           TAVILY_API_KEY:       ${{ secrets.TAVILY_KEY_1 }}
+          TAVILY_API_KEY_2:     ${{ secrets.TAVILY_KEY_2 }}
           SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           GITHUB_RUN_ID:        ${{ github.run_id }}
@@ -247,7 +276,7 @@ jobs:
           GITHUB_REPO:          ${{ github.repository }}
           INSTANCE_NUMBER:      ${{ github.event.inputs.instance_number || '1' }}
         run: |
-          echo "=== Pre-flight: openclaw.json channels block ==="
+          echo "=== Pre-flight: openclaw.json config validation ==="
           python3 -c "
           import json, sys, os
           try:
@@ -256,8 +285,10 @@ jobs:
               has_token = bool(tg.get('botToken', ''))
               rec = cfg.get('gateway', {}).get('session', {}).get('errorRecovery', 'NOT SET')
               fallback = cfg.get('agents', {}).get('defaults', {}).get('model', {}).get('fallback', 'NOT SET')
-              print('  enabled=%s  dmPolicy=%s  botToken_set=%s  recovery=%s  fallback=%s' % (
-                  tg.get('enabled'), tg.get('dmPolicy'), has_token, rec, fallback))
+              sb = cfg.get('plugins', {}).get('entries', {}).get('supabase', {})
+              sb_ok = bool(sb.get('config', {}).get('url', ''))
+              print('  telegram_enabled=%s  botToken_set=%s  recovery=%s  fallback=%s  supabase=%s' % (
+                  tg.get('enabled'), has_token, rec, fallback, sb_ok))
               if not has_token:
                   print('ERROR: botToken missing — bot will not respond')
                   sys.exit(1)
@@ -285,7 +316,6 @@ jobs:
           echo "=== Gateway startup log (first 80 lines) ==="
           head -80 /tmp/openclaw.log 2>/dev/null || echo "(log empty)"
 
-          # Liveness check: tee process stays alive as long as openclaw is running
           if ! kill -0 $TEE_PID 2>/dev/null; then
             echo "ERROR: Gateway pipeline exited during startup. Full log:"; cat /tmp/openclaw.log; exit 1
           fi
@@ -307,7 +337,7 @@ jobs:
           tok  = os.environ.get('TELEGRAM_BOT_TOKEN', '')
           rid  = os.environ.get('GITHUB_RUN_ID', '?')
           inst = os.environ.get('INSTANCE_NUMBER', '1')
-          msg  = chr(0x1F7E2) + ' Zypher online | Instance #' + inst + ' | Run ' + rid + chr(0xA) + 'Ready!'
+          msg  = chr(0x1F7E2) + ' Zypher online | Instance #' + inst + ' | Run ' + rid + chr(0xA) + 'Ready to respond!'
           try:
               data = J.dumps({'chat_id': '6317345496', 'text': msg}).encode()
               req  = urllib.request.Request(
@@ -320,20 +350,22 @@ jobs:
               print('WARN notification failed: ' + str(e))
           "
 
-          # Run for 220 minutes (session_duration - graceful_stop buffer)
-          sleep 13200
+          # Run for 215 minutes — triggers next instance 5 min before this one ends
+          # (was 220/13200s — reduced to 215/12900s to eliminate handoff gap)
+          sleep 12900
 
-          # Trigger next instance before this one stops (seamless handoff)
+          # Trigger next instance (seamless handoff — new instance starts before this one stops)
           NEXT=$(( INSTANCE_NUMBER + 1 ))
           curl -s -X POST \
             -H "Authorization: token $GITHUB_TOKEN" \
             -H "Accept: application/vnd.github.v3+json" \
             "https://api.github.com/repos/$GITHUB_REPO/actions/workflows/openclaw.yml/dispatches" \
             -d "{\"ref\":\"main\",\"inputs\":{\"instance_number\":\"$NEXT\"}}" \
-            && echo "Rotated to instance #$NEXT" \
+            && echo "Rotated to instance #$NEXT (5-min overlap handoff)" \
             || echo "WARN: Rotation failed — next schedule will start fresh"
 
-          sleep 120
+          # 5-minute overlap: both old and new instance are alive during handoff
+          sleep 300
 
           # Mark session inactive in Supabase
           if [ -n "$SUPABASE_URL" ] && [ -n "$SUPABASE_SERVICE_KEY" ]; then
@@ -352,4 +384,4 @@ jobs:
             kill -KILL "$OPENCLAW_PID" 2>/dev/null || true
           fi
           kill "$TEE_PID" 2>/dev/null || true
-          echo "Zypher stopped cleanly"
+          echo "Zypher stopped cleanly (instance #$INSTANCE_NUMBER)"
