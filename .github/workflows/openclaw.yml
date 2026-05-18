@@ -149,14 +149,12 @@ jobs:
           assert tg.get('enabled') == True, 'telegram not enabled'
           tok = tg.get('botToken','')
           assert tok and tok != 'TELEGRAM_TOKEN_HERE', 'botToken not injected'
-          recovery = c.get('gateway',{}).get('session',{}).get('errorRecovery','')
-          assert recovery == 'soft-reset', 'session.errorRecovery not set'
-          fallback = c.get('agents',{}).get('defaults',{}).get('model',{}).get('fallback','')
-          assert fallback, 'model fallback not configured'
+          primary = c.get('agents',{}).get('defaults',{}).get('model',{}).get('primary','')
+          assert primary, 'model.primary not configured'
           sb = c.get('plugins',{}).get('entries',{}).get('supabase',{})
           sb_url = sb.get('config',{}).get('url','')
           sb_ok = bool(sb_url) and sb_url != 'SUPABASE_URL_HERE'
-          print('Config OK — recovery=%s fallback=%s supabase_plugin=%s' % (recovery, fallback, sb_ok))
+          print('Config OK — model.primary=%s supabase_plugin=%s' % (primary, sb_ok))
           " || exit 1
           echo "All config sanity checks passed"
           echo "=== Final config (keys masked) ==="
@@ -286,12 +284,11 @@ jobs:
               cfg = json.load(open(os.path.expanduser('~/.openclaw/openclaw.json')))
               tg  = cfg.get('channels', {}).get('telegram', {})
               has_token = bool(tg.get('botToken', ''))
-              rec = cfg.get('gateway', {}).get('session', {}).get('errorRecovery', 'NOT SET')
-              fallback = cfg.get('agents', {}).get('defaults', {}).get('model', {}).get('fallback', 'NOT SET')
+              primary = cfg.get('agents', {}).get('defaults', {}).get('model', {}).get('primary', 'NOT SET')
               sb = cfg.get('plugins', {}).get('entries', {}).get('supabase', {})
               sb_ok = bool(sb.get('config', {}).get('url', ''))
-              print('  telegram_enabled=%s  botToken_set=%s  recovery=%s  fallback=%s  supabase=%s' % (
-                  tg.get('enabled'), has_token, rec, fallback, sb_ok))
+              print('  telegram_enabled=%s  botToken_set=%s  model.primary=%s  supabase=%s' % (
+                  tg.get('enabled'), has_token, primary, sb_ok))
               if not has_token:
                   print('ERROR: botToken missing — bot will not respond')
                   sys.exit(1)
