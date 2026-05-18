@@ -1,8 +1,32 @@
 {
+  "_note": "Reference config — not used directly by the workflow. The active config is generated from scripts/oc_template.json at runtime.",
   "agent": {
     "name": "Zypher",
     "persona": "Elite AI hacker and security researcher",
-    "system_prompt_file": "AGENTS.md"
+    "system_prompt_file": "AGENTS.md",
+    "model": "cerebras/qwen3-32b"
+  },
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "botToken": "${TELEGRAM_BOT_TOKEN}",
+      "dmPolicy": "allowlist",
+      "allowFrom": ["6317345496"]
+    }
+  },
+  "models": {
+    "providers": {
+      "cerebras": {
+        "baseUrl": "https://api.cerebras.ai/v1",
+        "apiKey": "${CEREBRAS_API_KEY}",
+        "api": "openai-completions",
+        "models": [
+          { "id": "qwen3-32b",    "name": "Qwen3 32B" },
+          { "id": "gpt-oss-120b", "name": "GPT-OSS 120B" },
+          { "id": "zai-glm-4.7",  "name": "Z.ai GLM 4.7" }
+        ]
+      }
+    }
   },
   "plugins": [
     {
@@ -19,24 +43,6 @@
           "api_keys": "cerebras_keys"
         }
       }
-    },
-    {
-      "name": "telegram",
-      "source": "native",
-      "config": {
-        "token": "${TELEGRAM_BOT_TOKEN}",
-        "allowed_users": "supabase:telegram_connections.telegram_user_id",
-        "mode": "polling"
-      }
-    },
-    {
-      "name": "cerebras",
-      "source": "clawhub:cerebras-ai",
-      "config": {
-        "keys": "${CEREBRAS_KEYS_JSON}",
-        "rotation": "round-robin",
-        "model": "auto-detect-best"
-      }
     }
   ],
   "skills": [
@@ -44,7 +50,7 @@
     "tavily"
   ],
   "runtime": {
-    "platform": "kali-linux",
+    "platform": "github-actions-ubuntu",
     "session_duration": "4h",
     "auto_rotate": true,
     "rotate_after_minutes": 220,
