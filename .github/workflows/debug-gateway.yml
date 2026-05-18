@@ -100,10 +100,7 @@ jobs:
           "
 
           echo "=== Start gateway (90s verbose) ==="
-          timeout 90 openclaw gateway \
-            ~/.openclaw/openclaw.json \
-            --verbose \
-            2>&1 | tee /tmp/gw_debug.log || true
+          timeout 90 openclaw gateway --verbose 2>&1 | tee /tmp/gw_debug.log || true
 
           echo ""
           echo "=== FULL GATEWAY LOG ==="
