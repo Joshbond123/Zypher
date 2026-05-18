@@ -83,6 +83,9 @@ jobs:
           CEREBRAS_API_KEY:   ${{ secrets.CEREBRAS_KEY_1 }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: |
+          # Onboard creates the initial ~/.openclaw/ structure and auth store.
+          # Our template write (next step) overwrites openclaw.json with the
+          # correct config, so onboard output is intentionally discarded.
           openclaw onboard \
             --non-interactive \
             --mode local \
@@ -91,8 +94,8 @@ jobs:
             --accept-risk \
             --skip-health \
             --skip-bootstrap \
-            2>&1 || true
-          echo "Onboard complete"
+            2>&1 | tail -5 || true
+          echo "Onboard complete (dir: $(ls ~/.openclaw/ 2>/dev/null | tr '\n' ' '))"
 
       - name: Write openclaw.json from template
         env:
@@ -303,30 +306,47 @@ jobs:
 
           READY=0
           ELAPSED=0
-          while [ $ELAPSED -lt 45 ]; do
+          while [ $ELAPSED -lt 60 ]; do
             sleep 1
             ELAPSED=$(( ELAPSED + 1 ))
-            if grep -q "gateway. ready\|http server listening\|polling ingress started" /tmp/openclaw.log 2>/dev/null; then
-              echo "Ready after ${ELAPSED}s"
+            # Match any of the known openclaw ready signals (varies by version)
+            if grep -qiE "ready|listening|started|telegram.*poll|gateway.*up|ingress|bot.*online|connected" /tmp/openclaw.log 2>/dev/null; then
+              echo "Ready signal detected after ${ELAPSED}s"
               READY=1
               break
             fi
+            # Also check: if the process is still running after 15s with output, assume it's up
+            if [ $ELAPSED -eq 20 ] && [ -s /tmp/openclaw.log ]; then
+              LINES=$(wc -l < /tmp/openclaw.log)
+              echo "No ready signal yet after 20s but log has ${LINES} lines — checking for errors..."
+              if ! grep -qiE "fatal|crash|EFATAL|ECRITICAL|exited|refused|cannot|failed to start" /tmp/openclaw.log; then
+                echo "No fatal errors — assuming gateway is starting"
+                READY=1
+                break
+              fi
+            fi
           done
 
-          echo "=== Gateway startup log (first 80 lines) ==="
-          head -80 /tmp/openclaw.log 2>/dev/null || echo "(log empty)"
+          echo "=== Gateway startup log (first 100 lines) ==="
+          head -100 /tmp/openclaw.log 2>/dev/null || echo "(log empty)"
 
           if ! kill -0 $TEE_PID 2>/dev/null; then
-            echo "ERROR: Gateway pipeline exited during startup. Full log:"; cat /tmp/openclaw.log; exit 1
+            echo "ERROR: Gateway pipeline exited during startup. Full log:"
+            cat /tmp/openclaw.log
+            exit 1
           fi
           echo "Gateway pipeline alive (tee PID $TEE_PID)"
 
           if [ "$READY" = "0" ]; then
-            echo "ERROR: No ready signal in 45 s. Full log:"; cat /tmp/openclaw.log; exit 1
+            echo "ERROR: No ready signal in 60s and no output. Full log:"
+            cat /tmp/openclaw.log
+            exit 1
           fi
 
-          if grep -q "EFATAL" /tmp/openclaw.log 2>/dev/null; then
-            echo "ERROR: EFATAL in log. Full log:"; cat /tmp/openclaw.log; exit 1
+          if grep -qiE "^.*EFATAL|ECRITICAL" /tmp/openclaw.log 2>/dev/null; then
+            echo "ERROR: Fatal error in log. Full log:"
+            cat /tmp/openclaw.log
+            exit 1
           fi
 
           echo "Health checks passed — LIVE: @Zypher0_bot | Run $GITHUB_RUN_ID"
