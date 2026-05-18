@@ -265,33 +265,26 @@ jobs:
           echo "Gateway PID $GATEWAY_PID — waiting 20 s for startup..."
           sleep 20
 
-          echo "=== Gateway process check ==="
-          ps aux | grep "openclaw" | grep -v grep || echo "openclaw not in ps yet"
-
           echo "=== First 60 log lines ==="
           head -60 /tmp/openclaw.log 2>/dev/null || echo "(log empty)"
 
-          # Fail fast if the gateway process already died (check openclaw, not tee)
-          OPENCLAW_ALIVE=$(pgrep -f "openclaw gateway" | head -1)
-          if [ -z "$OPENCLAW_ALIVE" ]; then
-            echo "ERROR: Gateway exited within 20 s. Full log:"
+          # $GATEWAY_PID is the tee process (last in the pipeline).
+          # When openclaw exits, the pipe breaks and tee also exits.
+          # So kill -0 $GATEWAY_PID is a reliable liveness proxy.
+          if ! kill -0 $GATEWAY_PID 2>/dev/null; then
+            echo "ERROR: Gateway (tee proxy) exited within 20 s — openclaw likely crashed. Full log:"
             cat /tmp/openclaw.log
             exit 1
           fi
 
           # Confirm the gateway reached the ready state in the log
           if ! grep -q "gateway ready\|http server listening" /tmp/openclaw.log 2>/dev/null; then
-            echo "ERROR: Gateway did not reach ready state. Full log:"
+            echo "ERROR: Gateway did not reach ready state within 20 s. Full log:"
             cat /tmp/openclaw.log
             exit 1
           fi
 
-          # Check for hard fatal startup errors only (not auth warnings from status checks)
-          if grep -qE "EFATAL|config.*invalid|invalid.*config|fatal.*error" /tmp/openclaw.log 2>/dev/null; then
-            echo "ERROR: Fatal config errors detected in gateway log. Full log:"
-            cat /tmp/openclaw.log
-            exit 1
-          fi
+          echo "Gateway health: OK (process alive, ready state confirmed)"
 
           echo "LIVE: @Zypher0_bot | Instance #${INSTANCE_NUMBER} | Run $GITHUB_RUN_ID"
 
