@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Zypher Supabase Bridge v2
+Zypher Supabase Bridge v3
 - Parses OpenClaw log and writes chat messages to Supabase chat_messages table
-- Sends heartbeat to active_sessions
+- Sends heartbeat to active_sessions (no updated_at — column does not exist)
 - Syncs important facts to longterm_memory table
+- Writes daily session notes to memory/YYYY-MM-DD.md (OpenClaw workspace format)
 """
 
 import os
@@ -11,9 +12,7 @@ import json
 import time
 import re
 import logging
-import urllib.request
-import urllib.error
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
@@ -25,10 +24,13 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 GITHUB_RUN_ID = os.environ.get("GITHUB_RUN_ID", "local")
 LOG_FILE = "/tmp/openclaw.log"
+WORKSPACE_DIR = os.path.expanduser("~/.openclaw/workspace")
 
 
 def sb(method, path, body=None, params=""):
     """Make a Supabase REST API call."""
+    import urllib.request
+    import urllib.error
     if not SUPABASE_URL or not SUPABASE_KEY:
         return False
     url = f"{SUPABASE_URL}/rest/v1/{path}{params}"
@@ -48,22 +50,28 @@ def sb(method, path, body=None, params=""):
         with urllib.request.urlopen(req, timeout=8):
             return True
     except urllib.error.HTTPError as e:
-        logger.debug("sb %s %s: HTTP %s %s", method, path, e.code, e.read()[:200])
+        body_bytes = e.read()[:300]
+        logger.debug("sb %s %s: HTTP %s %s", method, path, e.code, body_bytes)
     except Exception as e:
         logger.debug("sb %s %s: %s", method, path, e)
     return False
 
 
 def heartbeat():
-    """Update session last-seen timestamp."""
+    """Update session last-seen timestamp.
+    NOTE: active_sessions table does NOT have an updated_at column.
+    We only toggle is_active=True to confirm the session is alive.
+    """
     ok = sb(
         "PATCH",
         "active_sessions",
-        {"is_active": True, "updated_at": datetime.now(timezone.utc).isoformat()},
+        {"is_active": True},
         f"?github_run_id=eq.{GITHUB_RUN_ID}",
     )
     if ok:
         logger.info("Heartbeat OK  run=%s", GITHUB_RUN_ID)
+    else:
+        logger.debug("Heartbeat skipped (Supabase unavailable or no matching row)")
 
 
 def write_message(role: str, content: str):
@@ -93,9 +101,28 @@ def write_fact(key: str, value: str):
             "key": key,
             "value": value[:2000],
             "user_id": "joshbond",
+            "session_id": GITHUB_RUN_ID,
             "created_at": datetime.now(timezone.utc).isoformat(),
         },
     )
+
+
+def write_daily_note(lines_buffer: list):
+    """Append interesting log lines to workspace daily note.
+    OpenClaw's file-based memory reads memory/YYYY-MM-DD.md automatically.
+    """
+    if not lines_buffer:
+        return
+    today = date.today().isoformat()
+    notes_dir = os.path.join(WORKSPACE_DIR, "memory")
+    os.makedirs(notes_dir, exist_ok=True)
+    note_path = os.path.join(notes_dir, f"{today}.md")
+    try:
+        with open(note_path, "a") as f:
+            for line in lines_buffer:
+                f.write(line.strip() + "\n")
+    except Exception as e:
+        logger.debug("daily note write failed: %s", e)
 
 
 def parse_messages(lines: list) -> list:
@@ -147,14 +174,31 @@ def tail_log(last_pos: int = 0):
 
 def main():
     if not SUPABASE_URL or not SUPABASE_KEY:
-        logger.info("No Supabase credentials — running in heartbeat-only mode")
+        logger.info("No Supabase credentials — running in log-mirror mode only")
+        # Still mirror log to daily notes in workspace
+        log_pos = 0
         while True:
-            time.sleep(60)
+            time.sleep(20)
+            lines, log_pos = tail_log(log_pos)
+            interesting_keywords = [
+                "error", "warn", "telegram", "cerebras",
+                "exec", "tool", "browser", "web_fetch", "memory",
+                "drop dm", "unauthorized", "fatal", "polling",
+            ]
+            notable = [
+                l for l in lines
+                if l.strip() and any(k in l.lower() for k in interesting_keywords)
+            ]
+            write_daily_note(notable)
+            for line in notable:
+                logger.info("[openclaw] %s", line.strip()[:200])
+        return
 
-    logger.info("Supabase bridge v2 started — session %s", GITHUB_RUN_ID)
+    logger.info("Supabase bridge v3 started — session %s", GITHUB_RUN_ID)
     log_pos = 0
     tick = 0
     seen_messages: set = set()
+    daily_note_buffer = []
 
     while True:
         time.sleep(20)
@@ -163,6 +207,11 @@ def main():
         # Heartbeat every 2 minutes (every 6 ticks of 20 s)
         if tick % 6 == 0:
             heartbeat()
+
+        # Flush daily notes every 5 minutes (every 15 ticks)
+        if tick % 15 == 0 and daily_note_buffer:
+            write_daily_note(daily_note_buffer)
+            daily_note_buffer = []
 
         # Parse new log lines for messages
         lines, log_pos = tail_log(log_pos)
@@ -177,7 +226,7 @@ def main():
                     if len(seen_messages) > 500:
                         seen_messages = set(list(seen_messages)[-200:])
 
-            # Mirror interesting lines to stdout for GitHub Actions log
+            # Mirror interesting lines to stdout + daily note buffer
             interesting_keywords = [
                 "error", "warn", "telegram", "cerebras",
                 "exec", "tool", "browser", "web_fetch", "memory",
@@ -187,6 +236,7 @@ def main():
                 stripped = line.strip()
                 if stripped and any(k in stripped.lower() for k in interesting_keywords):
                     logger.info("[openclaw] %s", stripped[:200])
+                    daily_note_buffer.append(stripped)
 
 
 if __name__ == "__main__":
