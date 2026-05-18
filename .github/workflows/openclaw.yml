@@ -257,11 +257,11 @@ jobs:
           echo "=== Gateway startup log (first 80 lines) ==="
           head -80 /tmp/openclaw.log 2>/dev/null || echo "(log empty)"
 
-          OPENCLAW_PID=$(pgrep -f "openclaw gateway" | head -1)
-          if [ -z "$OPENCLAW_PID" ]; then
-            echo "ERROR: Gateway exited during startup. Full log:"; cat /tmp/openclaw.log; exit 1
+          # Liveness check: tee process stays alive as long as openclaw is running
+          if ! kill -0 $TEE_PID 2>/dev/null; then
+            echo "ERROR: Gateway pipeline exited during startup. Full log:"; cat /tmp/openclaw.log; exit 1
           fi
-          echo "Gateway process alive: PID $OPENCLAW_PID"
+          echo "Gateway pipeline alive (tee PID $TEE_PID)"
 
           if [ "$READY" = "0" ]; then
             echo "ERROR: No ready signal in 45 s. Full log:"; cat /tmp/openclaw.log; exit 1
