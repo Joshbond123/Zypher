@@ -1,0 +1,114 @@
+name: Debug OpenClaw Gateway
+
+on:
+  workflow_dispatch:
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install OpenClaw
+        run: npm install -g openclaw && openclaw --version 2>/dev/null || echo "installed"
+
+      - name: Test Cerebras key directly
+        env:
+          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_KEY_1 }}
+        run: |
+          echo "=== Cerebras key test ==="
+          echo "Key length: ${#CEREBRAS_API_KEY} | prefix: ${CEREBRAS_API_KEY:0:12}..."
+          HTTP=$(curl -s -o /tmp/cb_resp.json -w "%{http_code}" \
+            -H "Authorization: Bearer $CEREBRAS_API_KEY" \
+            https://api.cerebras.ai/v1/models)
+          echo "HTTP status: $HTTP"
+          cat /tmp/cb_resp.json | python3 -c "
+          import sys,json
+          try:
+            d=json.load(sys.stdin)
+            if 'data' in d:
+              print('Models:', [m['id'] for m in d['data']])
+            else:
+              print('Error response:', json.dumps(d))
+          except: print(sys.stdin.read())
+          " 2>/dev/null || cat /tmp/cb_resp.json
+
+          echo "=== Quick inference test ==="
+          curl -s -X POST https://api.cerebras.ai/v1/chat/completions \
+            -H "Authorization: Bearer $CEREBRAS_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d '{"model":"llama3.1-8b","messages":[{"role":"user","content":"Reply with just the word WORKING"}],"max_tokens":10}' \
+            | python3 -c "
+          import sys,json
+          try:
+            d=json.load(sys.stdin)
+            if d.get('choices'):
+              print('INFERENCE OK:', d['choices'][0]['message']['content'])
+            else:
+              print('INFERENCE FAIL:', json.dumps(d))
+          except Exception as e: print('Parse error:', e, sys.stdin.read()[:200])
+          " 2>/dev/null
+
+      - name: Build config + start gateway (verbose, 90s)
+        env:
+          TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CEREBRAS_API_KEY:     ${{ secrets.CEREBRAS_KEY_1 }}
+          TAVILY_API_KEY:       ${{ secrets.TAVILY_KEY_1 }}
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          mkdir -p ~/.openclaw/workspace/memory
+          printf "# Memory\nFresh debug session\n" > ~/.openclaw/workspace/MEMORY.md
+          echo '{"security":"full","ask":"off"}' > ~/.openclaw/exec-approvals.json
+
+          # Build config from template
+          sed \
+            -e "s|TELEGRAM_TOKEN_HERE|${TELEGRAM_BOT_TOKEN}|g" \
+            -e "s|CEREBRAS_KEY_HERE|${CEREBRAS_API_KEY}|g" \
+            -e "s|TAVILY_KEY_HERE|${TAVILY_API_KEY:-disabled}|g" \
+            -e "s|SUPABASE_URL_HERE|${SUPABASE_URL:-disabled}|g" \
+            -e "s|SUPABASE_KEY_HERE|${SUPABASE_SERVICE_KEY:-disabled}|g" \
+            scripts/oc_template.json > ~/.openclaw/openclaw.json
+
+          # If Tavily key is "disabled", turn off search
+          if grep -q '"apiKey": "disabled"' ~/.openclaw/openclaw.json; then
+            python3 -c "
+          import json,os
+          f=os.path.expanduser('~/.openclaw/openclaw.json')
+          c=json.load(open(f))
+          c['tools']['web']['search']={'provider':None,'enabled':False}
+          c['plugins']['entries']['tavily']['enabled']=False
+          json.dump(c,open(f,'w'),indent=2)
+          print('Tavily disabled')
+          "
+          fi
+
+          echo "=== Config (masked) ==="
+          python3 -c "
+          import json,re,os
+          raw=open(os.path.expanduser('~/.openclaw/openclaw.json')).read()
+          m=re.sub(r'\"(apiKey|botToken|key)\"\s*:\s*\"[^\"]{6,}\"','\"\\\\1\": \"***\"',raw)
+          print(m)
+          "
+
+          echo "=== Start gateway (90s verbose) ==="
+          timeout 90 openclaw gateway \
+            --config ~/.openclaw/openclaw.json \
+            --verbose \
+            2>&1 | tee /tmp/gw_debug.log || true
+
+          echo ""
+          echo "=== FULL GATEWAY LOG ==="
+          cat /tmp/gw_debug.log
+
+          echo ""
+          echo "=== ERROR LINES ==="
+          grep -i "error\|fatal\|fail\|wrong\|invalid\|401\|403\|auth" /tmp/gw_debug.log || echo "(no error lines)"
