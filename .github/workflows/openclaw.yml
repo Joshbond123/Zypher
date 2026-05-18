@@ -1,278 +1,278 @@
 name: Zypher OpenClaw Agent
 
-  on:
-    workflow_dispatch:
-      inputs:
-        instance_number:
-          description: 'Instance number for tracking'
-          required: false
-          default: '1'
-    schedule:
-      - cron: '0 */4 * * *'
+on:
+  workflow_dispatch:
+    inputs:
+      instance_number:
+        description: 'Instance number for tracking'
+        required: false
+        default: '1'
+  schedule:
+    - cron: '0 */4 * * *'
 
-  jobs:
-    run-agent:
-      runs-on: ubuntu-latest
-      timeout-minutes: 235
+jobs:
+  run-agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 235
 
-      steps:
-        - name: Checkout repository
-          uses: actions/checkout@v4
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-        - name: Setup Node.js 24
-          uses: actions/setup-node@v4
-          with:
-            node-version: '24'
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
 
-        - name: Setup Python 3
-          uses: actions/setup-python@v5
-          with:
-            python-version: '3.11'
+      - name: Setup Python 3
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-        - name: Install security tools + Google Chrome
-          run: |
-            sudo apt-get update -qq
-            sudo apt-get install -y --no-install-recommends \
-              nmap nikto sqlmap gobuster \
-              hydra netcat-openbsd masscan \
-              curl wget git jq \
-              openssl net-tools whois dnsutils \
-              dirb wfuzz wordlists \
-              python3-pip python3-scapy \
-              2>/dev/null || true
-            pip install PyNaCl requests -q 2>/dev/null || true
-            wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -O /tmp/chrome.deb
-            sudo apt-get install -y /tmp/chrome.deb 2>/dev/null \
-              || (sudo dpkg -i /tmp/chrome.deb && sudo apt-get -f install -y) || true
-            echo "Tools ready | Chrome: $(google-chrome --version 2>/dev/null || echo not-found)"
+      - name: Install security tools + Google Chrome
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            nmap nikto sqlmap gobuster \
+            hydra netcat-openbsd masscan \
+            curl wget git jq \
+            openssl net-tools whois dnsutils \
+            dirb wfuzz wordlists \
+            python3-pip python3-scapy \
+            2>/dev/null || true
+          pip install PyNaCl requests -q 2>/dev/null || true
+          wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -O /tmp/chrome.deb
+          sudo apt-get install -y /tmp/chrome.deb 2>/dev/null \
+            || (sudo dpkg -i /tmp/chrome.deb && sudo apt-get -f install -y) || true
+          echo "Tools ready | Chrome: $(google-chrome --version 2>/dev/null || echo not-found)"
 
-        - name: Validate secrets are present
-          env:
-            TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
-            CEREBRAS_API_KEY:     ${{ secrets.CEREBRAS_KEY_1 }}
-            SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
-            SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-          run: |
-            MISSING=0
-            [ -z "$TELEGRAM_BOT_TOKEN" ] && echo "ERROR: TELEGRAM_BOT_TOKEN not set" && MISSING=1
-            [ -z "$CEREBRAS_API_KEY" ]   && echo "ERROR: CEREBRAS_KEY_1 not set"     && MISSING=1
-            [ -z "$SUPABASE_URL" ]         && echo "WARN: SUPABASE_URL not set"
-            [ -z "$SUPABASE_SERVICE_KEY" ] && echo "WARN: SUPABASE_SERVICE_KEY not set"
-            [ "$MISSING" = "1" ] && exit 1 || echo "Required secrets present"
+      - name: Validate secrets are present
+        env:
+          TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CEREBRAS_API_KEY:     ${{ secrets.CEREBRAS_KEY_1 }}
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          MISSING=0
+          [ -z "$TELEGRAM_BOT_TOKEN" ] && echo "ERROR: TELEGRAM_BOT_TOKEN not set" && MISSING=1
+          [ -z "$CEREBRAS_API_KEY" ]   && echo "ERROR: CEREBRAS_KEY_1 not set"     && MISSING=1
+          [ -z "$SUPABASE_URL" ]         && echo "WARN: SUPABASE_URL not set"
+          [ -z "$SUPABASE_SERVICE_KEY" ] && echo "WARN: SUPABASE_SERVICE_KEY not set"
+          [ "$MISSING" = "1" ] && exit 1 || echo "Required secrets present"
 
-        - name: Validate Telegram bot token
-          env:
-            TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          run: |
-            RESP=$(curl -sf "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe" 2>&1)
-            if echo "$RESP" | grep -q '"ok":true'; then
-              BOT=$(echo "$RESP" | jq -r '.result.username // "unknown"')
-              echo "Telegram OK — bot: @${BOT}"
-            else
-              echo "ERROR: Telegram token invalid — $RESP"
-              exit 1
-            fi
+      - name: Validate Telegram bot token
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          RESP=$(curl -sf "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe" 2>&1)
+          if echo "$RESP" | grep -q '"ok":true'; then
+            BOT=$(echo "$RESP" | jq -r '.result.username // "unknown"')
+            echo "Telegram OK — bot: @${BOT}"
+          else
+            echo "ERROR: Telegram token invalid — $RESP"
+            exit 1
+          fi
 
-        - name: Install OpenClaw
-          run: |
-            npm install -g openclaw
-            echo "OpenClaw $(openclaw --version 2>/dev/null || echo installed)"
+      - name: Install OpenClaw
+        run: |
+          npm install -g openclaw
+          echo "OpenClaw $(openclaw --version 2>/dev/null || echo installed)"
 
-        - name: OpenClaw onboard (Cerebras)
-          env:
-            CEREBRAS_API_KEY:   ${{ secrets.CEREBRAS_KEY_1 }}
-          run: |
-            openclaw onboard \
-              --non-interactive \
-              --mode local \
-              --auth-choice cerebras-api-key \
-              --cerebras-api-key "$CEREBRAS_API_KEY" \
-              --accept-risk --skip-health --skip-bootstrap \
-              2>&1 | tail -5 || true
-            echo "Onboard complete: $(ls ~/.openclaw/ 2>/dev/null | tr '\n' ' ')"
+      - name: OpenClaw onboard (Cerebras)
+        env:
+          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_KEY_1 }}
+        run: |
+          openclaw onboard \
+            --non-interactive \
+            --mode local \
+            --auth-choice cerebras-api-key \
+            --cerebras-api-key "$CEREBRAS_API_KEY" \
+            --accept-risk --skip-health --skip-bootstrap \
+            2>&1 | tail -5 || true
+          echo "Onboard complete: $(ls ~/.openclaw/ 2>/dev/null | tr '\n' ' ')"
 
-        - name: Write openclaw.json from template
-          env:
-            TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
-            CEREBRAS_API_KEY:     ${{ secrets.CEREBRAS_KEY_1 }}
-            CEREBRAS_API_KEY_2:   ${{ secrets.CEREBRAS_KEY_2 }}
-            CEREBRAS_API_KEY_3:   ${{ secrets.CEREBRAS_KEY_3 }}
-            CEREBRAS_API_KEY_4:   ${{ secrets.CEREBRAS_KEY_4 }}
-            TAVILY_API_KEY:       ${{ secrets.TAVILY_KEY_1 }}
-            TAVILY_API_KEY_2:     ${{ secrets.TAVILY_KEY_2 }}
-            SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
-            SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-          run: |
-            mkdir -p ~/.openclaw/workspace/memory
-            cp AGENTS.md ~/.openclaw/workspace/AGENTS.md
-            K2="${CEREBRAS_API_KEY_2:-$CEREBRAS_API_KEY}"
-            K3="${CEREBRAS_API_KEY_3:-$CEREBRAS_API_KEY}"
-            K4="${CEREBRAS_API_KEY_4:-$CEREBRAS_API_KEY}"
-            sed \
-              -e "s|TELEGRAM_TOKEN_HERE|${TELEGRAM_BOT_TOKEN}|g" \
-              -e "s|CEREBRAS_KEY_1_HERE|${CEREBRAS_API_KEY}|g" \
-              -e "s|CEREBRAS_KEY_2_HERE|${K2}|g" \
-              -e "s|CEREBRAS_KEY_3_HERE|${K3}|g" \
-              -e "s|CEREBRAS_KEY_4_HERE|${K4}|g" \
-              -e "s|TAVILY_KEY_HERE|${TAVILY_API_KEY}|g" \
-              -e "s|SUPABASE_URL_HERE|${SUPABASE_URL}|g" \
-              -e "s|SUPABASE_KEY_HERE|${SUPABASE_SERVICE_KEY}|g" \
-              scripts/oc_template.json > ~/.openclaw/openclaw.json
-            if [ -z "$TAVILY_API_KEY" ] && [ -n "$TAVILY_API_KEY_2" ]; then
-              jq ".tools.web.search.apiKey=\"${TAVILY_API_KEY_2}\" | .plugins.entries.tavily.enabled=true" \
-                ~/.openclaw/openclaw.json > /tmp/p.json && mv /tmp/p.json ~/.openclaw/openclaw.json
-            elif [ -z "$TAVILY_API_KEY" ]; then
-              jq '.tools.web.search={"provider":null,"enabled":false}|.plugins.entries.tavily.enabled=false' \
-                ~/.openclaw/openclaw.json > /tmp/p.json && mv /tmp/p.json ~/.openclaw/openclaw.json
-            fi
-            echo '{"security":"full","ask":"off"}' > ~/.openclaw/exec-approvals.json
-            if grep -qE "TELEGRAM_TOKEN_HERE|CEREBRAS_KEY_[0-9]_HERE" ~/.openclaw/openclaw.json; then
-              echo "ERROR: placeholders not substituted"; exit 1
-            fi
-            python3 scripts/validate_config.py || exit 1
+      - name: Write openclaw.json from template
+        env:
+          TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CEREBRAS_API_KEY:     ${{ secrets.CEREBRAS_KEY_1 }}
+          CEREBRAS_API_KEY_2:   ${{ secrets.CEREBRAS_KEY_2 }}
+          CEREBRAS_API_KEY_3:   ${{ secrets.CEREBRAS_KEY_3 }}
+          CEREBRAS_API_KEY_4:   ${{ secrets.CEREBRAS_KEY_4 }}
+          TAVILY_API_KEY:       ${{ secrets.TAVILY_KEY_1 }}
+          TAVILY_API_KEY_2:     ${{ secrets.TAVILY_KEY_2 }}
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          mkdir -p ~/.openclaw/workspace/memory
+          cp AGENTS.md ~/.openclaw/workspace/AGENTS.md
+          K2="${CEREBRAS_API_KEY_2:-$CEREBRAS_API_KEY}"
+          K3="${CEREBRAS_API_KEY_3:-$CEREBRAS_API_KEY}"
+          K4="${CEREBRAS_API_KEY_4:-$CEREBRAS_API_KEY}"
+          sed \
+            -e "s|TELEGRAM_TOKEN_HERE|${TELEGRAM_BOT_TOKEN}|g" \
+            -e "s|CEREBRAS_KEY_1_HERE|${CEREBRAS_API_KEY}|g" \
+            -e "s|CEREBRAS_KEY_2_HERE|${K2}|g" \
+            -e "s|CEREBRAS_KEY_3_HERE|${K3}|g" \
+            -e "s|CEREBRAS_KEY_4_HERE|${K4}|g" \
+            -e "s|TAVILY_KEY_HERE|${TAVILY_API_KEY}|g" \
+            -e "s|SUPABASE_URL_HERE|${SUPABASE_URL}|g" \
+            -e "s|SUPABASE_KEY_HERE|${SUPABASE_SERVICE_KEY}|g" \
+            scripts/oc_template.json > ~/.openclaw/openclaw.json
+          if [ -z "$TAVILY_API_KEY" ] && [ -n "$TAVILY_API_KEY_2" ]; then
+            jq ".tools.web.search.apiKey=\"${TAVILY_API_KEY_2}\" | .plugins.entries.tavily.enabled=true" \
+              ~/.openclaw/openclaw.json > /tmp/p.json && mv /tmp/p.json ~/.openclaw/openclaw.json
+          elif [ -z "$TAVILY_API_KEY" ]; then
+            jq '.tools.web.search={"provider":null,"enabled":false}|.plugins.entries.tavily.enabled=false' \
+              ~/.openclaw/openclaw.json > /tmp/p.json && mv /tmp/p.json ~/.openclaw/openclaw.json
+          fi
+          echo '{"security":"full","ask":"off"}' > ~/.openclaw/exec-approvals.json
+          if grep -qE "TELEGRAM_TOKEN_HERE|CEREBRAS_KEY_[0-9]_HERE" ~/.openclaw/openclaw.json; then
+            echo "ERROR: placeholders not substituted"; exit 1
+          fi
+          python3 scripts/validate_config.py || exit 1
 
-        - name: Cerebras key rotation (round-robin)
-          env:
-            CEREBRAS_API_KEY:     ${{ secrets.CEREBRAS_KEY_1 }}
-            CEREBRAS_API_KEY_2:   ${{ secrets.CEREBRAS_KEY_2 }}
-            CEREBRAS_API_KEY_3:   ${{ secrets.CEREBRAS_KEY_3 }}
-            CEREBRAS_API_KEY_4:   ${{ secrets.CEREBRAS_KEY_4 }}
-            SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
-            SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-            GITHUB_RUN_ID:        ${{ github.run_id }}
-          run: python3 scripts/cerebras_key_rotator.py
+      - name: Cerebras key rotation (round-robin)
+        env:
+          CEREBRAS_API_KEY:     ${{ secrets.CEREBRAS_KEY_1 }}
+          CEREBRAS_API_KEY_2:   ${{ secrets.CEREBRAS_KEY_2 }}
+          CEREBRAS_API_KEY_3:   ${{ secrets.CEREBRAS_KEY_3 }}
+          CEREBRAS_API_KEY_4:   ${{ secrets.CEREBRAS_KEY_4 }}
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          GITHUB_RUN_ID:        ${{ github.run_id }}
+        run: python3 scripts/cerebras_key_rotator.py
 
-        - name: OpenClaw doctor --fix
-          run: openclaw doctor --fix 2>&1 || true
+      - name: OpenClaw doctor --fix
+        run: openclaw doctor --fix 2>&1 || true
 
-        - name: Install ClawHub skills
-          run: |
-            openclaw skills install clawhub:stealth-browser 2>&1 \
-              || openclaw plugins install clawhub:stealth-browser 2>&1 \
-              || echo "stealth-browser fallback active"
-            openclaw skills install clawhub:tavily 2>&1 \
-              || openclaw plugins install npm:@openclaw/tavily 2>&1 \
-              || echo "tavily skill skipped"
-            openclaw plugins list 2>/dev/null || true
+      - name: Install ClawHub skills
+        run: |
+          openclaw skills install clawhub:stealth-browser 2>&1 \
+            || openclaw plugins install clawhub:stealth-browser 2>&1 \
+            || echo "stealth-browser fallback active"
+          openclaw skills install clawhub:tavily 2>&1 \
+            || openclaw plugins install npm:@openclaw/tavily 2>&1 \
+            || echo "tavily skill skipped"
+          openclaw plugins list 2>/dev/null || true
 
-        - name: Bootstrap memory from Supabase
-          env:
-            SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
-            SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-            GITHUB_RUN_ID:        ${{ github.run_id }}
-          run: |
-            mkdir -p ~/.openclaw/workspace/memory
-            echo "[]" > /tmp/sb_msgs.json && echo "[]" > /tmp/sb_facts.json
-            if [ -n "$SUPABASE_URL" ] && [ -n "$SUPABASE_SERVICE_KEY" ]; then
-              curl -sf "$SUPABASE_URL/rest/v1/chat_messages?order=created_at.desc&limit=30&select=role,content,created_at" \
-                -H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
-                -o /tmp/sb_msgs.json && echo "Messages fetched" || { echo "[]" > /tmp/sb_msgs.json; }
-              curl -sf "$SUPABASE_URL/rest/v1/longterm_memory?order=created_at.desc&limit=20&select=key,value" \
-                -H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
-                -o /tmp/sb_facts.json && echo "Facts fetched" || { echo "[]" > /tmp/sb_facts.json; }
-            fi
-            python3 scripts/bootstrap_memory.py \
-              --msgs /tmp/sb_msgs.json --facts /tmp/sb_facts.json \
-              --run-id "$GITHUB_RUN_ID" --out ~/.openclaw/workspace/MEMORY.md \
-              && echo "Memory bootstrapped" \
-              || printf "# Zypher Memory\nFresh session\n" > ~/.openclaw/workspace/MEMORY.md
-            TODAY=$(date -u '+%Y-%m-%d')
-            [ ! -f ~/.openclaw/workspace/memory/${TODAY}.md ] && \
-              printf "# Zypher Daily — %s\nRun: %s\n" "$TODAY" "$GITHUB_RUN_ID" > \
-              ~/.openclaw/workspace/memory/${TODAY}.md || true
-
-        - name: Register session in Supabase
-          env:
-            SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
-            SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-            GITHUB_RUN_ID:        ${{ github.run_id }}
-            INSTANCE_NUMBER:      ${{ github.event.inputs.instance_number || '1' }}
-          run: |
-            [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_SERVICE_KEY" ] && exit 0 || true
-            EXPIRES=$(date -u -d '+4 hours' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u '+%Y-%m-%dT%H:%M:%SZ')
-            curl -s -X POST "$SUPABASE_URL/rest/v1/active_sessions" \
+      - name: Bootstrap memory from Supabase
+        env:
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          GITHUB_RUN_ID:        ${{ github.run_id }}
+        run: |
+          mkdir -p ~/.openclaw/workspace/memory
+          echo "[]" > /tmp/sb_msgs.json && echo "[]" > /tmp/sb_facts.json
+          if [ -n "$SUPABASE_URL" ] && [ -n "$SUPABASE_SERVICE_KEY" ]; then
+            curl -sf "$SUPABASE_URL/rest/v1/chat_messages?order=created_at.desc&limit=30&select=role,content,created_at" \
               -H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
-              -H "Content-Type: application/json" -H "Prefer: return=minimal" \
-              -d "{\"github_run_id\":\"$GITHUB_RUN_ID\",\"instance_number\":$INSTANCE_NUMBER,\"is_active\":true,\"expires_at\":\"$EXPIRES\"}" \
-              && echo "Session registered" || echo "WARN: registration failed"
+              -o /tmp/sb_msgs.json && echo "Messages fetched" || echo "[]" > /tmp/sb_msgs.json
+            curl -sf "$SUPABASE_URL/rest/v1/longterm_memory?order=created_at.desc&limit=20&select=key,value" \
+              -H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+              -o /tmp/sb_facts.json && echo "Facts fetched" || echo "[]" > /tmp/sb_facts.json
+          fi
+          python3 scripts/bootstrap_memory.py \
+            --msgs /tmp/sb_msgs.json --facts /tmp/sb_facts.json \
+            --run-id "$GITHUB_RUN_ID" --out ~/.openclaw/workspace/MEMORY.md \
+            && echo "Memory bootstrapped" \
+            || printf "# Zypher Memory\nFresh session\n" > ~/.openclaw/workspace/MEMORY.md
+          TODAY=$(date -u '+%Y-%m-%d')
+          [ ! -f ~/.openclaw/workspace/memory/${TODAY}.md ] && \
+            printf "# Zypher Daily — %s\nRun: %s\n" "$TODAY" "$GITHUB_RUN_ID" \
+            > ~/.openclaw/workspace/memory/${TODAY}.md || true
 
-        - name: Start Supabase sidecar
-          env:
-            SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
-            SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-            GITHUB_RUN_ID:        ${{ github.run_id }}
-          run: |
-            python3 -m py_compile scripts/zypher_agent.py || { echo "ERROR: syntax"; exit 1; }
-            python3 scripts/zypher_agent.py > /tmp/sidecar.log 2>&1 &
-            SIDECAR_PID=$!
-            sleep 3
-            kill -0 $SIDECAR_PID 2>/dev/null || { echo "ERROR: sidecar crashed"; cat /tmp/sidecar.log; exit 1; }
-            echo "Sidecar running PID=$SIDECAR_PID"
+      - name: Register session in Supabase
+        env:
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          GITHUB_RUN_ID:        ${{ github.run_id }}
+          INSTANCE_NUMBER:      ${{ github.event.inputs.instance_number || '1' }}
+        run: |
+          [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_SERVICE_KEY" ] && exit 0 || true
+          EXPIRES=$(date -u -d '+4 hours' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u '+%Y-%m-%dT%H:%M:%SZ')
+          curl -s -X POST "$SUPABASE_URL/rest/v1/active_sessions" \
+            -H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+            -H "Content-Type: application/json" -H "Prefer: return=minimal" \
+            -d "{\"github_run_id\":\"$GITHUB_RUN_ID\",\"instance_number\":$INSTANCE_NUMBER,\"is_active\":true,\"expires_at\":\"$EXPIRES\"}" \
+            && echo "Session registered" || echo "WARN: registration failed"
 
-        - name: Start OpenClaw Gateway (with periodic doctor)
-          env:
-            TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
-            CEREBRAS_API_KEY:     ${{ secrets.CEREBRAS_KEY_1 }}
-            CEREBRAS_API_KEY_2:   ${{ secrets.CEREBRAS_KEY_2 }}
-            CEREBRAS_API_KEY_3:   ${{ secrets.CEREBRAS_KEY_3 }}
-            CEREBRAS_API_KEY_4:   ${{ secrets.CEREBRAS_KEY_4 }}
-            TAVILY_API_KEY:       ${{ secrets.TAVILY_KEY_1 }}
-            TAVILY_API_KEY_2:     ${{ secrets.TAVILY_KEY_2 }}
-            SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
-            SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-            GITHUB_RUN_ID:        ${{ github.run_id }}
-            GITHUB_TOKEN:         ${{ secrets.GH_PAT }}
-            GITHUB_REPO:          ${{ github.repository }}
-            INSTANCE_NUMBER:      ${{ github.event.inputs.instance_number || '1' }}
-          run: |
-            python3 scripts/preflight_check.py || exit 1
+      - name: Start Supabase sidecar
+        env:
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          GITHUB_RUN_ID:        ${{ github.run_id }}
+        run: |
+          python3 -m py_compile scripts/zypher_agent.py || { echo "ERROR: syntax"; exit 1; }
+          python3 scripts/zypher_agent.py > /tmp/sidecar.log 2>&1 &
+          SIDECAR_PID=$!
+          sleep 3
+          kill -0 $SIDECAR_PID 2>/dev/null || { echo "ERROR: sidecar crashed"; cat /tmp/sidecar.log; exit 1; }
+          echo "Sidecar running PID=$SIDECAR_PID"
 
-            (while true; do
-              sleep 1800
-              echo "[$(date -u +%H:%M:%SZ)] Doctor + key stats check"
-              openclaw doctor 2>&1 | tail -3 || true
-              python3 scripts/cerebras_key_rotator.py --stats 2>&1 || true
-            done) &
-            DOCTOR_PID=$!
+      - name: Start OpenClaw Gateway
+        env:
+          TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CEREBRAS_API_KEY:     ${{ secrets.CEREBRAS_KEY_1 }}
+          CEREBRAS_API_KEY_2:   ${{ secrets.CEREBRAS_KEY_2 }}
+          CEREBRAS_API_KEY_3:   ${{ secrets.CEREBRAS_KEY_3 }}
+          CEREBRAS_API_KEY_4:   ${{ secrets.CEREBRAS_KEY_4 }}
+          TAVILY_API_KEY:       ${{ secrets.TAVILY_KEY_1 }}
+          TAVILY_API_KEY_2:     ${{ secrets.TAVILY_KEY_2 }}
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          GITHUB_RUN_ID:        ${{ github.run_id }}
+          GITHUB_TOKEN:         ${{ secrets.GH_PAT }}
+          GITHUB_REPO:          ${{ github.repository }}
+          INSTANCE_NUMBER:      ${{ github.event.inputs.instance_number || '1' }}
+        run: |
+          python3 scripts/preflight_check.py || exit 1
 
-            openclaw gateway 2>&1 | tee /tmp/openclaw.log &
-            TEE_PID=$!
+          (while true; do
+            sleep 1800
+            echo "[$(date -u +%H:%M:%SZ)] Scheduled doctor + key stats"
+            openclaw doctor 2>&1 | tail -3 || true
+            python3 scripts/cerebras_key_rotator.py --stats 2>&1 || true
+          done) &
+          DOCTOR_PID=$!
 
-            READY=0; ELAPSED=0
-            while [ $ELAPSED -lt 60 ]; do
-              sleep 1; ELAPSED=$(( ELAPSED + 1 ))
-              grep -qiE "ready|listening|started|telegram.*poll|gateway.*up|bot.*online|connected" /tmp/openclaw.log 2>/dev/null && READY=1 && break
-              if [ $ELAPSED -eq 20 ] && [ -s /tmp/openclaw.log ]; then
-                grep -qiE "fatal|crash|EFATAL|refused|failed to start" /tmp/openclaw.log || { READY=1; break; }
-              fi
-            done
+          openclaw gateway 2>&1 | tee /tmp/openclaw.log &
+          TEE_PID=$!
 
-            head -100 /tmp/openclaw.log 2>/dev/null || echo "(log empty)"
-            kill -0 $TEE_PID 2>/dev/null || { echo "ERROR: gateway exited"; cat /tmp/openclaw.log; exit 1; }
-            [ "$READY" = "0" ] && { echo "ERROR: no ready signal"; cat /tmp/openclaw.log; exit 1; }
+          READY=0; ELAPSED=0
+          while [ $ELAPSED -lt 60 ]; do
+            sleep 1; ELAPSED=$(( ELAPSED + 1 ))
+            grep -qiE "ready|listening|started|telegram.*poll|gateway.*up|bot.*online|connected" /tmp/openclaw.log 2>/dev/null && READY=1 && break
+            if [ $ELAPSED -eq 20 ] && [ -s /tmp/openclaw.log ]; then
+              grep -qiE "fatal|crash|EFATAL|refused|failed to start" /tmp/openclaw.log || { READY=1; break; }
+            fi
+          done
 
-            echo "LIVE: @Zypher0_bot | Run $GITHUB_RUN_ID | Instance #$INSTANCE_NUMBER"
-            python3 scripts/send_startup_notification.py
+          head -100 /tmp/openclaw.log 2>/dev/null || echo "(log empty)"
+          kill -0 $TEE_PID 2>/dev/null || { echo "ERROR: gateway exited"; cat /tmp/openclaw.log; exit 1; }
+          [ "$READY" = "0" ] && { echo "ERROR: no ready signal"; cat /tmp/openclaw.log; exit 1; }
 
-            sleep 12900
+          echo "LIVE: @Zypher0_bot | Run $GITHUB_RUN_ID | Instance #$INSTANCE_NUMBER"
+          python3 scripts/send_startup_notification.py
 
-            NEXT=$(( INSTANCE_NUMBER + 1 ))
-            curl -s -X POST \
-              -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github.v3+json" \
-              "https://api.github.com/repos/$GITHUB_REPO/actions/workflows/openclaw.yml/dispatches" \
-              -d "{\"ref\":\"main\",\"inputs\":{\"instance_number\":\"$NEXT\"}}" \
-              && echo "Rotated to instance #$NEXT" || echo "WARN: rotation failed"
+          sleep 12900
 
-            sleep 300
+          NEXT=$(( INSTANCE_NUMBER + 1 ))
+          curl -s -X POST \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/$GITHUB_REPO/actions/workflows/openclaw.yml/dispatches" \
+            -d "{\"ref\":\"main\",\"inputs\":{\"instance_number\":\"$NEXT\"}}" \
+            && echo "Rotated to instance #$NEXT" || echo "WARN: rotation failed"
 
-            [ -n "$SUPABASE_URL" ] && [ -n "$SUPABASE_SERVICE_KEY" ] && \
-              curl -s -X PATCH "$SUPABASE_URL/rest/v1/active_sessions?github_run_id=eq.$GITHUB_RUN_ID" \
-                -H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
-                -H "Content-Type: application/json" -d '{"is_active":false}' || true
+          sleep 300
 
-            kill $DOCTOR_PID 2>/dev/null || true
-            OC=$(pgrep -f "openclaw gateway" | head -1)
-            [ -n "$OC" ] && { kill -TERM $OC 2>/dev/null; sleep 5; kill -KILL $OC 2>/dev/null || true; }
-            kill $TEE_PID 2>/dev/null || true
-            echo "Zypher stopped cleanly (instance #$INSTANCE_NUMBER)"
-  
+          [ -n "$SUPABASE_URL" ] && [ -n "$SUPABASE_SERVICE_KEY" ] && \
+            curl -s -X PATCH "$SUPABASE_URL/rest/v1/active_sessions?github_run_id=eq.$GITHUB_RUN_ID" \
+              -H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+              -H "Content-Type: application/json" -d '{"is_active":false}' || true
+
+          kill $DOCTOR_PID 2>/dev/null || true
+          OC=$(pgrep -f "openclaw gateway" | head -1)
+          [ -n "$OC" ] && { kill -TERM $OC 2>/dev/null; sleep 5; kill -KILL $OC 2>/dev/null || true; }
+          kill $TEE_PID 2>/dev/null || true
+          echo "Zypher stopped cleanly (instance #$INSTANCE_NUMBER)"
