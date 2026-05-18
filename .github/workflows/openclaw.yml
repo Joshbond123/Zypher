@@ -78,6 +78,25 @@ jobs:
           npm install -g openclaw
           echo "OpenClaw $(openclaw --version 2>/dev/null || echo installed)"
 
+      - name: OpenClaw onboard (Cerebras)
+        env:
+          CEREBRAS_API_KEY:   ${{ secrets.CEREBRAS_KEY_1 }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          # Run onboard first so it initialises directories and writes gateway.mode=local.
+          # The next step overwrites openclaw.json with our full template, so onboard's
+          # partial config is intentionally replaced — gateway.mode is added to the template.
+          openclaw onboard \
+            --non-interactive \
+            --mode local \
+            --auth-choice cerebras-api-key \
+            --cerebras-api-key "$CEREBRAS_API_KEY" \
+            --accept-risk \
+            --skip-health \
+            --skip-bootstrap \
+            2>&1 || true
+          echo "Onboard complete — gateway.mode initialised"
+
       - name: Write openclaw.json from template
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -90,30 +109,18 @@ jobs:
             -e "s|TELEGRAM_TOKEN_HERE|${TELEGRAM_BOT_TOKEN}|g" \
             scripts/oc_template.json > ~/.openclaw/openclaw.json
           echo '{ "security": "full", "ask": "off" }' > ~/.openclaw/exec-approvals.json
-          echo "openclaw.json written — Telegram token injected, Tavily key injected"
+          echo "openclaw.json written — Telegram token injected, Tavily key injected, gateway.mode=local"
           # Sanity: confirm neither placeholder survived
           if grep -q "TELEGRAM_TOKEN_HERE\|TAVILY_KEY_HERE" ~/.openclaw/openclaw.json; then
             echo "ERROR: Template placeholders were not substituted"
             exit 1
           fi
-          echo "Template substitution verified"
-
-      - name: OpenClaw onboard (Cerebras)
-        env:
-          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_KEY_1 }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        run: |
-          openclaw onboard \
-            --non-interactive \
-            --mode local \
-            --auth-choice cerebras-api-key \
-            --cerebras-api-key "$CEREBRAS_API_KEY" \
-            --accept-risk \
-            --skip-health \
-            --skip-bootstrap \
-            --skip-config \
-            2>&1 || true
-          echo "Onboard complete (config preserved from template)"
+          # Sanity: confirm gateway.mode is present
+          if ! grep -q '"mode"' ~/.openclaw/openclaw.json; then
+            echo "ERROR: gateway.mode missing from openclaw.json"
+            exit 1
+          fi
+          echo "Template substitution and gateway.mode verified"
 
       - name: Install stealth-browser + Tavily from ClawHub
         run: |
