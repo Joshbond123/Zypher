@@ -301,7 +301,7 @@ jobs:
           "
 
           echo "Starting Zypher gateway..."
-          openclaw gateway --config ~/.openclaw/openclaw.json 2>&1 | tee /tmp/openclaw.log &
+          openclaw gateway ~/.openclaw/openclaw.json 2>&1 | tee /tmp/openclaw.log &
           TEE_PID=$!
 
           READY=0
