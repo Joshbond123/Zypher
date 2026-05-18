@@ -86,20 +86,28 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
           mkdir -p ~/.openclaw/workspace
-          curl -s "$SUPABASE_URL/rest/v1/chat_messages?order=created_at.desc&limit=30&select=role,content,created_at" \
+          echo "[]" > /tmp/sb_msgs.json
+          echo "[]" > /tmp/sb_facts.json
+          curl -sf "$SUPABASE_URL/rest/v1/chat_messages?order=created_at.desc&limit=30&select=role,content,created_at" \
             -H "apikey: $SUPABASE_SERVICE_KEY" \
             -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
-            > /tmp/sb_msgs.json 2>/dev/null || echo "[]" > /tmp/sb_msgs.json
-          curl -s "$SUPABASE_URL/rest/v1/longterm_memory?order=created_at.desc&limit=20&select=key,value" \
+            -o /tmp/sb_msgs.json || echo "[]" > /tmp/sb_msgs.json
+          curl -sf "$SUPABASE_URL/rest/v1/longterm_memory?order=created_at.desc&limit=20&select=key,value" \
             -H "apikey: $SUPABASE_SERVICE_KEY" \
             -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
-            > /tmp/sb_facts.json 2>/dev/null || echo "[]" > /tmp/sb_facts.json
-          python3 scripts/bootstrap_memory.py \
-            --msgs /tmp/sb_msgs.json \
-            --facts /tmp/sb_facts.json \
-            --run-id "$GITHUB_RUN_ID" \
-            --out ~/.openclaw/workspace/MEMORY.md
-          echo "Memory bootstrapped"
+            -o /tmp/sb_facts.json || echo "[]" > /tmp/sb_facts.json
+          if [ -f scripts/bootstrap_memory.py ]; then
+            python3 scripts/bootstrap_memory.py \
+              --msgs /tmp/sb_msgs.json \
+              --facts /tmp/sb_facts.json \
+              --run-id "$GITHUB_RUN_ID" \
+              --out ~/.openclaw/workspace/MEMORY.md \
+              && echo "Memory bootstrapped from Supabase" || echo "Bootstrap error (ignored)"
+          else
+            echo "# Zypher Memory" > ~/.openclaw/workspace/MEMORY.md
+            echo "Fresh session — no history yet" >> ~/.openclaw/workspace/MEMORY.md
+            echo "Memory placeholder created"
+          fi
 
       - name: Write openclaw.json
         env:
