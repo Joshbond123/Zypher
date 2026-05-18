@@ -55,7 +55,7 @@
   },
   "plugins": {
     "entries": {
-      "tavily":  { "enabled": true, "config": { "apiKey": "TAVILY_KEY_HERE" } },
+      "tavily":  { "enabled": true },
       "browser": { "enabled": true }
     }
   },
