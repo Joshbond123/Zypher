@@ -41,8 +41,8 @@ jobs:
             python3-pip python3-scapy \
             2>/dev/null || true
           wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -O /tmp/chrome.deb
-          sudo apt-get install -y /tmp/chrome.deb 2>/dev/null || \
-            (sudo dpkg -i /tmp/chrome.deb && sudo apt-get -f install -y 2>/dev/null) || true
+          sudo apt-get install -y /tmp/chrome.deb 2>/dev/null \
+            || (sudo dpkg -i /tmp/chrome.deb && sudo apt-get -f install -y) || true
           echo "Tools ready | Chrome: $(google-chrome --version 2>/dev/null || echo not-found)"
 
       - name: Install OpenClaw
@@ -70,14 +70,12 @@ jobs:
           echo "--- stealth-browser ---"
           openclaw skills install clawhub:stealth-browser 2>&1 \
             || openclaw plugins install clawhub:stealth-browser 2>&1 \
-            || echo "stealth-browser: bundled fallback active"
-
+            || echo "stealth-browser bundled fallback active"
           echo "--- tavily ---"
           openclaw skills install clawhub:tavily 2>&1 \
             || openclaw plugins install npm:@openclaw/tavily 2>&1 \
-            || echo "tavily: API-key config will be used"
-
-          echo "--- installed ---"
+            || echo "tavily API-key config will be used"
+          echo "--- plugin list ---"
           openclaw plugins list 2>/dev/null || true
           openclaw skills list  2>/dev/null || true
 
@@ -88,92 +86,31 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
           mkdir -p ~/.openclaw/workspace
-          MSGS=$(curl -s "$SUPABASE_URL/rest/v1/chat_messages?order=created_at.desc&limit=30&select=role,content,created_at" \
+          curl -s "$SUPABASE_URL/rest/v1/chat_messages?order=created_at.desc&limit=30&select=role,content,created_at" \
             -H "apikey: $SUPABASE_SERVICE_KEY" \
-            -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" 2>/dev/null || echo "[]")
-          FACTS=$(curl -s "$SUPABASE_URL/rest/v1/longterm_memory?order=created_at.desc&limit=20&select=key,value" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+            > /tmp/sb_msgs.json 2>/dev/null || echo "[]" > /tmp/sb_msgs.json
+          curl -s "$SUPABASE_URL/rest/v1/longterm_memory?order=created_at.desc&limit=20&select=key,value" \
             -H "apikey: $SUPABASE_SERVICE_KEY" \
-            -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" 2>/dev/null || echo "[]")
-          python3 - "$MSGS" "$FACTS" << 'PYEOF'
-import json, sys, os
-try:    msgs  = json.loads(sys.argv[1]) if len(sys.argv) > 1 else []
-except: msgs  = []
-try:    facts = json.loads(sys.argv[2]) if len(sys.argv) > 2 else []
-except: facts = []
-msgs.reverse()
-run_id = os.environ.get("GITHUB_RUN_ID","unknown")
-lines = [f"# Zypher Memory — Run {run_id}", "## Long-term Facts"]
-lines += [f"- {f.get('key','?')}: {str(f.get('value',''))[:200]}" for f in facts] or ["(none yet)"]
-lines += ["", "## Conversation History (last 30)"]
-lines += [f"[{m.get('created_at','')[:16]}] {m.get('role','?').upper()}: {str(m.get('content',''))[:300]}" for m in msgs] or ["(none)"]
-open(os.path.expanduser("~/.openclaw/workspace/MEMORY.md"), "w").write("\n".join(lines))
-print(f"Memory bootstrapped: {len(msgs)} messages, {len(facts)} facts")
-PYEOF
-          echo "Memory ready"
+            -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+            > /tmp/sb_facts.json 2>/dev/null || echo "[]" > /tmp/sb_facts.json
+          python3 scripts/bootstrap_memory.py \
+            --msgs /tmp/sb_msgs.json \
+            --facts /tmp/sb_facts.json \
+            --run-id "$GITHUB_RUN_ID" \
+            --out ~/.openclaw/workspace/MEMORY.md
+          echo "Memory bootstrapped"
 
-      - name: Write openclaw.json (stealth-browser + Tavily + headless Chrome)
+      - name: Write openclaw.json
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TAVILY_API_KEY: ${{ secrets.TAVILY_KEY_1 }}
         run: |
           mkdir -p ~/.openclaw/workspace
           cp AGENTS.md ~/.openclaw/workspace/AGENTS.md
-          TKEY="$TAVILY_API_KEY"
-          cat > /tmp/oc_raw.json << 'OCEOF'
-{
-  "agents": {
-    "defaults": {
-      "workspace": "~/.openclaw/workspace",
-      "model": { "primary": "cerebras/qwen-3-235b-a22b-instruct-2507" }
-    },
-    "list": [
-      {
-        "id": "zypher",
-        "identity": {
-          "name": "Zypher",
-          "theme": "elite AI hacker — master of stealth-browser and Tavily web research",
-          "emoji": "👾"
-        }
-      }
-    ]
-  },
-  "channels": {
-    "telegram": {
-      "enabled": true,
-      "dmPolicy": "allowlist",
-      "allowFrom": ["6317345496"]
-    }
-  },
-  "tools": {
-    "profile": "full",
-    "exec": { "timeoutSec": 120, "security": "full" },
-    "web": {
-      "search": { "provider": "tavily" },
-      "fetch":  { "enabled": true, "maxChars": 60000 }
-    }
-  },
-  "browser": {
-    "enabled": true,
-    "headless": true,
-    "profiles": { "openclaw": { "headless": true } }
-  },
-  "plugins": {
-    "entries": {
-      "tavily":  { "enabled": true, "config": { "apiKey": "TAVILY_KEY_HERE" } },
-      "browser": { "enabled": true }
-    }
-  },
-  "logging": {
-    "level": "info",
-    "file": "/tmp/openclaw.log",
-    "consoleLevel": "info",
-    "consoleStyle": "pretty"
-  }
-}
-OCEOF
-          sed "s/TAVILY_KEY_HERE/$TKEY/" /tmp/oc_raw.json > ~/.openclaw/openclaw.json
+          sed "s/TAVILY_KEY_HERE/$TAVILY_API_KEY/" scripts/oc_template.json > ~/.openclaw/openclaw.json
           echo '{ "security": "full", "ask": "off" }' > ~/.openclaw/exec-approvals.json
-          echo "openclaw.json ready — stealth-browser + tavily + headless browser"
+          echo "openclaw.json ready (stealth-browser + tavily + headless Chrome)"
 
       - name: Register session in Supabase
         env:
@@ -182,7 +119,8 @@ OCEOF
           GITHUB_RUN_ID: ${{ github.run_id }}
           INSTANCE_NUMBER: ${{ github.event.inputs.instance_number || '1' }}
         run: |
-          EXPIRES=$(date -u -d '+4 hours' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u '+%Y-%m-%dT%H:%M:%SZ')
+          EXPIRES=$(date -u -d '+4 hours' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+            || date -u '+%Y-%m-%dT%H:%M:%SZ')
           curl -s -X POST "$SUPABASE_URL/rest/v1/active_sessions" \
             -H "apikey: $SUPABASE_SERVICE_KEY" \
             -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
@@ -200,7 +138,7 @@ OCEOF
           python3 scripts/zypher_agent.py > /tmp/sidecar.log 2>&1 &
           echo "Supabase sidecar PID $!"
 
-      - name: Start OpenClaw Gateway — Zypher live
+      - name: Start OpenClaw Gateway
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_KEY_1 }}
@@ -213,7 +151,8 @@ OCEOF
           INSTANCE_NUMBER: ${{ github.event.inputs.instance_number || '1' }}
         run: |
           echo "Starting Zypher — stealth-browser + Tavily + Supabase memory..."
-          export TELEGRAM_BOT_TOKEN CEREBRAS_API_KEY TAVILY_API_KEY SUPABASE_URL SUPABASE_SERVICE_KEY GITHUB_RUN_ID
+          export TELEGRAM_BOT_TOKEN CEREBRAS_API_KEY TAVILY_API_KEY \
+                 SUPABASE_URL SUPABASE_SERVICE_KEY GITHUB_RUN_ID
           openclaw gateway 2>&1 | tee /tmp/openclaw.log &
           GATEWAY_PID=$!
           sleep 15
