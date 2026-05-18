@@ -3,15 +3,15 @@
     "mode": "local",
     "session": {
       "errorRecovery": "soft-reset",
-      "maxRetries": 2,
-      "retryDelayMs": 1500
+      "maxRetries": 3,
+      "retryDelayMs": 2000
     }
   },
   "agents": {
     "defaults": {
       "workspace": "~/.openclaw/workspace",
       "model": {
-        "primary": "cerebras/llama-3.3-70b",
+        "primary": "cerebras/zai-glm-4.7",
         "fallback": "cerebras/llama3.1-8b"
       }
     },
@@ -45,15 +45,19 @@
         "api": "openai-completions",
         "models": [
           {
-            "id": "llama-3.3-70b",
-            "name": "Llama 3.3 70B"
+            "id": "zai-glm-4.7",
+            "name": "Z.ai GLM 4.7"
+          },
+          {
+            "id": "gpt-oss-120b",
+            "name": "GPT OSS 120B"
           },
           {
             "id": "llama3.1-8b",
             "name": "Llama 3.1 8B"
           },
           {
-            "id": "qwen-3-235b-2507",
+            "id": "qwen-3-235b-a22b-instruct-2507",
             "name": "Qwen3 235B"
           }
         ]
