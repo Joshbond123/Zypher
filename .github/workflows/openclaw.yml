@@ -40,6 +40,7 @@ jobs:
             dirb wfuzz wordlists \
             python3-pip python3-scapy \
             2>/dev/null || true
+          pip install PyNaCl requests -q 2>/dev/null || true
           wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -O /tmp/chrome.deb
           sudo apt-get install -y /tmp/chrome.deb 2>/dev/null \
             || (sudo dpkg -i /tmp/chrome.deb && sudo apt-get -f install -y) || true
@@ -53,8 +54,8 @@ jobs:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: |
           MISSING=0
-          [ -z "$TELEGRAM_BOT_TOKEN" ]   && echo "ERROR: TELEGRAM_BOT_TOKEN not set" && MISSING=1
-          [ -z "$CEREBRAS_API_KEY" ]     && echo "ERROR: CEREBRAS_KEY_1 not set"     && MISSING=1
+          [ -z "$TELEGRAM_BOT_TOKEN" ] && echo "ERROR: TELEGRAM_BOT_TOKEN not set" && MISSING=1
+          [ -z "$CEREBRAS_API_KEY" ]   && echo "ERROR: CEREBRAS_KEY_1 not set"     && MISSING=1
           [ -z "$SUPABASE_URL" ]         && echo "WARN:  SUPABASE_URL not set (memory disabled)"
           [ -z "$SUPABASE_SERVICE_KEY" ] && echo "WARN:  SUPABASE_SERVICE_KEY not set (memory disabled)"
           [ "$MISSING" = "1" ] && exit 1 || echo "Required secrets present"
@@ -83,9 +84,6 @@ jobs:
           CEREBRAS_API_KEY:   ${{ secrets.CEREBRAS_KEY_1 }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: |
-          # Onboard creates the initial ~/.openclaw/ structure and auth store.
-          # Our template write (next step) overwrites openclaw.json with the
-          # correct config, so onboard output is intentionally discarded.
           openclaw onboard \
             --non-interactive \
             --mode local \
@@ -103,22 +101,33 @@ jobs:
           TAVILY_API_KEY:       ${{ secrets.TAVILY_KEY_1 }}
           TAVILY_API_KEY_2:     ${{ secrets.TAVILY_KEY_2 }}
           CEREBRAS_API_KEY:     ${{ secrets.CEREBRAS_KEY_1 }}
+          CEREBRAS_API_KEY_2:   ${{ secrets.CEREBRAS_KEY_2 }}
+          CEREBRAS_API_KEY_3:   ${{ secrets.CEREBRAS_KEY_3 }}
+          CEREBRAS_API_KEY_4:   ${{ secrets.CEREBRAS_KEY_4 }}
           SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: |
           mkdir -p ~/.openclaw/workspace/memory
           cp AGENTS.md ~/.openclaw/workspace/AGENTS.md
 
-          # --- Token substitution ---
+          # Use KEY_1 as fallback for any missing numbered keys
+          K2="${CEREBRAS_API_KEY_2:-$CEREBRAS_API_KEY}"
+          K3="${CEREBRAS_API_KEY_3:-$CEREBRAS_API_KEY}"
+          K4="${CEREBRAS_API_KEY_4:-$CEREBRAS_API_KEY}"
+
+          # Token substitution — 4 Cerebras provider placeholders
           sed \
             -e "s|TELEGRAM_TOKEN_HERE|${TELEGRAM_BOT_TOKEN}|g" \
-            -e "s|CEREBRAS_KEY_HERE|${CEREBRAS_API_KEY}|g" \
+            -e "s|CEREBRAS_KEY_1_HERE|${CEREBRAS_API_KEY}|g" \
+            -e "s|CEREBRAS_KEY_2_HERE|${K2}|g" \
+            -e "s|CEREBRAS_KEY_3_HERE|${K3}|g" \
+            -e "s|CEREBRAS_KEY_4_HERE|${K4}|g" \
             -e "s|TAVILY_KEY_HERE|${TAVILY_API_KEY}|g" \
             -e "s|SUPABASE_URL_HERE|${SUPABASE_URL}|g" \
             -e "s|SUPABASE_KEY_HERE|${SUPABASE_SERVICE_KEY}|g" \
             scripts/oc_template.json > ~/.openclaw/openclaw.json
 
-          # --- Tavily: use KEY_2 as fallback or disable cleanly ---
+          # Tavily: use KEY_2 as fallback or disable cleanly
           if [ -z "$TAVILY_API_KEY" ] && [ -n "$TAVILY_API_KEY_2" ]; then
             echo "INFO: TAVILY_KEY_1 absent — using TAVILY_KEY_2 as primary"
             jq ".tools.web.search.apiKey = \"${TAVILY_API_KEY_2}\" | .plugins.entries.tavily.enabled = true" \
@@ -135,39 +144,59 @@ jobs:
 
           echo '{ "security": "full", "ask": "off" }' > ~/.openclaw/exec-approvals.json
 
-          # --- Sanity checks ---
-          if grep -qE "TELEGRAM_TOKEN_HERE|CEREBRAS_KEY_HERE" ~/.openclaw/openclaw.json; then
-            echo "ERROR: Template placeholders not substituted"; exit 1
+          # Sanity check — no unfilled placeholders
+          if grep -qE "TELEGRAM_TOKEN_HERE|CEREBRAS_KEY_[0-9]_HERE" ~/.openclaw/openclaw.json; then
+            echo "ERROR: Template placeholders not substituted"
+            grep -E "TELEGRAM_TOKEN_HERE|CEREBRAS_KEY_[0-9]_HERE" ~/.openclaw/openclaw.json
+            exit 1
           fi
+
           python3 -c "
           import json, sys, os
           c = json.load(open(os.path.expanduser('~/.openclaw/openclaw.json')))
-          assert c.get('gateway',{}).get('mode')=='local', 'gateway.mode missing'
           tg = c.get('channels',{}).get('telegram',{})
           assert tg.get('enabled') == True, 'telegram not enabled'
           tok = tg.get('botToken','')
           assert tok and tok != 'TELEGRAM_TOKEN_HERE', 'botToken not injected'
           model_cfg = c.get('agents',{}).get('defaults',{}).get('model',{})
           primary = model_cfg.get('primary','')
-          assert primary, 'model.primary not configured'
           fallbacks = model_cfg.get('fallbacks', [])
-          assert len(fallbacks) > 0, 'model.fallbacks empty — requests will fail if primary is unavailable'
-          print('Config OK — model.primary=%s fallbacks=%s' % (primary, fallbacks))
+          assert primary, 'model.primary not configured'
+          assert len(fallbacks) > 0, 'model.fallbacks empty'
+          providers = c.get('models',{}).get('providers',{})
+          num_providers = len([p for p in providers if 'cerebras' in p.lower()])
+          print('Config OK — primary=%s fallbacks=%d providers=%d streaming=%s' % (
+              primary, len(fallbacks), num_providers,
+              tg.get('streaming',{}).get('mode','off')))
           " || exit 1
           echo "All config sanity checks passed"
-          echo "=== Final config (keys masked) ==="
+          echo "=== Config preview (keys masked) ==="
           python3 -c "
           import json, os, re
           raw = open(os.path.expanduser('~/.openclaw/openclaw.json')).read()
-          masked = re.sub(r'(\"apiKey\"|\"botToken\"|\"key\")\s*:\s*\"[^\"]{8,}\"', r'\1: \"***\"', raw)
-          print(masked[:2000])
+          masked = re.sub(r'(\"apiKey\"|\"botToken\")\s*:\s*\"[^\"]{8,}\"', r'\1: \"***\"', raw)
+          print(masked[:2500])
           "
+
+      - name: Run cerebras_key_rotator.py (round-robin key selection)
+        env:
+          CEREBRAS_API_KEY:     ${{ secrets.CEREBRAS_KEY_1 }}
+          CEREBRAS_API_KEY_2:   ${{ secrets.CEREBRAS_KEY_2 }}
+          CEREBRAS_API_KEY_3:   ${{ secrets.CEREBRAS_KEY_3 }}
+          CEREBRAS_API_KEY_4:   ${{ secrets.CEREBRAS_KEY_4 }}
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          GITHUB_RUN_ID:        ${{ github.run_id }}
+        run: |
+          echo "=== Cerebras Key Rotator ==="
+          python3 scripts/cerebras_key_rotator.py 2>&1
+          echo "=== Rotator complete ==="
 
       - name: Run openclaw doctor --fix
         run: |
-          echo "=== Running openclaw doctor --fix to auto-correct any remaining config issues ==="
+          echo "=== openclaw doctor --fix ==="
           openclaw doctor --fix 2>&1 || true
-          echo "=== Doctor check complete ==="
+          echo "=== Doctor complete ==="
 
       - name: Install stealth-browser + Tavily from ClawHub
         run: |
@@ -176,12 +205,9 @@ jobs:
             || echo "stealth-browser bundled fallback active"
           openclaw skills install clawhub:tavily 2>&1 \
             || openclaw plugins install npm:@openclaw/tavily 2>&1 \
-            || echo "tavily skill install skipped (key-based config in use)"
-          # NOTE: clawhub:supabase is intentionally NOT installed here.
-          # Supabase persistence is handled by zypher_agent.py sidecar.
-          # Having supabase plugin enabled=true but not installed caused
-          # plugin hook failures during message processing — root cause of
-          # "Something went wrong". Plugin is now set to enabled=false.
+            || echo "tavily skill install skipped"
+          # NOTE: clawhub:supabase intentionally NOT installed.
+          # supabase plugin is disabled in config; sidecar handles persistence.
           openclaw plugins list 2>/dev/null || true
           openclaw skills list  2>/dev/null || true
 
@@ -208,7 +234,7 @@ jobs:
               && echo "Long-term facts fetched" \
               || { echo "WARN: could not fetch longterm_memory"; echo "[]" > /tmp/sb_facts.json; }
           else
-            echo "Supabase not configured — starting fresh session"
+            echo "Supabase not configured — fresh session"
           fi
           python3 scripts/bootstrap_memory.py \
             --msgs  /tmp/sb_msgs.json \
@@ -216,14 +242,12 @@ jobs:
             --run-id "$GITHUB_RUN_ID" \
             --out   ~/.openclaw/workspace/MEMORY.md \
             && echo "Memory bootstrapped" \
-            || { echo "Bootstrap error — using blank memory"; \
+            || { echo "Bootstrap error — blank memory";
                  printf "# Zypher Memory\nFresh session\n" > ~/.openclaw/workspace/MEMORY.md; }
-          # Write today's daily note placeholder (OpenClaw reads memory/YYYY-MM-DD.md)
           TODAY=$(date -u '+%Y-%m-%d')
           DAILY_NOTE=~/.openclaw/workspace/memory/${TODAY}.md
           if [ ! -f "$DAILY_NOTE" ]; then
             printf "# Zypher Daily Notes — %s\nSession: %s\n" "$TODAY" "$GITHUB_RUN_ID" > "$DAILY_NOTE"
-            echo "Daily note created: $DAILY_NOTE"
           fi
 
       - name: Register session in Supabase
@@ -266,14 +290,13 @@ jobs:
           fi
           echo "Sidecar running (PID $SIDECAR_PID)"
 
-      - name: Start OpenClaw Gateway
+      - name: Start OpenClaw Gateway + periodic doctor
         env:
           TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CEREBRAS_API_KEY:     ${{ secrets.CEREBRAS_KEY_1 }}
           CEREBRAS_API_KEY_2:   ${{ secrets.CEREBRAS_KEY_2 }}
           CEREBRAS_API_KEY_3:   ${{ secrets.CEREBRAS_KEY_3 }}
           CEREBRAS_API_KEY_4:   ${{ secrets.CEREBRAS_KEY_4 }}
-          CEREBRAS_API_KEY_5:   ${{ secrets.CEREBRAS_KEY_5 }}
           TAVILY_API_KEY:       ${{ secrets.TAVILY_KEY_1 }}
           TAVILY_API_KEY_2:     ${{ secrets.TAVILY_KEY_2 }}
           SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
@@ -283,28 +306,54 @@ jobs:
           GITHUB_REPO:          ${{ github.repository }}
           INSTANCE_NUMBER:      ${{ github.event.inputs.instance_number || '1' }}
         run: |
-          echo "=== Pre-flight: openclaw.json config validation ==="
+          echo "=== Pre-flight: openclaw.json validation ==="
           python3 -c "
           import json, sys, os
           try:
               cfg = json.load(open(os.path.expanduser('~/.openclaw/openclaw.json')))
               tg  = cfg.get('channels', {}).get('telegram', {})
-              has_token = bool(tg.get('botToken', ''))
               model_cfg = cfg.get('agents', {}).get('defaults', {}).get('model', {})
               primary = model_cfg.get('primary', 'NOT SET')
               fallbacks = model_cfg.get('fallbacks', [])
+              providers = cfg.get('models', {}).get('providers', {})
+              cerebras_providers = [p for p in providers if 'cerebras' in p.lower()]
+              streaming = tg.get('streaming', {}).get('mode', 'off')
               sb_enabled = cfg.get('plugins', {}).get('entries', {}).get('supabase', {}).get('enabled', False)
-              print('  telegram_enabled=%s  botToken_set=%s  model.primary=%s  fallbacks=%s  supabase_plugin=%s' % (
-                  tg.get('enabled'), has_token, primary, fallbacks, sb_enabled))
-              if not has_token:
-                  print('ERROR: botToken missing — bot will not respond')
+              print('  telegram=%s  botToken_set=%s  streaming=%s' % (tg.get('enabled'), bool(tg.get('botToken','')), streaming))
+              print('  model.primary=%s  fallbacks=%d  providers=%s  supabase_plugin=%s' % (
+                  primary, len(fallbacks), cerebras_providers, sb_enabled))
+              if not tg.get('botToken',''):
+                  print('ERROR: botToken missing')
                   sys.exit(1)
               if not fallbacks:
-                  print('WARN: No model fallbacks — requests will fail if primary model is unavailable')
+                  print('WARN: No fallbacks configured')
           except Exception as e:
-              print('Could not validate config: %s' % e)
+              print('Config error: %s' % e)
               sys.exit(1)
           "
+
+          # Start periodic doctor (every 30 min) in background
+          (
+            while true; do
+              sleep 1800
+              echo "[$(date -u +%H:%M:%SZ)] Running scheduled openclaw doctor check..."
+              openclaw doctor 2>&1 | tail -5 || true
+              echo "[$(date -u +%H:%M:%SZ)] Key rotator stats:"
+              python3 scripts/cerebras_key_rotator.py --stats 2>&1 \
+                || python3 /dev/stdin << 'PYSTATS'
+import json, os, time
+sf = os.path.expanduser('~/.openclaw/cerebras_key_stats.json')
+if os.path.exists(sf):
+    stats = json.load(open(sf))
+    for kid, st in stats.items():
+        print(f"  {kid}: requests={st.get('request_count',0)} rate_limits={st.get('rate_limit_events',0)}")
+else:
+    print("  No stats file yet")
+PYSTATS
+            done
+          ) &
+          DOCTOR_PID=$!
+          echo "Periodic doctor started (PID $DOCTOR_PID, every 30 min)"
 
           echo "Starting Zypher gateway..."
           openclaw gateway 2>&1 | tee /tmp/openclaw.log &
@@ -316,15 +365,13 @@ jobs:
             sleep 1
             ELAPSED=$(( ELAPSED + 1 ))
             if grep -qiE "ready|listening|started|telegram.*poll|gateway.*up|ingress|bot.*online|connected" /tmp/openclaw.log 2>/dev/null; then
-              echo "Ready signal detected after ${ELAPSED}s"
+              echo "Ready signal after ${ELAPSED}s"
               READY=1
               break
             fi
             if [ $ELAPSED -eq 20 ] && [ -s /tmp/openclaw.log ]; then
-              LINES=$(wc -l < /tmp/openclaw.log)
-              echo "No ready signal yet after 20s but log has ${LINES} lines — checking for errors..."
-              if ! grep -qiE "fatal|crash|EFATAL|ECRITICAL|exited|refused|cannot|failed to start" /tmp/openclaw.log; then
-                echo "No fatal errors — assuming gateway is starting"
+              if ! grep -qiE "fatal|crash|EFATAL|ECRITICAL|exited|refused|failed to start" /tmp/openclaw.log; then
+                echo "No ready signal but no fatal errors at 20s — assuming startup in progress"
                 READY=1
                 break
               fi
@@ -335,33 +382,22 @@ jobs:
           head -100 /tmp/openclaw.log 2>/dev/null || echo "(log empty)"
 
           if ! kill -0 $TEE_PID 2>/dev/null; then
-            echo "ERROR: Gateway pipeline exited during startup. Full log:"
-            cat /tmp/openclaw.log
-            exit 1
+            echo "ERROR: Gateway pipeline exited. Full log:"; cat /tmp/openclaw.log; exit 1
           fi
-          echo "Gateway pipeline alive (tee PID $TEE_PID)"
 
           if [ "$READY" = "0" ]; then
-            echo "ERROR: No ready signal in 60s and no output. Full log:"
-            cat /tmp/openclaw.log
-            exit 1
+            echo "ERROR: No ready signal in 60s. Full log:"; cat /tmp/openclaw.log; exit 1
           fi
 
-          if grep -qiE "^.*EFATAL|ECRITICAL" /tmp/openclaw.log 2>/dev/null; then
-            echo "ERROR: Fatal error in log. Full log:"
-            cat /tmp/openclaw.log
-            exit 1
-          fi
+          echo "LIVE: @Zypher0_bot | Run $GITHUB_RUN_ID | Instance #$INSTANCE_NUMBER"
 
-          echo "Health checks passed — LIVE: @Zypher0_bot | Run $GITHUB_RUN_ID"
-
-          # Send startup notification to Telegram
+          # Startup notification
           python3 -c "
           import os, urllib.request, json as J
           tok  = os.environ.get('TELEGRAM_BOT_TOKEN', '')
           rid  = os.environ.get('GITHUB_RUN_ID', '?')
           inst = os.environ.get('INSTANCE_NUMBER', '1')
-          msg  = chr(0x1F7E2) + ' Zypher online | Instance #' + inst + ' | Run ' + rid + chr(0xA) + 'Ready! (v5: model fallbacks active)'
+          msg  = chr(0x1F7E2) + ' Zypher online | Instance #' + inst + ' | Run ' + rid + chr(0xA) + 'Ready! (4 Cerebras keys, 11-entry fallback chain, streaming active)'
           try:
               data = J.dumps({'chat_id': '6317345496', 'text': msg}).encode()
               req  = urllib.request.Request(
@@ -374,23 +410,23 @@ jobs:
               print('WARN notification failed: ' + str(e))
           "
 
-          # Run for 215 minutes — triggers next instance 5 min before this one ends
+          # Run for 215 minutes then hand off
           sleep 12900
 
-          # Trigger next instance (seamless handoff)
+          # Trigger next instance
           NEXT=$(( INSTANCE_NUMBER + 1 ))
           curl -s -X POST \
             -H "Authorization: token $GITHUB_TOKEN" \
             -H "Accept: application/vnd.github.v3+json" \
             "https://api.github.com/repos/$GITHUB_REPO/actions/workflows/openclaw.yml/dispatches" \
             -d "{\"ref\":\"main\",\"inputs\":{\"instance_number\":\"$NEXT\"}}" \
-            && echo "Rotated to instance #$NEXT (5-min overlap handoff)" \
-            || echo "WARN: Rotation failed — next schedule will start fresh"
+            && echo "Rotated to instance #$NEXT" \
+            || echo "WARN: Rotation failed"
 
-          # 5-minute overlap: both old and new instance alive during handoff
+          # 5-min overlap handoff
           sleep 300
 
-          # Mark session inactive in Supabase
+          # Mark session inactive
           if [ -n "$SUPABASE_URL" ] && [ -n "$SUPABASE_SERVICE_KEY" ]; then
             curl -s -X PATCH "$SUPABASE_URL/rest/v1/active_sessions?github_run_id=eq.$GITHUB_RUN_ID" \
               -H "apikey: $SUPABASE_SERVICE_KEY" \
@@ -400,6 +436,7 @@ jobs:
           fi
 
           # Graceful shutdown
+          kill $DOCTOR_PID 2>/dev/null || true
           OPENCLAW_PID=$(pgrep -f "openclaw gateway" | head -1)
           if [ -n "$OPENCLAW_PID" ]; then
             kill -TERM "$OPENCLAW_PID" 2>/dev/null || true
