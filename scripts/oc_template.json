@@ -1,0 +1,50 @@
+{
+  "agents": {
+    "defaults": {
+      "workspace": "~/.openclaw/workspace",
+      "model": { "primary": "cerebras/qwen-3-235b-a22b-instruct-2507" }
+    },
+    "list": [
+      {
+        "id": "zypher",
+        "identity": {
+          "name": "Zypher",
+          "theme": "elite AI hacker — master of stealth-browser and Tavily web research",
+          "emoji": "👾"
+        }
+      }
+    ]
+  },
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "dmPolicy": "allowlist",
+      "allowFrom": ["6317345496"]
+    }
+  },
+  "tools": {
+    "profile": "full",
+    "exec": { "timeoutSec": 120, "security": "full" },
+    "web": {
+      "search": { "provider": "tavily" },
+      "fetch":  { "enabled": true, "maxChars": 60000 }
+    }
+  },
+  "browser": {
+    "enabled": true,
+    "headless": true,
+    "profiles": { "openclaw": { "headless": true } }
+  },
+  "plugins": {
+    "entries": {
+      "tavily":  { "enabled": true, "config": { "apiKey": "TAVILY_KEY_HERE" } },
+      "browser": { "enabled": true }
+    }
+  },
+  "logging": {
+    "level": "info",
+    "file": "/tmp/openclaw.log",
+    "consoleLevel": "info",
+    "consoleStyle": "pretty"
+  }
+}
