@@ -5,7 +5,9 @@
   "agents": {
     "defaults": {
       "workspace": "~/.openclaw/workspace",
-      "model": { "primary": "cerebras/llama-3.3-70b" }
+      "model": {
+        "primary": "cerebras/llama-3.3-70b"
+      }
     },
     "list": [
       {
@@ -23,7 +25,9 @@
       "enabled": true,
       "botToken": "TELEGRAM_TOKEN_HERE",
       "dmPolicy": "allowlist",
-      "allowFrom": ["6317345496"]
+      "allowFrom": [
+        "6317345496"
+      ]
     }
   },
   "models": {
@@ -34,19 +38,37 @@
         "apiKey": "CEREBRAS_KEY_HERE",
         "api": "openai-completions",
         "models": [
-          { "id": "llama-3.3-70b",      "name": "Llama 3.3 70B" },
-          { "id": "llama3.1-8b",         "name": "Llama 3.1 8B" },
-          { "id": "qwen-3-235b-2507",    "name": "Qwen3 235B" }
+          {
+            "id": "llama-3.3-70b",
+            "name": "Llama 3.3 70B"
+          },
+          {
+            "id": "llama3.1-8b",
+            "name": "Llama 3.1 8B"
+          },
+          {
+            "id": "qwen-3-235b-2507",
+            "name": "Qwen3 235B"
+          }
         ]
       }
     }
   },
   "tools": {
     "profile": "full",
-    "exec": { "timeoutSec": 120, "security": "full" },
+    "exec": {
+      "timeoutSec": 120,
+      "security": "full"
+    },
     "web": {
-      "search": { "provider": "tavily" },
-      "fetch":  { "enabled": true, "maxChars": 60000 }
+      "search": {
+        "provider": "tavily",
+        "apiKey": "TAVILY_KEY_HERE"
+      },
+      "fetch": {
+        "enabled": true,
+        "maxChars": 60000
+      }
     }
   },
   "browser": {
@@ -54,8 +76,12 @@
   },
   "plugins": {
     "entries": {
-      "tavily":  { "enabled": true },
-      "browser": { "enabled": true }
+      "tavily": {
+        "enabled": true
+      },
+      "browser": {
+        "enabled": true
+      }
     }
   },
   "logging": {
