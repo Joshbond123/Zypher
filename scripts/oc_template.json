@@ -18,12 +18,7 @@
           "cerebras-3/llama3.1-8b",
           "cerebras-4/llama3.1-8b"
         ]
-      },
-      "responseTimeout": 120000,
-      "taskTimeout": 300000,
-      "concurrency": 4,
-      "retryOnFailure": true,
-      "maxRetries": 3
+      }
     },
     "list": [
       {
@@ -42,9 +37,7 @@
       "mode": "none"
     },
     "port": 18789,
-    "bind": "loopback",
-    "keepAlive": true,
-    "requestTimeout": 120000
+    "bind": "loopback"
   },
   "channels": {
     "telegram": {
@@ -79,16 +72,6 @@
       "timeout": 30000,
       "retries": 2
     }
-  },
-  "runtime": {
-    "concurrency": 4,
-    "taskQueueSize": 16,
-    "workerThreads": 2,
-    "streamBufferMs": 0,
-    "asyncDispatch": true,
-    "progressPollMs": 500,
-    "stallDetectMs": 30000,
-    "stallRecovery": true
   },
   "models": {
     "mode": "merge",

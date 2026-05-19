@@ -10,8 +10,11 @@ if not tok:
     print('WARN: No TELEGRAM_BOT_TOKEN — skipping notification')
     raise SystemExit(0)
 
-msg = ('\U0001f7e2 Zypher online | Instance #' + inst + ' | Run ' + rid + '\n'
-       'Ready! (4 Cerebras keys \u2022 11-entry fallback chain \u2022 streaming active \u2022 key rotator running)')
+msg = (
+    '\U0001f7e2 Zypher online | Instance #' + inst + ' | Run ' + rid[-6:] + '\n'
+    'Ready — send me a task.\n'
+    '4 Cerebras keys \u2022 11-model fallback chain \u2022 streaming:partial \u2022 stall alert in 45s'
+)
 
 try:
     data = json.dumps({'chat_id': '6317345496', 'text': msg}).encode()
