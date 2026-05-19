@@ -194,7 +194,8 @@ jobs:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           SUPABASE_PAT:         ${{ secrets.SUPABASE_PAT }}
           GITHUB_RUN_ID:        ${{ github.run_id }}
-        run: python3 scripts/setup_schema.py || echo "WARN: schema check non-fatal, continuing"
+        run: |
+          python3 scripts/setup_schema.py || echo "WARN - schema check non-fatal, continuing"
 
       - name: Bootstrap memory from Supabase
         env:
