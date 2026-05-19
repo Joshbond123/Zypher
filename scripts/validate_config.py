@@ -28,7 +28,8 @@ assert len(fallbacks) > 0, 'model.fallbacks is empty — requests will fail if p
 
 providers = c.get('models', {}).get('providers', {})
 num_providers = len([p for p in providers if 'cerebras' in p.lower()])
-streaming = tg.get('streaming', {}).get('mode', 'off')
+streaming = tg.get('streaming', {}).get('mode', 'off') if isinstance(tg.get('streaming'), dict) else 'off'
+assert streaming in ('off', 'partial', 'block', 'progress'), f'streaming.mode invalid: "{streaming}"'
 sb_enabled = c.get('plugins', {}).get('entries', {}).get('supabase', {}).get('enabled', False)
 
 print('Config OK: primary=%s fallbacks=%d providers=%d streaming=%s supabase_plugin=%s' % (

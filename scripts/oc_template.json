@@ -46,15 +46,6 @@
     "keepAlive": true,
     "requestTimeout": 120000
   },
-  "session": {
-    "dmScope": "per-channel-peer",
-    "progressUpdates": true,
-    "progressInterval": 15,
-    "typingIndicator": true,
-    "announceTools": true,
-    "announceSubAgents": true,
-    "streamingAck": true
-  },
   "channels": {
     "telegram": {
       "enabled": true,
@@ -62,24 +53,8 @@
       "dmPolicy": "allowlist",
       "allowFrom": ["6317345496"],
       "streaming": {
-        "enabled": true,
-        "mode": "progressive",
-        "chunkDelay": 0,
-        "flushInterval": 500
-      },
-      "typing": {
-        "enabled": true,
-        "interval": 4000
-      },
-      "progress": {
-        "enabled": true,
-        "interval": 20,
-        "showToolCalls": true,
-        "showSteps": true,
-        "showSubAgents": true,
-        "draftUpdates": true
-      },
-      "parseMode": "Markdown"
+        "mode": "partial"
+      }
     }
   },
   "tools": {
