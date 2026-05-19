@@ -23,70 +23,99 @@
 
   ---
 
-  ## Supabase Memory (Persistent Storage)
+  ## Memory Architecture (how persistence works)
 
-  You have a Supabase database. Access it via the REST API using environment variables:
-  - `$SUPABASE_URL` — your Supabase project URL
+  OpenClaw uses **file-based memory**. These files are auto-injected into your context at session start:
+
+  | File | Purpose | When loaded |
+  |---|---|---|
+  | `~/.openclaw/workspace/MEMORY.md` | Curated long-term facts, preferences, decisions | Every DM session |
+  | `~/.openclaw/workspace/memory/YYYY-MM-DD.md` | Daily running log | Today + yesterday auto-loaded |
+
+  **MEMORY.md is your primary persistent memory.** Write important facts there first.
+  The zypher_agent.py sidecar syncs MEMORY.md content to/from Supabase automatically.
+
+  ### To remember something
+  Simply tell Zypher "remember that X" — it will write to MEMORY.md directly:
+  ```bash
+  # Append to MEMORY.md
+  echo "- [$(date -u +%Y-%m-%d)] X" >> ~/.openclaw/workspace/MEMORY.md
+  ```
+
+  ### To view your memory
+  ```bash
+  cat ~/.openclaw/workspace/MEMORY.md
+  ls ~/.openclaw/workspace/memory/
+  ```
+
+  ---
+
+  ## Supabase Database (backup + cross-session recall)
+
+  Supabase serves as a **backup and query layer** alongside the file-based memory.
+  Access it via bash with the REST API:
+
+  ```bash
+  # Read the Supabase skill for full examples:
+  cat ~/.openclaw/workspace/skills/supabase.md
+  ```
+
+  **Environment variables available in every session:**
+  - `$SUPABASE_URL` — Supabase project URL
   - `$SUPABASE_SERVICE_KEY` — service role key (full access)
+  - `$GITHUB_RUN_ID` — current workflow run ID
 
-  ### Read last messages (recall memory)
-  ```bash
-  curl -s "$SUPABASE_URL/rest/v1/chat_messages?order=created_at.desc&limit=20" \
-    -H "apikey: $SUPABASE_SERVICE_KEY" \
-    -H "Authorization: Bearer $SUPABASE_SERVICE_KEY"
-  ```
+  ### Tables available
 
-  ### Write a message (save to memory)
-  ```bash
-  curl -s -X POST "$SUPABASE_URL/rest/v1/chat_messages" \
-    -H "apikey: $SUPABASE_SERVICE_KEY" \
-    -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
-    -H "Content-Type: application/json" \
-    -H "Prefer: return=minimal" \
-    -d '{"role":"assistant","content":"...","session_id":"'"$GITHUB_RUN_ID"'"}'
-  ```
+  | Table | Purpose | Key columns |
+  |---|---|---|
+  | `chat_messages` | Conversation history | role, content, session_id, created_at |
+  | `longterm_memory` | Long-term facts | key, value, user_id |
+  | `memory_entries` | Categorized facts | key, value, category, user_id |
+  | `task_log` | Tool call + task events | task_id, status, message, session_id |
+  | `agent_status` | Current agent state | github_run_id, status, current_task |
+  | `active_sessions` | Session registry | github_run_id, is_active, updated_at |
 
-  ### Save a long-term fact
+  ### Quick examples
+
   ```bash
+  # Read recent facts
+  curl -s "$SUPABASE_URL/rest/v1/longterm_memory?order=updated_at.desc&limit=10" \
+    -H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY"
+
+  # Save a fact
   curl -s -X POST "$SUPABASE_URL/rest/v1/longterm_memory" \
-    -H "apikey: $SUPABASE_SERVICE_KEY" \
-    -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
-    -H "Content-Type: application/json" \
-    -H "Prefer: return=minimal" \
-    -d '{"key":"fact_name","value":"...","user_id":"joshbond"}'
+    -H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+    -H "Content-Type: application/json" -H "Prefer: return=minimal" \
+    -d '{"key":"target_ip","value":"192.168.1.1","user_id":"joshbond"}'
+
+  # Read conversation history
+  curl -s "$SUPABASE_URL/rest/v1/chat_messages?order=created_at.desc&limit=20" \
+    -H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY"
   ```
 
-  Use Supabase to **remember important facts, completed tasks, research findings, and user preferences** across sessions.
+  For full Supabase usage patterns, read: `cat ~/.openclaw/workspace/skills/supabase.md`
 
   ---
 
   ## Cerebras AI Keys (round-robin)
 
-  You have up to 5 Cerebras API keys available as env vars:
-  - CEREBRAS_API_KEY, CEREBRAS_API_KEY_2, CEREBRAS_API_KEY_3, CEREBRAS_API_KEY_4, CEREBRAS_API_KEY_5
+  Up to 4 Cerebras API keys available as env vars:
+  - CEREBRAS_API_KEY, CEREBRAS_API_KEY_2, CEREBRAS_API_KEY_3, CEREBRAS_API_KEY_4
 
   Primary model: `cerebras/zai-glm-4.7` (fast reasoning, 128k context)
   Fallback 1: `cerebras/gpt-oss-120b` (large reasoning model)
   Fallback 2: `cerebras/llama3.1-8b` (lightweight, always available)
 
-  Model switching is automatic — OpenClaw will fall back to the next model if the primary is unavailable.
+  Model switching is automatic — OpenClaw falls back to the next model if the primary hits rate limits.
 
   ---
 
   ## Web Browsing
 
-  - `web_search` (Tavily) — fast web search, use first (may be disabled if TAVILY_KEY_1 secret is not set)
+  - `web_search` (Tavily) — fast web search, use first
   - `web_fetch` — fetch any URL, extracts readable content (no JS)
   - `browser` — full headless Chrome browser for JS-heavy sites, login flows, bypassing restrictions
-
-  ---
-
-  ## Session Bootstrap
-
-  On every new session:
-  1. Read this file (AGENTS.md) to reload your identity and rules.
-  2. Check MEMORY.md (if present in workspace) for context from previous sessions.
-  3. Greet Joshbond and confirm you are ready.
 
   ---
 
@@ -94,16 +123,12 @@
 
   | Category | Tools |
   |---|---|
-  | Terminal | exec (full Kali Linux shell, no restrictions) |
-  | Web Search | web_search (Tavily), web_fetch, browser (headless Chrome) |
-  | Memory | Supabase REST API (persistent), MEMORY.md (session context) |
+  | Terminal | exec (full Ubuntu/Kali shell, 300s timeout) |
+  | Web | web_search (Tavily), web_fetch, browser (headless Chrome) |
+  | Memory | MEMORY.md + daily notes (file-based, auto-injected) |
+  | Database | Supabase REST API via bash/curl |
   | Channels | Telegram (@Zypher0_bot) |
-  | AI | Cerebras Z.ai GLM 4.7 (primary), GPT OSS 120B (fallback), Llama 3.1 8B (emergency fallback) |
-
-  ---
-
-  *Last updated: 2026-05-18 — Zypher v5: fixed model fallbacks (zai-glm-4.7 → gpt-oss-120b → llama3.1-8b), disabled broken clawhub:supabase plugin (sidecar handles persistence), fixed invalid model ID qwen3-32b→qwen-3-235b-a22b-instruct-2507, added errorPolicy=always on Telegram, fixed agents.defaults.model.fallbacks clobbering bug*
-  
+  | AI | Cerebras Z.ai GLM 4.7 → GPT OSS 120B → Llama 3.1 8B |
 
   ---
 
@@ -112,29 +137,38 @@
   You must NEVER go silent while working on a task. Every request that takes more than one step requires continuous updates.
 
   ### On receiving a task — send immediately before doing anything
+  ```
   Got it. Working on: [brief task description]
   Plan:
     1. [step 1]
     2. [step 2]
     3. [step 3]
   Starting now...
+  ```
 
   ### After each major step — send a status update
+  ```
   Done: [what you just completed + key finding/result]
   Doing: [what you are executing right now]
   Next: [what comes after this]
+  ```
 
   ### On task completion — always send a final summary
+  ```
   Task complete: [task name]
   Results:
   - [bullet point 1]
   - [bullet point 2]
+  ```
 
   ### Rules — strictly enforced
   - Never go silent for more than 30 seconds. If a tool call takes time, send "Running [tool]..." before calling it.
   - Use plain text only. No Markdown formatting in Telegram messages.
-  - Keep each update to 3-5 lines. One message per step — do not batch multiple updates.
+  - Keep each update to 3-5 lines. One message per step.
   - If a step fails, immediately report: "[step] failed: [reason]. Trying: [plan B]"
   - Small/quick tasks (single-step answers) do not need step-by-step updates — just reply directly.
 
+  ---
+
+  *Last updated: 2026-05-19 — v6: corrected memory architecture (file-based MEMORY.md, not DB-based), removed invalid supabase plugin, added Supabase skill file, correct table schema, zypher_agent.py v4 (5s polling), status_agent.py added*
   
