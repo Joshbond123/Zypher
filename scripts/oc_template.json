@@ -52,14 +52,14 @@
       ],
       "errorPolicy": "always",
       "streaming": {
-        "mode": "progress"
+        "mode": "off"
       }
     }
   },
   "tools": {
     "profile": "full",
     "exec": {
-      "timeoutSec": 120,
+      "timeoutSec": 300,
       "security": "full"
     },
     "web": {
