@@ -203,6 +203,7 @@ jobs:
           python3 scripts/bootstrap_memory.py \
             --msgs /tmp/sb_msgs.json --facts /tmp/sb_facts.json \
             --run-id "$GITHUB_RUN_ID" --out ~/.openclaw/workspace/MEMORY.md \
+            --sb-url "$SUPABASE_URL" --sb-key "$SUPABASE_SERVICE_KEY" \
             && echo "Memory bootstrapped" \
             || printf "# Zypher Memory\nFresh session\n" > ~/.openclaw/workspace/MEMORY.md
           TODAY=$(date -u '+%Y-%m-%d')
@@ -210,34 +211,95 @@ jobs:
             printf "# Zypher Daily — %s\nRun: %s\n" "$TODAY" "$GITHUB_RUN_ID" \
             > ~/.openclaw/workspace/memory/${TODAY}.md || true
 
-      - name: Register session in Supabase
-        env:
-          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-          GITHUB_RUN_ID:        ${{ github.run_id }}
-          INSTANCE_NUMBER:      ${{ github.event.inputs.instance_number || '1' }}
-        run: |
-          [ -z "$SUPABASE_URL" ] || [ -z "$SUPABASE_SERVICE_KEY" ] && exit 0 || true
-          EXPIRES=$(date -u -d '+4 hours' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u '+%Y-%m-%dT%H:%M:%SZ')
-          curl -s -X POST "$SUPABASE_URL/rest/v1/active_sessions" \
-            -H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
-            -H "Content-Type: application/json" -H "Prefer: return=minimal" \
-            -d "{\"github_run_id\":\"$GITHUB_RUN_ID\",\"instance_number\":$INSTANCE_NUMBER,\"is_active\":true,\"expires_at\":\"$EXPIRES\"}" \
-            && echo "Session registered" || echo "WARN: registration failed"
+      - name: Verify Supabase schema + register session
+          env:
+            SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+            SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+            GITHUB_RUN_ID:        ${{ github.run_id }}
+          run: |
+            python3 scripts/setup_supabase.py || echo "WARN: setup_supabase failed (non-fatal)"
 
-      - name: Start Supabase sidecar
-        env:
-          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-          GITHUB_RUN_ID:        ${{ github.run_id }}
-        run: |
-          python3 -m py_compile scripts/zypher_agent.py || { echo "ERROR: syntax"; exit 1; }
-          python3 scripts/zypher_agent.py > /tmp/sidecar.log 2>&1 &
-          SIDECAR_PID=$!
-          sleep 3
-          kill -0 $SIDECAR_PID 2>/dev/null || { echo "ERROR: sidecar crashed"; cat /tmp/sidecar.log; exit 1; }
-          echo "Sidecar running PID=$SIDECAR_PID"
+        - name: Create workspace Supabase skill
+          env:
+            SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+            SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+            GITHUB_RUN_ID:        ${{ github.run_id }}
+          run: |
+            mkdir -p ~/.openclaw/workspace/skills
+            cat > ~/.openclaw/workspace/skills/supabase.md << 'SKILL_EOF'
+  # Supabase REST API — Zypher Skill
 
+  You have a Supabase database. Access it via bash using curl.
+  Environment variables always available:
+  - $SUPABASE_URL
+  - $SUPABASE_SERVICE_KEY
+  - $GITHUB_RUN_ID
+
+  ## Tables
+  | Table | Purpose |
+  |---|---|
+  | chat_messages | Conversation history (role, content, session_id) |
+  | longterm_memory | Long-term facts (key, value, user_id) |
+  | memory_entries | Categorized facts (key, value, category) |
+  | task_log | Tool call events (task_id, status, message) |
+  | agent_status | Current agent state (status, current_task) |
+  | active_sessions | Session registry (github_run_id, is_active) |
+
+  ## Read recent facts
+  ```bash
+  curl -s "$SUPABASE_URL/rest/v1/longterm_memory?order=updated_at.desc&limit=20" \
+    -H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" | python3 -m json.tool
+  ```
+
+  ## Save a fact
+  ```bash
+  curl -s -X POST "$SUPABASE_URL/rest/v1/longterm_memory" \
+    -H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+    -H "Content-Type: application/json" -H "Prefer: return=minimal" \
+    -d '{"key":"target_ip","value":"10.0.0.1","user_id":"joshbond"}'
+  ```
+
+  ## Save a categorized memory entry
+  ```bash
+  curl -s -X POST "$SUPABASE_URL/rest/v1/memory_entries" \
+    -H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+    -H "Content-Type: application/json" -H "Prefer: return=minimal" \
+    -d '{"key":"recon_notes","value":"...","category":"pentest","user_id":"joshbond"}'
+  ```
+
+  ## Read conversation history
+  ```bash
+  curl -s "$SUPABASE_URL/rest/v1/chat_messages?order=created_at.desc&limit=20&select=role,content,created_at" \
+    -H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY"
+  ```
+
+  ## Log a task event
+  ```bash
+  curl -s -X POST "$SUPABASE_URL/rest/v1/task_log" \
+    -H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+    -H "Content-Type: application/json" -H "Prefer: return=minimal" \
+    -d "{\"task_id\":\"task_$(date +%s)\",\"status\":\"complete\",\"message\":\"task done\",\"session_id\":\"$GITHUB_RUN_ID\"}"
+  ```
+  SKILL_EOF
+            echo "Supabase skill created: $(wc -l < ~/.openclaw/workspace/skills/supabase.md) lines"
+      - name: Start Supabase sidecar + status agent
+          env:
+            SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+            SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+            TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
+            GITHUB_RUN_ID:        ${{ github.run_id }}
+            INSTANCE_NUMBER:      ${{ github.event.inputs.instance_number || '1' }}
+          run: |
+            python3 -m py_compile scripts/zypher_agent.py || { echo "ERROR: zypher_agent.py syntax"; exit 1; }
+            python3 -m py_compile scripts/status_agent.py || { echo "ERROR: status_agent.py syntax"; exit 1; }
+            python3 scripts/zypher_agent.py > /tmp/sidecar.log 2>&1 &
+            SIDECAR_PID=$!
+            python3 scripts/status_agent.py > /tmp/status_agent.log 2>&1 &
+            STATUS_PID=$!
+            sleep 3
+            kill -0 $SIDECAR_PID 2>/dev/null || { echo "ERROR: sidecar crashed"; cat /tmp/sidecar.log; exit 1; }
+            kill -0 $STATUS_PID 2>/dev/null && echo "Status agent running PID=$STATUS_PID" || echo "WARN: status_agent exited (non-fatal)"
+            echo "Sidecar PID=$SIDECAR_PID | Status agent PID=$STATUS_PID"
       - name: Start OpenClaw Gateway
         env:
           TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
