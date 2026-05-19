@@ -224,15 +224,13 @@ jobs:
             --run-id "$GITHUB_RUN_ID" --out ~/.openclaw/workspace/MEMORY.md \
             --sb-url "${SUPABASE_URL:-}" --sb-key "${SUPABASE_SERVICE_KEY:-}" \
             && echo "Memory bootstrapped OK" \
-            || printf "# Zypher Memory\nFresh session — no prior memory loaded.\n" \
-               > ~/.openclaw/workspace/MEMORY.md
+            || printf "# Zypher Memory\nFresh session.\n" > ~/.openclaw/workspace/MEMORY.md
           TODAY=$(date -u '+%Y-%m-%d')
           [ ! -f ~/.openclaw/workspace/memory/${TODAY}.md ] && \
-            printf "# Zypher Daily Log — %s\nRun ID: %s\n\n## Events\n" "$TODAY" "$GITHUB_RUN_ID" \
+            printf "# Zypher Daily Log - %s\nRun ID: %s\n\n" "$TODAY" "$GITHUB_RUN_ID" \
             > ~/.openclaw/workspace/memory/${TODAY}.md || true
-          echo "Memory files: $(ls ~/.openclaw/workspace/memory/ 2>/dev/null | tr '\n' ' ')"
 
-      - name: Register session + write Supabase skill
+      - name: Register session and install workspace skills
         env:
           SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
@@ -240,75 +238,10 @@ jobs:
         run: |
           python3 scripts/setup_supabase.py || echo "WARN: session registration non-fatal"
           mkdir -p ~/.openclaw/workspace/skills
-          cat > ~/.openclaw/workspace/skills/supabase.md << 'SKILL_EOF'
-# Supabase REST API — Zypher Skill
+          cp scripts/supabase_skill.md ~/.openclaw/workspace/skills/supabase.md
+          echo "Workspace skills installed: $(ls ~/.openclaw/workspace/skills/)"
 
-You have a Supabase database for persistent memory. Access it via bash using curl.
-Environment variables always available in every session:
-- $SUPABASE_URL — project REST URL
-- $SUPABASE_SERVICE_KEY — service role key (full access)
-- $GITHUB_RUN_ID — current workflow run ID
-
-## Tables & Purposes
-| Table | Purpose | Key columns |
-|---|---|---|
-| chat_messages | Full conversation history | role, content, session_id, created_at |
-| longterm_memory | Key-value long-term facts | key, value, user_id, updated_at |
-| memory_entries | Categorized memory | key, value, category, user_id, updated_at |
-| task_log | Tool call + task events | task_id, status, message, session_id |
-| agent_status | Live agent state | status, current_task, tools_called |
-| active_sessions | Session registry | github_run_id, is_active, expires_at |
-
-## Save a long-term fact (UPSERT)
-```bash
-curl -s -X POST "$SUPABASE_URL/rest/v1/longterm_memory" \
-  -H "apikey: $SUPABASE_SERVICE_KEY" \
-  -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
-  -H "Content-Type: application/json" \
-  -H "Prefer: resolution=merge-duplicates" \
-  -d '{"key":"target","value":"10.0.0.1","user_id":"joshbond"}'
-```
-
-## Read recent facts
-```bash
-curl -s "$SUPABASE_URL/rest/v1/longterm_memory?order=updated_at.desc&limit=20" \
-  -H "apikey: $SUPABASE_SERVICE_KEY" \
-  -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" | python3 -m json.tool
-```
-
-## Save a categorized memory entry (UPSERT)
-```bash
-curl -s -X POST "$SUPABASE_URL/rest/v1/memory_entries" \
-  -H "apikey: $SUPABASE_SERVICE_KEY" \
-  -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
-  -H "Content-Type: application/json" \
-  -H "Prefer: resolution=merge-duplicates" \
-  -d '{"key":"recon_notes","value":"target has ports 80,443,8080 open","category":"pentest","user_id":"joshbond"}'
-```
-
-## Read conversation history
-```bash
-curl -s "$SUPABASE_URL/rest/v1/chat_messages?order=created_at.desc&limit=20&select=role,content,created_at" \
-  -H "apikey: $SUPABASE_SERVICE_KEY" \
-  -H "Authorization: Bearer $SUPABASE_SERVICE_KEY"
-```
-
-## Log a task event
-```bash
-curl -s -X POST "$SUPABASE_URL/rest/v1/task_log" \
-  -H "apikey: $SUPABASE_SERVICE_KEY" \
-  -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
-  -H "Content-Type: application/json" \
-  -H "Prefer: return=minimal" \
-  -d "{\"task_id\":\"task_$(date +%s)\",\"status\":\"complete\",\"message\":\"Done\",\"session_id\":\"$GITHUB_RUN_ID\"}"
-```
-
-## Remember a fact (shorthand)
-Simply say: "remember that <fact>" and Zypher will write it to both MEMORY.md and Supabase.
-SKILL_EOF
-          echo "Supabase skill written: $(wc -l < ~/.openclaw/workspace/skills/supabase.md) lines"
-
-      - name: Start Supabase sidecar + status agent
+      - name: Start Supabase sidecar and status agent
         env:
           SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
@@ -328,7 +261,7 @@ SKILL_EOF
           if kill -0 $SIDECAR_PID 2>/dev/null; then
             echo "Supabase sidecar running PID=$SIDECAR_PID"
           else
-            echo "WARN: Supabase sidecar exited early (non-fatal, Supabase logging disabled)"
+            echo "WARN: Supabase sidecar exited early (non-fatal)"
             cat /tmp/sidecar.log || true
           fi
           if kill -0 $STATUS_PID 2>/dev/null; then
@@ -356,7 +289,7 @@ SKILL_EOF
         run: |
           python3 scripts/preflight_check.py || exit 1
 
-          # Periodic doctor + key stats every 30 min (background)
+          # Periodic maintenance every 30 min (background)
           (while true; do
             sleep 1800
             echo "[$(date -u +%H:%M:%SZ)] Scheduled maintenance: doctor + key stats"
@@ -365,33 +298,25 @@ SKILL_EOF
           done) &
           DOCTOR_PID=$!
 
-          # Start gateway — tee output to log file for monitoring
+          # Start gateway with output piped to log file
           openclaw gateway 2>&1 | tee /tmp/openclaw.log &
           TEE_PID=$!
 
-          # Capture the actual gateway process PID (not tee)
-          sleep 2
-          GW_PID=$(pgrep -f "node.*openclaw" | grep -v $$ | head -1 || true)
-          echo "Gateway PIDs: tee=$TEE_PID gateway=${GW_PID:-detecting...}"
-
-          # Wait up to 120s for a ready signal in the log (increased from 60s)
+          # Wait up to 120s for ready signal (OpenClaw 2026.5.18 has faster startup)
           READY=0; ELAPSED=0
           while [ $ELAPSED -lt 120 ]; do
             sleep 2; ELAPSED=$(( ELAPSED + 2 ))
-
-            # Check for explicit ready strings from OpenClaw
             if grep -qiE \
               "ready|listening|started|telegram.*poll|gateway.*up|bot.*online|connected|polling|webhook" \
               /tmp/openclaw.log 2>/dev/null; then
               echo "Ready signal detected at ${ELAPSED}s"
               READY=1; break
             fi
-
             # After 30s: if log has content and no fatal errors, assume running
             if [ $ELAPSED -ge 30 ] && [ -s /tmp/openclaw.log ]; then
-              if ! grep -qiE "EFATAL|fatal error|failed to start|ECONNREFUSED|cannot start|ENOENT.*openclaw" \
+              if ! grep -qiE "EFATAL|fatal error|failed to start|ECONNREFUSED|cannot start" \
                 /tmp/openclaw.log 2>/dev/null; then
-                echo "Gateway log active, no fatal errors at ${ELAPSED}s — assuming ready"
+                echo "Gateway log active at ${ELAPSED}s (no fatal errors) - assuming ready"
                 READY=1; break
               fi
             fi
@@ -400,28 +325,27 @@ SKILL_EOF
           echo "=== Gateway log (first 80 lines) ==="
           head -80 /tmp/openclaw.log 2>/dev/null || echo "(log empty)"
 
-          # Fatal: tee/gateway process died
+          # Check for fatal exit
           if ! kill -0 $TEE_PID 2>/dev/null; then
             echo "ERROR: gateway process exited early"
             cat /tmp/openclaw.log
             exit 1
           fi
 
-          # Fatal errors in log
+          # Check for fatal errors in log
           if grep -qiE "EFATAL|fatal error|failed to start|ECONNREFUSED" /tmp/openclaw.log 2>/dev/null; then
             echo "ERROR: fatal error found in gateway log"
             cat /tmp/openclaw.log
             exit 1
           fi
 
-          # If still no ready signal, check if the gateway process is alive
+          # Last resort: check if any node process is alive
           if [ "$READY" = "0" ]; then
-            echo "WARN: no ready signal within 120s"
-            GW_ALIVE=$(pgrep -f "node.*openclaw" | grep -v $$ | wc -l)
+            GW_ALIVE=$(pgrep -f "node.*openclaw" 2>/dev/null | wc -l)
             if [ "$GW_ALIVE" -gt 0 ]; then
-              echo "Gateway node process is alive ($GW_ALIVE procs) — proceeding"
+              echo "WARN: no ready signal in 120s but gateway process is alive - proceeding"
             else
-              echo "ERROR: no gateway process found and no ready signal"
+              echo "ERROR: no gateway process and no ready signal"
               cat /tmp/openclaw.log
               exit 1
             fi
@@ -430,23 +354,22 @@ SKILL_EOF
           echo "LIVE: @Zypher0_bot | Run $GITHUB_RUN_ID | Instance #${INSTANCE_NUMBER:-1}"
           python3 scripts/send_startup_notification.py
 
-          # Main loop: run for 3.5 hours (12600s), then rotate to next instance
+          # Main loop: run 3.5 hours then rotate
           sleep 12600
 
-          # Dispatch next instance before we exit (zero-downtime rotation)
+          # Dispatch next instance for zero-downtime rotation
           NEXT=$(( ${INSTANCE_NUMBER:-1} + 1 ))
           curl -sf -X POST \
             -H "Authorization: token $GITHUB_TOKEN" \
             -H "Accept: application/vnd.github.v3+json" \
             "https://api.github.com/repos/$GITHUB_REPO/actions/workflows/openclaw.yml/dispatches" \
             -d "{\"ref\":\"main\",\"inputs\":{\"instance_number\":\"$NEXT\"}}" \
-            && echo "Rotated to instance #$NEXT (concurrency group will cancel this run)" \
-            || echo "WARN: self-dispatch failed — schedule cron fallback will cover"
+            && echo "Rotated to instance #$NEXT" \
+            || echo "WARN: self-dispatch failed (cron fallback covers)"
 
-          # 5-min overlap window for new instance to come online
           sleep 300
 
-          # Mark session inactive in Supabase
+          # Mark session inactive
           if [ -n "$SUPABASE_URL" ] && [ -n "$SUPABASE_SERVICE_KEY" ]; then
             curl -sf -X PATCH \
               "$SUPABASE_URL/rest/v1/active_sessions?github_run_id=eq.$GITHUB_RUN_ID" \
@@ -456,13 +379,8 @@ SKILL_EOF
               -d '{"is_active":false}' || true
           fi
 
-          # Clean shutdown
           kill $DOCTOR_PID 2>/dev/null || true
           OC=$(pgrep -f "node.*openclaw" | head -1)
-          if [ -n "$OC" ]; then
-            kill -TERM $OC 2>/dev/null
-            sleep 5
-            kill -KILL $OC 2>/dev/null || true
-          fi
+          [ -n "$OC" ] && { kill -TERM $OC 2>/dev/null; sleep 5; kill -KILL $OC 2>/dev/null || true; }
           kill $TEE_PID 2>/dev/null || true
-          echo "Zypher stopped cleanly (instance #${INSTANCE_NUMBER:-1}, uptime ~3h55m)"
+          echo "Zypher stopped cleanly (instance #${INSTANCE_NUMBER:-1})"
