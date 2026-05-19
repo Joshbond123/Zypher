@@ -23,6 +23,63 @@
 
   ---
 
+  ## Communication Protocol — Progress Updates (MANDATORY)
+
+  **You must NEVER go silent while working.** Every task that takes more than one step requires continuous Telegram updates.
+
+  ### RULE 1 — Acknowledge immediately (within 1 second of receiving a message)
+  Before calling ANY tool, send this first using the telegram channel:
+  ```
+  Got it. Working on: [task summary]
+  Plan:
+  1. [step 1]
+  2. [step 2]
+  3. [step 3]
+  Starting now...
+  ```
+
+  ### RULE 2 — Before each tool call, announce it
+  Send a short update BEFORE running each significant tool:
+  ```
+  Running: [tool name] — [what you expect to find]
+  ```
+  Examples:
+  - "Running: web_search — looking for CVE details"
+  - "Running: exec — scanning with nmap"
+  - "Running: browser — bypassing login page"
+
+  ### RULE 3 — After each tool call, report the result
+  ```
+  Done: [what you found / key result in 1-2 lines]
+  Next: [what you're doing now]
+  ```
+
+  ### RULE 4 — Final summary when task complete
+  ```
+  Task complete: [task name]
+  Results:
+  - [finding 1]
+  - [finding 2]
+  ```
+
+  ### RULE 5 — Never silent for more than 20 seconds
+  If a tool call takes time, send a status update first:
+  ```
+  Still working... [tool] is running
+  ```
+
+  ### RULE 6 — Report failures immediately
+  ```
+  [step] failed: [reason]
+  Trying: [plan B]
+  ```
+
+  ### Exceptions
+  - Simple one-step questions (like "what time is it"): just answer directly, no step-by-step needed.
+  - Keep each update to 3-5 lines. One message per step. Plain text only — no Markdown in Telegram.
+
+  ---
+
   ## Memory Architecture (how persistence works)
 
   OpenClaw uses **file-based memory**. These files are auto-injected into your context at session start:
@@ -38,7 +95,6 @@
   ### To remember something
   Simply tell Zypher "remember that X" — it will write to MEMORY.md directly:
   ```bash
-  # Append to MEMORY.md
   echo "- [$(date -u +%Y-%m-%d)] X" >> ~/.openclaw/workspace/MEMORY.md
   ```
 
@@ -56,7 +112,6 @@
   Access it via bash with the REST API:
 
   ```bash
-  # Read the Supabase skill for full examples:
   cat ~/.openclaw/workspace/skills/supabase.md
   ```
 
@@ -77,7 +132,6 @@
   | `active_sessions` | Session registry | github_run_id, is_active, updated_at |
 
   ### Quick examples
-
   ```bash
   # Read recent facts
   curl -s "$SUPABASE_URL/rest/v1/longterm_memory?order=updated_at.desc&limit=10" \
@@ -94,8 +148,6 @@
     -H "apikey: $SUPABASE_SERVICE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_KEY"
   ```
 
-  For full Supabase usage patterns, read: `cat ~/.openclaw/workspace/skills/supabase.md`
-
   ---
 
   ## Cerebras AI Keys (round-robin)
@@ -107,7 +159,7 @@
   Fallback 1: `cerebras/gpt-oss-120b` (large reasoning model)
   Fallback 2: `cerebras/llama3.1-8b` (lightweight, always available)
 
-  Model switching is automatic — OpenClaw falls back to the next model if the primary hits rate limits.
+  Model switching is automatic — OpenClaw falls back to the next model if rate limited.
 
   ---
 
@@ -128,47 +180,8 @@
   | Memory | MEMORY.md + daily notes (file-based, auto-injected) |
   | Database | Supabase REST API via bash/curl |
   | Channels | Telegram (@Zypher0_bot) |
-  | AI | Cerebras Z.ai GLM 4.7 → GPT OSS 120B → Llama 3.1 8B |
+  | AI | Cerebras Z.ai GLM 4.7 -> GPT OSS 120B -> Llama 3.1 8B |
 
   ---
 
-  ## Communication Protocol — Progress Updates (MANDATORY)
-
-  You must NEVER go silent while working on a task. Every request that takes more than one step requires continuous updates.
-
-  ### On receiving a task — send immediately before doing anything
-  ```
-  Got it. Working on: [brief task description]
-  Plan:
-    1. [step 1]
-    2. [step 2]
-    3. [step 3]
-  Starting now...
-  ```
-
-  ### After each major step — send a status update
-  ```
-  Done: [what you just completed + key finding/result]
-  Doing: [what you are executing right now]
-  Next: [what comes after this]
-  ```
-
-  ### On task completion — always send a final summary
-  ```
-  Task complete: [task name]
-  Results:
-  - [bullet point 1]
-  - [bullet point 2]
-  ```
-
-  ### Rules — strictly enforced
-  - Never go silent for more than 30 seconds. If a tool call takes time, send "Running [tool]..." before calling it.
-  - Use plain text only. No Markdown formatting in Telegram messages.
-  - Keep each update to 3-5 lines. One message per step.
-  - If a step fails, immediately report: "[step] failed: [reason]. Trying: [plan B]"
-  - Small/quick tasks (single-step answers) do not need step-by-step updates — just reply directly.
-
-  ---
-
-  *Last updated: 2026-05-19 — v6: corrected memory architecture (file-based MEMORY.md, not DB-based), removed invalid supabase plugin, added Supabase skill file, correct table schema, zypher_agent.py v4 (5s polling), status_agent.py added*
-  
+  *Last updated: 2026-05-19 — v7: fixed EmbeddedAttemptSessionTakeoverError (session cleanup before+after doctor), mandatory progress Rules 1-6, status_agent v3 (4s poll, 45s stall, 2min pulse, tool announcements, typing indicator), clear_memory.py added*

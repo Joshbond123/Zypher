@@ -7,6 +7,13 @@ on:
         description: 'Instance number for tracking'
         required: false
         default: '1'
+      reset_memory:
+        description: 'Reset all memory (wipe Supabase + fresh MEMORY.md)'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+
   schedule:
     - cron: '0 */4 * * *'
 
@@ -121,6 +128,24 @@ jobs:
           mkdir -p ~/.openclaw/workspace/memory ~/.openclaw/workspace/skills
           echo "Onboard complete: $(ls ~/.openclaw/ 2>/dev/null | tr '\n' ' ')"
 
+      # ─── CRITICAL BUG FIX: EmbeddedAttemptSessionTakeoverError ─────────────
+      # openclaw onboard + doctor create JSONL session files in ~/.openclaw/agents/
+      # When the gateway later spawns an embedded sub-agent and temporarily releases
+      # the proper-lockfile prompt lock, it detects the session file mtime changed
+      # (from earlier onboard/doctor writes) and throws EmbeddedAttemptSessionTakeoverError,
+      # killing every task at ~67s. Fix: wipe stale sessions BEFORE starting the gateway.
+      - name: Clear stale session files (prevents EmbeddedAttemptSessionTakeoverError)
+        run: |
+          echo "Clearing stale OpenClaw session/lock files..."
+          # Remove agents sessions directory entirely — gateway creates fresh ones on first DM
+          rm -rf ~/.openclaw/agents/ 2>/dev/null || true
+          # Remove any leftover .lock files from proper-lockfile
+          find ~/.openclaw -name "*.lock" -type d -exec rm -rf {} + 2>/dev/null || true
+          find ~/.openclaw -name "*.lock" -type f -delete 2>/dev/null || true
+          # Remove stale cron session files if any
+          rm -rf ~/.openclaw/cron/ 2>/dev/null || true
+          echo "Session cleanup done: $(ls ~/.openclaw/ 2>/dev/null | tr '\n' ' ')"
+
       - name: Write openclaw.json from template
         env:
           TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -178,6 +203,14 @@ jobs:
       - name: OpenClaw doctor --fix
         run: openclaw doctor --fix 2>&1 || true
 
+      # After doctor --fix, clean again — doctor may have re-created session files
+      - name: Re-clean session files post-doctor
+        run: |
+          rm -rf ~/.openclaw/agents/ 2>/dev/null || true
+          find ~/.openclaw -name "*.lock" -type d -exec rm -rf {} + 2>/dev/null || true
+          find ~/.openclaw -name "*.lock" -type f -delete 2>/dev/null || true
+          echo "Post-doctor session cleanup done"
+
       - name: Install ClawHub skills
         run: |
           openclaw skills install clawhub:stealth-browser 2>&1 \
@@ -187,6 +220,17 @@ jobs:
             || openclaw plugins install npm:@openclaw/tavily 2>&1 \
             || echo "tavily skill not available (skipped)"
           openclaw plugins list 2>/dev/null || true
+
+      - name: Reset memory (optional — only when reset_memory=true)
+        if: ${{ github.event.inputs.reset_memory == 'true' }}
+        env:
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          GITHUB_RUN_ID:        ${{ github.run_id }}
+        run: |
+          echo "Memory reset requested — wiping Supabase + MEMORY.md..."
+          python3 scripts/clear_memory.py
+          echo "Memory reset complete"
 
       - name: Ensure Supabase schema exists
         env:
@@ -290,12 +334,18 @@ jobs:
         run: |
           python3 scripts/preflight_check.py || exit 1
 
+          # Final safety: kill any stale openclaw node process from prior step
+          pkill -f "node.*openclaw" 2>/dev/null || true
+          sleep 1
+
           # Periodic maintenance every 30 min (background)
           (while true; do
             sleep 1800
             echo "[$(date -u +%H:%M:%SZ)] Scheduled maintenance: doctor + key stats"
             openclaw doctor 2>&1 | tail -3 || true
             python3 scripts/cerebras_key_rotator.py --stats 2>&1 || true
+            # Re-clean any stale session locks that may have appeared during the run
+            find ~/.openclaw -name "*.lock" -type d -mmin +10 -exec rm -rf {} + 2>/dev/null || true
           done) &
           DOCTOR_PID=$!
 
@@ -303,7 +353,7 @@ jobs:
           openclaw gateway 2>&1 | tee /tmp/openclaw.log &
           TEE_PID=$!
 
-          # Wait up to 120s for ready signal (OpenClaw 2026.5.18 has faster startup)
+          # Wait up to 120s for ready signal
           READY=0; ELAPSED=0
           while [ $ELAPSED -lt 120 ]; do
             sleep 2; ELAPSED=$(( ELAPSED + 2 ))
@@ -313,7 +363,6 @@ jobs:
               echo "Ready signal detected at ${ELAPSED}s"
               READY=1; break
             fi
-            # After 30s: if log has content and no fatal errors, assume running
             if [ $ELAPSED -ge 30 ] && [ -s /tmp/openclaw.log ]; then
               if ! grep -qiE "EFATAL|fatal error|failed to start|ECONNREFUSED|cannot start" \
                 /tmp/openclaw.log 2>/dev/null; then
@@ -326,21 +375,18 @@ jobs:
           echo "=== Gateway log (first 80 lines) ==="
           head -80 /tmp/openclaw.log 2>/dev/null || echo "(log empty)"
 
-          # Check for fatal exit
           if ! kill -0 $TEE_PID 2>/dev/null; then
             echo "ERROR: gateway process exited early"
             cat /tmp/openclaw.log
             exit 1
           fi
 
-          # Check for fatal errors in log
           if grep -qiE "EFATAL|fatal error|failed to start|ECONNREFUSED" /tmp/openclaw.log 2>/dev/null; then
             echo "ERROR: fatal error found in gateway log"
             cat /tmp/openclaw.log
             exit 1
           fi
 
-          # Last resort: check if any node process is alive
           if [ "$READY" = "0" ]; then
             GW_ALIVE=$(pgrep -f "node.*openclaw" 2>/dev/null | wc -l)
             if [ "$GW_ALIVE" -gt 0 ]; then

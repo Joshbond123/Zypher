@@ -18,7 +18,12 @@
           "cerebras-3/llama3.1-8b",
           "cerebras-4/llama3.1-8b"
         ]
-      }
+      },
+      "responseTimeout": 120000,
+      "taskTimeout": 300000,
+      "concurrency": 4,
+      "retryOnFailure": true,
+      "maxRetries": 3
     },
     "list": [
       {
@@ -37,17 +42,44 @@
       "mode": "none"
     },
     "port": 18789,
-    "bind": "loopback"
+    "bind": "loopback",
+    "keepAlive": true,
+    "requestTimeout": 120000
   },
   "session": {
-    "dmScope": "per-channel-peer"
+    "dmScope": "per-channel-peer",
+    "progressUpdates": true,
+    "progressInterval": 15,
+    "typingIndicator": true,
+    "announceTools": true,
+    "announceSubAgents": true,
+    "streamingAck": true
   },
   "channels": {
     "telegram": {
       "enabled": true,
       "botToken": "TELEGRAM_TOKEN_HERE",
       "dmPolicy": "allowlist",
-      "allowFrom": ["6317345496"]
+      "allowFrom": ["6317345496"],
+      "streaming": {
+        "enabled": true,
+        "mode": "progressive",
+        "chunkDelay": 0,
+        "flushInterval": 500
+      },
+      "typing": {
+        "enabled": true,
+        "interval": 4000
+      },
+      "progress": {
+        "enabled": true,
+        "interval": 20,
+        "showToolCalls": true,
+        "showSteps": true,
+        "showSubAgents": true,
+        "draftUpdates": true
+      },
+      "parseMode": "Markdown"
     }
   },
   "tools": {
@@ -72,6 +104,16 @@
       "timeout": 30000,
       "retries": 2
     }
+  },
+  "runtime": {
+    "concurrency": 4,
+    "taskQueueSize": 16,
+    "workerThreads": 2,
+    "streamBufferMs": 0,
+    "asyncDispatch": true,
+    "progressPollMs": 500,
+    "stallDetectMs": 30000,
+    "stallRecovery": true
   },
   "models": {
     "mode": "merge",
