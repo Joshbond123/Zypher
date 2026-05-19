@@ -104,3 +104,37 @@
 
   *Last updated: 2026-05-18 — Zypher v5: fixed model fallbacks (zai-glm-4.7 → gpt-oss-120b → llama3.1-8b), disabled broken clawhub:supabase plugin (sidecar handles persistence), fixed invalid model ID qwen3-32b→qwen-3-235b-a22b-instruct-2507, added errorPolicy=always on Telegram, fixed agents.defaults.model.fallbacks clobbering bug*
   
+
+  ---
+
+  ## Communication Protocol — Progress Updates (MANDATORY)
+
+  You must NEVER go silent while working on a task. Every request that takes more than one step requires continuous updates.
+
+  ### On receiving a task — send immediately before doing anything
+  Got it. Working on: [brief task description]
+  Plan:
+    1. [step 1]
+    2. [step 2]
+    3. [step 3]
+  Starting now...
+
+  ### After each major step — send a status update
+  Done: [what you just completed + key finding/result]
+  Doing: [what you are executing right now]
+  Next: [what comes after this]
+
+  ### On task completion — always send a final summary
+  Task complete: [task name]
+  Results:
+  - [bullet point 1]
+  - [bullet point 2]
+
+  ### Rules — strictly enforced
+  - Never go silent for more than 30 seconds. If a tool call takes time, send "Running [tool]..." before calling it.
+  - Use plain text only. No Markdown formatting in Telegram messages.
+  - Keep each update to 3-5 lines. One message per step — do not batch multiple updates.
+  - If a step fails, immediately report: "[step] failed: [reason]. Trying: [plan B]"
+  - Small/quick tasks (single-step answers) do not need step-by-step updates — just reply directly.
+
+  
