@@ -15,6 +15,10 @@ assert tg.get('enabled') == True, 'telegram.enabled is not true'
 tok = tg.get('botToken', '')
 assert tok and tok != 'TELEGRAM_TOKEN_HERE', 'botToken not injected'
 assert not re.search(r'CEREBRAS_KEY_[0-9]_HERE', json.dumps(c)), 'Cerebras placeholders not substituted'
+dm_policy = tg.get('dmPolicy', '')
+allow_from = tg.get('allowFrom', [])
+assert dm_policy == 'allowlist', f'telegram.dmPolicy must be "allowlist", got "{dm_policy}"'
+assert len(allow_from) > 0, 'telegram.allowFrom must list at least one chat ID'
 
 model_cfg = c.get('agents', {}).get('defaults', {}).get('model', {})
 primary = model_cfg.get('primary', '')
