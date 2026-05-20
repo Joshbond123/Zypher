@@ -3,7 +3,6 @@
     "defaults": {
       "workspace": "~/.openclaw/workspace",
       "skipBootstrap": true,
-      "contextInjection": "never",
       "model": {
         "primary": "cerebras/qwen3-32b",
         "fallbacks": [
@@ -55,9 +54,7 @@
       ],
       "streaming": {
         "mode": "off"
-      },
-      "errorMessages": false,
-      "systemMessages": false
+      }
     }
   },
   "tools": {
@@ -123,16 +120,6 @@
             "maxTokens": 16000
           },
           {
-            "id": "qwen-3-32b",
-            "name": "Qwen3 32B (alt)",
-            "reasoning": false,
-            "input": [
-              "text"
-            ],
-            "contextWindow": 128000,
-            "maxTokens": 16000
-          },
-          {
             "id": "zai-glm-4.7",
             "name": "Z.ai GLM 4.7",
             "reasoning": true,
@@ -146,16 +133,6 @@
             "id": "gpt-oss-120b",
             "name": "GPT OSS 120B",
             "reasoning": true,
-            "input": [
-              "text"
-            ],
-            "contextWindow": 128000,
-            "maxTokens": 16000
-          },
-          {
-            "id": "qwen-3-235b-a22b-instruct-2507",
-            "name": "Qwen3 235B",
-            "reasoning": false,
             "input": [
               "text"
             ],
@@ -201,28 +178,8 @@
             "maxTokens": 16000
           },
           {
-            "id": "qwen-3-32b",
-            "name": "Qwen3 32B (alt)",
-            "reasoning": false,
-            "input": [
-              "text"
-            ],
-            "contextWindow": 128000,
-            "maxTokens": 16000
-          },
-          {
             "id": "zai-glm-4.7",
             "name": "Z.ai GLM 4.7",
-            "reasoning": true,
-            "input": [
-              "text"
-            ],
-            "contextWindow": 128000,
-            "maxTokens": 16000
-          },
-          {
-            "id": "gpt-oss-120b",
-            "name": "GPT OSS 120B",
             "reasoning": true,
             "input": [
               "text"
@@ -269,28 +226,8 @@
             "maxTokens": 16000
           },
           {
-            "id": "qwen-3-32b",
-            "name": "Qwen3 32B (alt)",
-            "reasoning": false,
-            "input": [
-              "text"
-            ],
-            "contextWindow": 128000,
-            "maxTokens": 16000
-          },
-          {
             "id": "zai-glm-4.7",
             "name": "Z.ai GLM 4.7",
-            "reasoning": true,
-            "input": [
-              "text"
-            ],
-            "contextWindow": 128000,
-            "maxTokens": 16000
-          },
-          {
-            "id": "gpt-oss-120b",
-            "name": "GPT OSS 120B",
             "reasoning": true,
             "input": [
               "text"
@@ -337,28 +274,8 @@
             "maxTokens": 16000
           },
           {
-            "id": "qwen-3-32b",
-            "name": "Qwen3 32B (alt)",
-            "reasoning": false,
-            "input": [
-              "text"
-            ],
-            "contextWindow": 128000,
-            "maxTokens": 16000
-          },
-          {
             "id": "zai-glm-4.7",
             "name": "Z.ai GLM 4.7",
-            "reasoning": true,
-            "input": [
-              "text"
-            ],
-            "contextWindow": 128000,
-            "maxTokens": 16000
-          },
-          {
-            "id": "gpt-oss-120b",
-            "name": "GPT OSS 120B",
             "reasoning": true,
             "input": [
               "text"
