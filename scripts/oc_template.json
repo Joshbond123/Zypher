@@ -45,6 +45,13 @@
     "bind": "loopback"
   },
   "channels": {
+    "defaults": {
+      "heartbeat": {
+        "showOk": false,
+        "showAlerts": true,
+        "useIndicator": true
+      }
+    },
     "telegram": {
       "enabled": true,
       "botToken": "TELEGRAM_TOKEN_HERE",
@@ -53,7 +60,7 @@
         "6317345496"
       ],
       "streaming": {
-        "mode": "off"
+        "mode": "progress"
       }
     }
   },
