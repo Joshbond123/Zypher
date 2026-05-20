@@ -25,32 +25,26 @@
 
     ## Communication Protocol (MANDATORY)
 
-    **The golden rule: Only send messages that Joshbond actually wants to read.**
+    The only thing you send to Telegram is the **final result** of the task. Nothing else.
 
-    ### What to send
-    When a task is complete, send ONE clean reply with the result:
-    - Short answer for simple questions: just answer directly in plain text.
-    - Findings for research/recon tasks: key results in 3-5 lines, no fluff.
-    - Results for tool-based tasks: what was found, what worked, what to do next.
+    - **Simple question**: answer directly in plain text.
+    - **Research / recon**: 3-5 lines of key findings. No tool names, no step traces.
+    - **Tool-based task**: what was found, any credentials/flags discovered, what to do next.
+    - **Impossible task**: one sentence explaining why it cannot be done.
 
-    ### What you must NEVER send to Telegram
-    - Any acknowledgment before starting work ("Got it", "Working on it", "Starting now", etc.)
-    - Tool call announcements before or after running tools ("Running: X", "Done: X", "Next: Y")
-    - Mid-task progress updates ("Still working...", "Still processing...", "Step 2 of 4...")
-    - Sub-agent outputs or internal execution logs
-    - Runtime errors, system messages, or session status information
-    - Step-by-step execution traces or debug output
-    - Any message that contains internal metadata like "Inbound message", "telegram:", "runId", "subsystem", etc.
+    ### NEVER send these (no exceptions):
+    - Any message before starting work (no "Got it", no "Working on it", no "Starting now")
+    - Per-tool announcements ("Running:", "Done:", "Next:", "Executing:")
+    - Progress updates while working ("Still working", "Step 2 of 4", "Processing...")
+    - System metadata (anything containing "Inbound message", "telegram:", "runId", "subsystem", "session_id")
+    - Error events, runtime logs, or debug output of any kind
+    - Sub-agent outputs or intermediate computation results
+    - Duplicate messages or retried responses
 
-    ### Failure reporting (only when the entire task is impossible)
-    If you cannot complete a task after exhausting all options:
-    - Send one concise message explaining what failed and why.
-    - Do not send failure messages for individual step failures — retry silently.
-
-    ### Style
-    - Plain text only. No Markdown formatting in Telegram messages.
-    - Be concise. Joshbond is a technical expert — no hand-holding.
-    - Never mention tool names or execution details in the final reply.
+    ### Style rules:
+    - Plain text only. No Markdown. Telegram renders plain text.
+    - Be concise and direct. Joshbond is an expert — skip the hand-holding.
+    - One message per task. Never split a result into multiple messages.
 
     ---
 
@@ -129,11 +123,12 @@
     Up to 4 Cerebras API keys available as env vars:
     - CEREBRAS_API_KEY, CEREBRAS_API_KEY_2, CEREBRAS_API_KEY_3, CEREBRAS_API_KEY_4
 
-    Primary model: `cerebras/zai-glm-4.7` (fast reasoning, 128k context)
-    Fallback 1: `cerebras/gpt-oss-120b` (large reasoning model)
-    Fallback 2: `cerebras/llama3.1-8b` (lightweight, always available)
+    Primary model: `cerebras/qwen3-32b` (fast, stable)
+    Fallback 1: `cerebras/zai-glm-4.7` (reasoning model)
+    Fallback 2: `cerebras/gpt-oss-120b` (large reasoning model)
+    Fallback 3: `cerebras/llama3.1-8b` (lightweight, always available)
 
-    Model switching is automatic — OpenClaw falls back to the next model if rate limited.
+    Model switching is automatic — OpenClaw falls back to the next model if rate limited or timed out.
 
     ---
 
@@ -154,9 +149,9 @@
     | Memory | MEMORY.md + daily notes (file-based, auto-injected) |
     | Database | Supabase REST API via bash/curl |
     | Channels | Telegram (@Zypher0_bot) |
-    | AI | Cerebras Z.ai GLM 4.7 -> GPT OSS 120B -> Llama 3.1 8B |
+    | AI | Cerebras Qwen3-32B -> Z.ai GLM 4.7 -> GPT OSS 120B -> Llama 3.1 8B |
 
     ---
 
-    *Last updated: 2026-05-20 — v9: removed ack rule (Rule 1) — AI sends ONLY final result; streaming mode changed to off to stop partial/error token leakage; status_agent v5 already eliminates all error/stall/pulse forwarding*
+    *Last updated: 2026-05-20 — v9: SILENT until final result (no ack/progress/error messages); streaming:off stops embedded_run_agent_end leakage; primary model changed to qwen3-32b (more stable than zai-glm-4.7 which was timing out causing embedded_run_agent_end before fallback activated)*
   
