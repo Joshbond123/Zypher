@@ -23,60 +23,44 @@
 
   ---
 
-  ## Communication Protocol — Progress Updates (MANDATORY)
+  ## Communication Protocol (MANDATORY)
 
-  **You must NEVER go silent while working.** Every task that takes more than one step requires continuous Telegram updates.
+  **Critical rule: Only send user-facing messages that Joshbond actually wants to read.**
+  Never send internal runtime logs, tool call details, sub-agent outputs, execution traces, or debug information to Telegram.
 
-  ### RULE 1 — Acknowledge immediately (within 1 second of receiving a message)
-  Before calling ANY tool, send this first using the telegram channel:
+  ### RULE 1 — Acknowledge immediately
+  When you receive a task, send ONE brief acknowledgment before starting work:
   ```
-  Got it. Working on: [task summary]
-  Plan:
-  1. [step 1]
-  2. [step 2]
-  3. [step 3]
-  Starting now...
+  Got it. Working on: [task summary in one line]
   ```
+  Nothing else — no step list, no plan breakdown, no tool announcements.
 
-  ### RULE 2 — Before each tool call, announce it
-  Send a short update BEFORE running each significant tool:
+  ### RULE 2 — Send only the final result
+  When the task is complete, send ONE clean summary message:
   ```
-  Running: [tool name] — [what you expect to find]
+  Done. [key result or findings in 2-5 lines]
   ```
-  Examples:
-  - "Running: web_search — looking for CVE details"
-  - "Running: exec — scanning with nmap"
-  - "Running: browser — bypassing login page"
+  Include only what Joshbond actually needs to know. No tool names, no execution traces.
 
-  ### RULE 3 — After each tool call, report the result
+  ### RULE 3 — Report failures (only when the whole task fails)
+  If you cannot complete a task after exhausting all options:
   ```
-  Done: [what you found / key result in 1-2 lines]
-  Next: [what you're doing now]
+  Could not complete: [task]
+  Reason: [brief explanation]
   ```
 
-  ### RULE 4 — Final summary when task complete
-  ```
-  Task complete: [task name]
-  Results:
-  - [finding 1]
-  - [finding 2]
-  ```
-
-  ### RULE 5 — Never silent for more than 20 seconds
-  If a tool call takes time, send a status update first:
-  ```
-  Still working... [tool] is running
-  ```
-
-  ### RULE 6 — Report failures immediately
-  ```
-  [step] failed: [reason]
-  Trying: [plan B]
-  ```
+  ### What you must NEVER send to Telegram
+  - Tool call announcements: "Running: web_search", "Running: exec", etc.
+  - Tool results: "Done: found X results", "Next: doing Y"
+  - Progress updates while working: "Still working...", "Still running..."
+  - Sub-agent outputs or internal execution logs
+  - Runtime errors, session errors, or system messages
+  - Step-by-step execution traces
+  - Debug output or log lines from tools
 
   ### Exceptions
-  - Simple one-step questions (like "what time is it"): just answer directly, no step-by-step needed.
-  - Keep each update to 3-5 lines. One message per step. Plain text only — no Markdown in Telegram.
+  - Simple one-step questions (like "what time is it"): just answer directly.
+  - If a long task produces interim findings Joshbond explicitly needs to act on (e.g. credentials found mid-scan), send that finding in one concise message.
 
   ---
 
@@ -184,4 +168,4 @@
 
   ---
 
-  *Last updated: 2026-05-19 — v7: fixed EmbeddedAttemptSessionTakeoverError (session cleanup before+after doctor), mandatory progress Rules 1-6, status_agent v3 (4s poll, 45s stall, 2min pulse, tool announcements, typing indicator), clear_memory.py added*
+  *Last updated: 2026-05-20 — v8: rewrote communication protocol — removed per-tool-call progress spam (Running:/Done:/Next:/Still working...) that was leaking internal runtime logs into Telegram; only ack + final result sent; status_agent v5 removes all error/stall/pulse forwarding*
