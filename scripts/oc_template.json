@@ -3,9 +3,9 @@
     "defaults": {
       "workspace": "~/.openclaw/workspace",
       "skipBootstrap": true,
+      "contextInjection": "never",
       "model": {
         "primary": "cerebras/qwen3-32b",
-        "timeoutSec": 20,
         "fallbacks": [
           "cerebras/llama-3.3-70b",
           "cerebras/zai-glm-4.7",
@@ -90,6 +90,7 @@
         "baseUrl": "https://api.cerebras.ai/v1",
         "apiKey": "CEREBRAS_KEY_1_HERE",
         "api": "openai-completions",
+        "timeoutSeconds": 25,
         "models": [
           {
             "id": "llama3.1-8b",
@@ -167,6 +168,7 @@
         "baseUrl": "https://api.cerebras.ai/v1",
         "apiKey": "CEREBRAS_KEY_2_HERE",
         "api": "openai-completions",
+        "timeoutSeconds": 25,
         "models": [
           {
             "id": "llama3.1-8b",
@@ -234,6 +236,7 @@
         "baseUrl": "https://api.cerebras.ai/v1",
         "apiKey": "CEREBRAS_KEY_3_HERE",
         "api": "openai-completions",
+        "timeoutSeconds": 25,
         "models": [
           {
             "id": "llama3.1-8b",
@@ -301,6 +304,7 @@
         "baseUrl": "https://api.cerebras.ai/v1",
         "apiKey": "CEREBRAS_KEY_4_HERE",
         "api": "openai-completions",
+        "timeoutSeconds": 25,
         "models": [
           {
             "id": "llama3.1-8b",
