@@ -4,15 +4,18 @@
       "workspace": "~/.openclaw/workspace",
       "skipBootstrap": false,
       "model": {
-        "primary": "cerebras/zai-glm-4.7",
+        "primary": "cerebras/qwen3-32b",
         "fallbacks": [
+          "cerebras/zai-glm-4.7",
           "cerebras/gpt-oss-120b",
+          "cerebras-2/qwen3-32b",
           "cerebras-2/zai-glm-4.7",
           "cerebras-2/gpt-oss-120b",
+          "cerebras-3/qwen3-32b",
           "cerebras-3/zai-glm-4.7",
           "cerebras-3/gpt-oss-120b",
+          "cerebras-4/qwen3-32b",
           "cerebras-4/zai-glm-4.7",
-          "cerebras-4/gpt-oss-120b",
           "cerebras/llama3.1-8b",
           "cerebras-2/llama3.1-8b",
           "cerebras-3/llama3.1-8b",
@@ -44,10 +47,14 @@
       "enabled": true,
       "botToken": "TELEGRAM_TOKEN_HERE",
       "dmPolicy": "allowlist",
-      "allowFrom": ["6317345496"],
+      "allowFrom": [
+        "6317345496"
+      ],
       "streaming": {
-        "mode": "partial"
-      }
+        "mode": "off"
+      },
+      "errorMessages": false,
+      "systemMessages": false
     }
   },
   "tools": {
