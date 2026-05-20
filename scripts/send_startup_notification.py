@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Sends a Telegram startup notification to the owner."""
+"""
+Sends a single Telegram startup notification to the owner.
+This is the ONLY place that sends the startup message.
+status_agent.py must NOT send a duplicate startup notification.
+"""
 import os, urllib.request, json
 
 tok  = os.environ.get('TELEGRAM_BOT_TOKEN', '')
@@ -11,9 +15,8 @@ if not tok:
     raise SystemExit(0)
 
 msg = (
-    '\U0001f7e2 Zypher online | Instance #' + inst + ' | Run ' + rid[-6:] + '\n'
-    'Ready — send me a task.\n'
-    '4 Cerebras keys \u2022 11-model fallback chain \u2022 streaming:partial \u2022 stall alert in 45s'
+    '\U0001f7e2 Zypher online | Instance #' + inst + ' | Run #' + rid[-6:] + '\n'
+    'Ready — send me a task.'
 )
 
 try:
