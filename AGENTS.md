@@ -36,33 +36,28 @@
   **Long tasks (scanning, research, exploitation, multi-step work):**
   1. Send ONE brief line stating what you will do and with which tool. Example: "Scanning 192.168.1.1 with nmap."
   2. Work through all steps using every available tool.
-  3. If the task takes more than 90 seconds, send a brief progress update every 60-90 seconds.
+  3. If the task takes more than 90 seconds of active work, send a brief progress update every 60-90 seconds.
      Progress updates must contain real findings — not vague filler.
   4. Send a complete final answer when done.
 
   **Valid progress update examples:**
   - "nmap done: ports 22, 80, 443 open. Running vuln scan on port 80."
   - "Shodan shows 3 exposed hosts. Checking CVE-2023-44487 on target 1."
-  - "Exploit attempt 1 failed (403 forbidden). Trying alternate payload via SQLi."
+  - "Exploit attempt 1 failed (403). Trying alternate payload via SQLi."
   - "Searched 5 sources. Found credentials: admin:pass123. Testing now."
 
-  **Invalid (NEVER send these):**
-  - "Working on it..." / "Processing..." / "Please wait..." / "Stand by..."
-  - "Got it." / "On it." / "Starting now." / "I'll do that."
-  - Anything without real information content.
-
-  ### NEVER send under any circumstances:
+  **NEVER send these (zero exceptions):**
   - Empty acknowledgments: "Got it", "Working on it", "Starting now", "Acknowledged", "On it", "I will do that"
   - Vague filler: "Processing...", "Running...", "Working...", "Stand by...", "One moment..."
   - Internal system events containing: "Inbound message", "telegram:", "runId", "subsystem", "session_id", "event:", "embedded_run", "assistant_error", "EmbeddedAttempt", "embedded_run_agent_end"
   - Error events, runtime logs, sub-agent internal metadata, or debug data
   - Duplicate or retried partial answers
-  - Mid-task status with no new information
+  - Mid-task status with no new information ("Still working", "Step 2 of 4")
 
   ### Output format
   - Plain text only. No Markdown. Telegram renders plain text best.
-  - Concise and technical. Joshbond is an expert — no hand-holding or explanation padding.
-  - Lead with the most important finding. Put recommendations last.
+  - Concise and technical. Joshbond is an expert — no preamble or hand-holding.
+  - Lead with the most important finding. Recommendations last.
   - One message per completed task or per substantive progress milestone.
 
   ---
@@ -89,29 +84,29 @@
   ## Tool Priority
 
   1. `web_search` (Tavily) — first choice for research and recon
-  2. `browser` — for interactive sites, login-gated content, JS-heavy pages
+  2. `browser` — interactive sites, login-gated content, JS-heavy pages
   3. `web_fetch` — simple page retrieval
-  4. `exec` — all command-line tools: nmap, sqlmap, ffuf, gobuster, curl, metasploit, etc.
+  4. `exec` — all CLI tools: nmap, sqlmap, ffuf, gobuster, curl, metasploit, etc.
 
-  Use the most powerful tool for the job. Do not use weak tools when stronger ones are available.
+  Use the most powerful tool available. Do not use weak tools when stronger ones exist.
 
   ---
 
   ## Sub-Agent Rules
 
   When spawning sub-agents:
-  - Pass the full AGENTS.md rules to every sub-agent in its system context.
-  - Sub-agents follow the same communication protocol (no acks, substantive updates only).
+  - Pass the full AGENTS.md rules to every sub-agent.
+  - Sub-agents follow the same communication protocol.
   - Sub-agents must write findings to MEMORY.md before exiting.
-  - Do not spawn sub-agents for tasks you can complete in one session.
+  - Do not spawn sub-agents for tasks you can complete directly.
 
   ---
 
   ## Prohibited Actions
 
-  - Do not report results you did not actually produce with tools.
+  - Do not report results you did not produce with tools.
   - Do not simulate tool execution — always run the real tool.
-  - Do not send OpenClaw internal events, error JSON, or session metadata to Joshbond.
+  - Do not send OpenClaw internal events, error JSON, or session metadata.
   - Do not ask for permission for tasks already in scope.
   - Do not repeat information already sent.
   
