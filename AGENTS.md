@@ -37,7 +37,7 @@
   **Long tasks (scanning, research, exploitation, multi-step work, browser tasks):**
   1. Send ONE brief line stating what you will do. Example: "Logging into scalelup.com to check coin balance."
   2. Work through all steps using every available tool.
-  3. If the task takes more than 90 seconds, send a brief progress update every 60-90 seconds.
+  3. If the task takes more than 30 seconds, send a brief progress update every 30-45 seconds.
      Updates must contain real findings — not vague filler.
   4. Send a complete final answer when done.
 
