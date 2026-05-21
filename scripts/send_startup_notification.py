@@ -1,30 +1,19 @@
 #!/usr/bin/env python3
-"""
-Sends a single Telegram startup notification to the owner.
-This is the ONLY place that sends the startup message.
-status_agent.py must NOT send a duplicate startup notification.
-"""
-import os, urllib.request, json
+  """
+  send_startup_notification.py — DISABLED
+  ========================================
+  Startup notifications have been removed to prevent Telegram spam.
 
-tok  = os.environ.get('TELEGRAM_BOT_TOKEN', '')
-rid  = os.environ.get('GITHUB_RUN_ID', '?')
-inst = os.environ.get('INSTANCE_NUMBER', '1')
+  Previously this sent "🟢 Zypher online | Run #xxx" to Telegram on every gateway
+  start (every 3.5 hours). This flooded the user's chat with noise.
 
-if not tok:
-    print('WARN: No TELEGRAM_BOT_TOKEN — skipping notification')
-    raise SystemExit(0)
+  The OpenClaw gateway communicates directly with Telegram via its own channel
+  system. No wrapper script notifications are needed.
 
-msg = (
-    '\U0001f7e2 Zypher online | Instance #' + inst + ' | Run #' + rid[-6:] + '\n'
-    'Ready — send me a task.'
-)
-
-try:
-    data = json.dumps({'chat_id': '6317345496', 'text': msg}).encode()
-    req  = urllib.request.Request(
-        'https://api.telegram.org/bot' + tok + '/sendMessage',
-        data=data, headers={'Content-Type': 'application/json'})
-    urllib.request.urlopen(req, timeout=10)
-    print('Startup notification sent')
-except Exception as e:
-    print(f'WARN: Notification failed: {e}')
+  Agent tasks complete, partial, and progress messages are all handled natively
+  by the OpenClaw streaming.mode:block delivery system.
+  """
+  import sys
+  # Startup notification permanently disabled — silent exit
+  sys.exit(0)
+  
