@@ -18,7 +18,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install OpenClaw
-        run: npm install -g openclaw && openclaw --version 2>/dev/null || echo "installed"
+        run: npm install -g openclaw@2026.5.20 && openclaw --version 2>/dev/null || echo "installed"
 
       - name: Test Cerebras key directly
         env:
