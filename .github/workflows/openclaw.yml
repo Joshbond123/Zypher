@@ -121,7 +121,7 @@ jobs:
 
       - name: Install OpenClaw (pinned stable)
         run: |
-          npm install -g openclaw@2026.5.18
+          npm install -g openclaw@2026.5.20
           echo "OpenClaw version: $(openclaw --version 2>/dev/null || echo installed-ok)"
 
       - name: OpenClaw onboard (Cerebras)
@@ -419,9 +419,12 @@ jobs:
             fi
           fi
 
-          # Gateway is live — NO startup notification sent to Telegram.
-          # Startup spam ("🟢 Zypher online | Run #xxx") has been permanently removed.
+          # Gateway is live — send startup notification to Telegram
           echo "LIVE: @Zypher0_bot | Run $GITHUB_RUN_ID | Instance #${INSTANCE_NUMBER:-1}"
+          curl -sf -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d "chat_id=6317345496" \
+            -d "text=Zypher online | Run #${GITHUB_RUN_NUMBER} | Ready for tasks" \
+            || echo "WARN: startup notification failed (non-fatal)"
 
           # Main loop: run 3.5 hours then rotate
           sleep 12600
