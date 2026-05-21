@@ -125,10 +125,11 @@ def patch_config(keys: list, selected_key: str):
     providers = cfg.setdefault('models', {}).setdefault('providers', {})
 
     model_defs = [
-        {"id": "zai-glm-4.7",    "name": "Z.ai GLM 4.7",           "reasoning": True,  "input": ["text"], "contextWindow": 128000, "maxTokens": 8192},
-        {"id": "gpt-oss-120b",   "name": "GPT OSS 120B",            "reasoning": True,  "input": ["text"], "contextWindow": 128000, "maxTokens": 8192},
+        {"id": "qwen3-32b",      "name": "Qwen3 32B",               "reasoning": False, "input": ["text"], "contextWindow": 128000, "maxTokens": 16000},
+        {"id": "llama-3.3-70b",  "name": "Llama 3.3 70B",           "reasoning": False, "input": ["text"], "contextWindow": 128000, "maxTokens": 8192},
         {"id": "llama3.1-8b",    "name": "Llama 3.1 8B",            "reasoning": False, "input": ["text"], "contextWindow": 128000, "maxTokens": 8192},
-        {"id": "qwen-3-235b-a22b-instruct-2507", "name": "Qwen 3 235B", "reasoning": False, "input": ["text"], "contextWindow": 128000, "maxTokens": 8192},
+        {"id": "zai-glm-4.7",    "name": "Z.ai GLM 4.7",            "reasoning": True,  "input": ["text"], "contextWindow": 128000, "maxTokens": 16000},
+        {"id": "gpt-oss-120b",   "name": "GPT OSS 120B",            "reasoning": True,  "input": ["text"], "contextWindow": 128000, "maxTokens": 16000},
     ]
 
     base_provider = {
@@ -151,21 +152,27 @@ def patch_config(keys: list, selected_key: str):
     sel_idx = keys.index(selected_key) if selected_key in keys else 0
     log(f'  Primary cerebras provider set to key index {sel_idx} ({mask(selected_key)})')
 
-    # Rebuild fallback chain spanning all providers
+    # Rebuild fallback chain spanning all providers — fast non-reasoning first, reasoning as last resort
     fallbacks = []
-    models_priority = ['zai-glm-4.7', 'gpt-oss-120b', 'llama3.1-8b']
-    for model in models_priority:
+    fast_models = ['qwen3-32b', 'llama-3.3-70b', 'llama3.1-8b']
+    slow_models = ['zai-glm-4.7', 'gpt-oss-120b']
+    for model in fast_models:
         for i in range(len(keys)):
             pname = 'cerebras' if i == 0 else f'cerebras-{i+1}'
             fid = f'{pname}/{model}'
             # Primary model on primary provider is already the primary — skip from fallbacks
-            if i == 0 and model == 'zai-glm-4.7':
+            if i == 0 and model == 'qwen3-32b':
                 continue
+            fallbacks.append(fid)
+    for model in slow_models:
+        for i in range(len(keys)):
+            pname = 'cerebras' if i == 0 else f'cerebras-{i+1}'
+            fid = f'{pname}/{model}'
             fallbacks.append(fid)
 
     # Update agents.defaults.model
     model_cfg = cfg.setdefault('agents', {}).setdefault('defaults', {}).setdefault('model', {})
-    model_cfg['primary'] = 'cerebras/zai-glm-4.7'
+    model_cfg['primary'] = 'cerebras/qwen3-32b'
     model_cfg['fallbacks'] = fallbacks
     log(f'  Fallback chain: {len(fallbacks)} entries spanning {len(keys)} keys × 3 models')
 
