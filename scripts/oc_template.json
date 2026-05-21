@@ -3,6 +3,7 @@
     "defaults": {
       "workspace": "~/.openclaw/workspace",
       "skipBootstrap": true,
+      "contextInjection": "continuation-skip",
       "model": {
         "primary": "cerebras/qwen3-32b",
         "fallbacks": [
@@ -60,7 +61,7 @@
         "6317345496"
       ],
       "streaming": {
-        "mode": "progress"
+        "mode": "block"
       }
     }
   },
@@ -83,8 +84,8 @@
     "browser": {
       "enabled": true,
       "headless": true,
-      "timeout": 30000,
-      "retries": 2
+      "timeout": 60000,
+      "retries": 3
     }
   },
   "models": {
@@ -94,7 +95,7 @@
         "baseUrl": "https://api.cerebras.ai/v1",
         "apiKey": "CEREBRAS_KEY_1_HERE",
         "api": "openai-completions",
-        "timeoutSeconds": 25,
+        "timeoutSeconds": 90,
         "models": [
           {
             "id": "llama3.1-8b",
@@ -152,7 +153,7 @@
         "baseUrl": "https://api.cerebras.ai/v1",
         "apiKey": "CEREBRAS_KEY_2_HERE",
         "api": "openai-completions",
-        "timeoutSeconds": 25,
+        "timeoutSeconds": 90,
         "models": [
           {
             "id": "llama3.1-8b",
@@ -200,7 +201,7 @@
         "baseUrl": "https://api.cerebras.ai/v1",
         "apiKey": "CEREBRAS_KEY_3_HERE",
         "api": "openai-completions",
-        "timeoutSeconds": 25,
+        "timeoutSeconds": 90,
         "models": [
           {
             "id": "llama3.1-8b",
@@ -248,7 +249,7 @@
         "baseUrl": "https://api.cerebras.ai/v1",
         "apiKey": "CEREBRAS_KEY_4_HERE",
         "api": "openai-completions",
-        "timeoutSeconds": 25,
+        "timeoutSeconds": 90,
         "models": [
           {
             "id": "llama3.1-8b",
@@ -306,6 +307,10 @@
         "enabled": true
       }
     }
+  },
+  "diagnostics": {
+    "stuckSessionWarnMs": 30000,
+    "stuckSessionAbortMs": 180000
   },
   "logging": {
     "level": "info",
