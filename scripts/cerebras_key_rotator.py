@@ -125,7 +125,7 @@ def patch_config(keys: list, selected_key: str):
     providers = cfg.setdefault('models', {}).setdefault('providers', {})
 
     model_defs = [
-        {"id": "qwen3-32b",      "name": "Qwen3 32B",               "reasoning": False, "input": ["text"], "contextWindow": 128000, "maxTokens": 16000},
+        {"id": "qwen3-32b",      "name": "Qwen3 32B",               "reasoning": True,  "input": ["text"], "contextWindow": 128000, "maxTokens": 16000},
         {"id": "llama-3.3-70b",  "name": "Llama 3.3 70B",           "reasoning": False, "input": ["text"], "contextWindow": 128000, "maxTokens": 8192},
         {"id": "llama3.1-8b",    "name": "Llama 3.1 8B",            "reasoning": False, "input": ["text"], "contextWindow": 128000, "maxTokens": 8192},
         {"id": "zai-glm-4.7",    "name": "Z.ai GLM 4.7",            "reasoning": True,  "input": ["text"], "contextWindow": 128000, "maxTokens": 16000},
@@ -135,6 +135,7 @@ def patch_config(keys: list, selected_key: str):
     base_provider = {
         "baseUrl": "https://api.cerebras.ai/v1",
         "api": "openai-completions",
+        "timeoutSeconds": 300,
         "models": model_defs
     }
 
