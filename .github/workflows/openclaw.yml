@@ -19,7 +19,7 @@ on:
 
 concurrency:
   group: zypher-singleton
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   run-agent:
@@ -343,6 +343,16 @@ jobs:
             && echo "Status agent running PID=$STATUS_PID" \
             || { echo "WARN: Status agent exited early (non-fatal)"; cat /tmp/status_agent.log || true; }
 
+      - name: Verify Telegram runtime dependencies
+        run: |
+          set +e
+          openclaw gateway --help >/tmp/oc_help.txt 2>&1
+          if grep -qi "Cannot find module.*grammy" /tmp/oc_help.txt; then
+            echo "Detected missing grammY runtime dependency. Installing fallback..."
+            npm install -g grammy@^1.42.0 || true
+          fi
+          set -e
+
       - name: Start OpenClaw Gateway
         env:
           TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -381,7 +391,6 @@ jobs:
             openclaw doctor 2>&1 | tail -3 || true
             python3 scripts/post_doctor_fix.py 2>&1 || true
             python3 scripts/cerebras_key_rotator.py --stats 2>&1 || true
-            find ~/.openclaw -name "*.lock" -type d -mmin +10 -exec rm -rf {} + 2>/dev/null || true
           done) &
           DOCTOR_PID=$!
 
