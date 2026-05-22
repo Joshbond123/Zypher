@@ -17,6 +17,17 @@ except Exception as e:
 tg = cfg.setdefault('channels', {}).setdefault('telegram', {})
 changed = []
 
+# Fix dmPolicy — must be "allowlist" or allowFrom filter is bypassed
+if tg.get('dmPolicy') != 'allowlist':
+    old_policy = tg.get('dmPolicy')
+    tg['dmPolicy'] = 'allowlist'
+    changed.append(f'dmPolicy: "{old_policy}" -> "allowlist"')
+
+# Fix telegram.enabled — must be True or channel is inactive
+if not tg.get('enabled', False):
+    tg['enabled'] = True
+    changed.append('telegram.enabled: False -> True')
+
 # Fix streaming.mode — openclaw issue #66509: partial mode causes silent delivery failure
 current_mode = tg.get('streaming', {}).get('mode')
 if current_mode != 'block':
