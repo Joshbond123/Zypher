@@ -219,34 +219,8 @@ jobs:
 
       - name: Validate + restore config after doctor
         run: |
+          python3 scripts/post_doctor_fix.py
           python3 scripts/validate_config.py || exit 1
-          python3 - <<'PYEOF'
-import json, os
-p = os.path.expanduser('~/.openclaw/openclaw.json')
-cfg = json.load(open(p))
-tg = cfg.setdefault('channels', {}).setdefault('telegram', {})
-changed = False
-if tg.get('streaming', {}).get('mode') != 'block':
-    tg.setdefault('streaming', {})['mode'] = 'block'
-    print('RESTORED streaming.mode=block (doctor had reset it)')
-    changed = True
-af = tg.get('allowFrom', [])
-fixed = [int(x) for x in af]
-if af != fixed:
-    tg['allowFrom'] = fixed
-    print('RESTORED allowFrom to integers:', fixed)
-    changed = True
-for pname, prov in cfg.get('models', {}).get('providers', {}).items():
-    if 'cerebras' in pname and prov.get('timeoutSeconds', 0) < 300:
-        prov['timeoutSeconds'] = 300
-        print('RESTORED', pname, 'timeoutSeconds=300')
-        changed = True
-if changed:
-    json.dump(cfg, open(p, 'w'), indent=2)
-    print('Config re-applied OK')
-else:
-    print('Config intact after doctor — no changes needed')
-PYEOF
 
       # ─── BROWSER SKILL: xthezealot-stealth-browser ───────────────────────
       # Installs the stealth browser skill for anti-detection web automation.
@@ -385,26 +359,10 @@ PYEOF
           GITHUB_REPO:          ${{ github.repository }}
           INSTANCE_NUMBER:      ${{ github.event.inputs.instance_number || '1' }}
         run: |
-          # BUG FIX: Remove repo-root openclaw.config.json — prevents gateway from
-          # auto-discovering it and using literal "${TELEGRAM_BOT_TOKEN}" placeholder
+          # Remove repo-root openclaw.config.json — prevents gateway from
+          # auto-discovering it and using the literal ${TELEGRAM_BOT_TOKEN} placeholder
           rm -f openclaw.config.json 2>/dev/null || true
-          echo "Removed CWD openclaw.config.json (prevents config override)"
-
-          # Dump effective config values for debug visibility
-          echo "=== Effective config before gateway start ==="
-          python3 -c "
-import json,os
-cfg=json.load(open(os.path.expanduser('~/.openclaw/openclaw.json')))
-tg=cfg.get('channels',{}).get('telegram',{})
-m=cfg.get('agents',{}).get('defaults',{}).get('model',{})
-print('  streaming.mode:',tg.get('streaming',{}).get('mode'))
-print('  allowFrom:',tg.get('allowFrom'),'| types:',[type(x).__name__ for x in tg.get('allowFrom',[])])
-print('  dmPolicy:',tg.get('dmPolicy'))
-print('  botToken set:',bool(tg.get('botToken','')))
-print('  primary model:',m.get('primary'))
-print('  providers:',list(cfg.get('models',{}).get('providers',{}).keys()))
-"
-
+          python3 scripts/config_dump.py
           python3 scripts/preflight_check.py || exit 1
 
           # Kill any stale openclaw node process from prior step
@@ -416,28 +374,7 @@ print('  providers:',list(cfg.get('models',{}).get('providers',{}).keys()))
             sleep 1800
             echo "[$(date -u +%H:%M:%SZ)] Scheduled maintenance: doctor + key stats"
             openclaw doctor 2>&1 | tail -3 || true
-            # Re-apply critical config values after doctor (doctor may reset streaming.mode)
-            python3 -c "
-import json,os
-p=os.path.expanduser('~/.openclaw/openclaw.json')
-try:
-    cfg=json.load(open(p))
-    tg=cfg.setdefault('channels',{}).setdefault('telegram',{})
-    chg=False
-    if tg.get('streaming',{}).get('mode')!='block':
-        tg.setdefault('streaming',{})['mode']='block'
-        chg=True
-    af=tg.get('allowFrom',[])
-    fixed=[int(x) for x in af]
-    if af!=fixed:
-        tg['allowFrom']=fixed
-        chg=True
-    if chg:
-        json.dump(cfg,open(p,'w'),indent=2)
-        print('[maint] Config restored after doctor')
-except Exception as e:
-    print('[maint] WARN config patch failed:',e)
-" 2>&1 || true
+            python3 scripts/post_doctor_fix.py 2>&1 || true
             python3 scripts/cerebras_key_rotator.py --stats 2>&1 || true
             find ~/.openclaw -name "*.lock" -type d -mmin +10 -exec rm -rf {} + 2>/dev/null || true
           done) &
@@ -469,9 +406,8 @@ except Exception as e:
           echo "=== Gateway log (first 80 lines) ==="
           head -80 /tmp/openclaw.log 2>/dev/null || echo "(log empty)"
 
-          GW_PROC=$(pgrep -f "node.*openclaw" 2>/dev/null | wc -l || echo 0)
-          if ! kill -0 $TEE_PID 2>/dev/null || [ "$GW_PROC" -eq 0 ]; then
-            echo "ERROR: gateway process exited early (TEE_PID=$(kill -0 $TEE_PID 2>/dev/null && echo alive || echo dead), openclaw_procs=$GW_PROC)"
+          if ! kill -0 $TEE_PID 2>/dev/null; then
+            echo "ERROR: gateway process exited early"
             cat /tmp/openclaw.log
             exit 1
           fi
@@ -514,7 +450,8 @@ except Exception as e:
 
             sleep 30
 
-            if ! kill -0 $TEE_PID 2>/dev/null; then
+            GW_PROCS=$(pgrep -c -f "node.*openclaw" 2>/dev/null || echo 0)
+            if ! kill -0 $TEE_PID 2>/dev/null || [ "$GW_PROCS" -eq 0 ]; then
               RESTART_COUNT=$(( RESTART_COUNT + 1 ))
               echo "[$(date -u +%H:%M:%SZ)] WARN: gateway process died (restart #${RESTART_COUNT}/${MAX_RESTARTS})"
               tail -20 /tmp/openclaw.log 2>/dev/null || true
