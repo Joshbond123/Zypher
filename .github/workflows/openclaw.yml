@@ -121,8 +121,16 @@ jobs:
 
       - name: Install OpenClaw (pinned stable)
         run: |
-          npm install -g openclaw@2026.5.20
+          npm install -g openclaw@2026.5.5
           echo "OpenClaw version: $(openclaw --version 2>/dev/null || echo installed-ok)"
+
+      - name: Verify OpenClaw install and channel dependencies
+        run: |
+          set -e
+          echo "Node: $(node -v) | npm: $(npm -v)"
+          openclaw --version
+          # Ensure externalized telegram/plugin deps are resolved after install
+          npm ls -g --depth=0 2>/dev/null | grep -E "openclaw|grammy|undici" || true
 
       - name: OpenClaw onboard (Cerebras)
         env:
@@ -353,6 +361,24 @@ jobs:
           fi
           set -e
 
+      - name: Runtime smoke test (local agent task execution)
+        env:
+          CEREBRAS_API_KEY:     ${{ secrets.CEREBRAS_KEY_1 }}
+          CEREBRAS_API_KEY_2:   ${{ secrets.CEREBRAS_KEY_2 }}
+          CEREBRAS_API_KEY_3:   ${{ secrets.CEREBRAS_KEY_3 }}
+          CEREBRAS_API_KEY_4:   ${{ secrets.CEREBRAS_KEY_4 }}
+          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          GITHUB_RUN_ID:        ${{ github.run_id }}
+        run: |
+          set -e
+          timeout 180s openclaw agent --agent zypher --message "Run a 3-step diagnostic summary of this runtime and return concise bullets." \
+            > /tmp/oc_smoke.txt 2>&1 || true
+          tail -80 /tmp/oc_smoke.txt || true
+          if grep -qiE "error|failed|EFATAL|timeout" /tmp/oc_smoke.txt; then
+            echo "WARN: smoke test output contains error markers; continuing so gateway logs can provide details"
+          fi
+
       - name: Start OpenClaw Gateway
         env:
           TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -409,7 +435,7 @@ jobs:
               READY=1; break
             fi
             if [ $ELAPSED -ge 30 ] && [ -s /tmp/openclaw.log ]; then
-              if ! grep -qiE "EFATAL|fatal error|failed to start|ECONNREFUSED|cannot start" \
+              if ! grep -qiE "EFATAL|fatal error|failed to start|ECONNREFUSED|cannot start|Session file path must be within sessions directory|EmbeddedAttemptSessionTakeoverError|handler failed" \
                 /tmp/openclaw.log 2>/dev/null; then
                 echo "Gateway log active at ${ELAPSED}s (no fatal errors) - assuming ready"
                 READY=1; break
