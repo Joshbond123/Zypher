@@ -215,6 +215,11 @@ jobs:
           GITHUB_RUN_ID:        ${{ github.run_id }}
         run: python3 scripts/cerebras_key_rotator.py
 
+      - name: Provider preflight (Cerebras API)
+        env:
+          CEREBRAS_API_KEY:     ${{ secrets.CEREBRAS_KEY_1 }}
+        run: python3 scripts/provider_preflight.py
+
       - name: OpenClaw doctor --fix
         run: openclaw doctor --fix 2>&1 || true
 
