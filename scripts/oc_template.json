@@ -310,8 +310,7 @@
     }
   },
   "diagnostics": {
-    "stuckSessionWarnMs": 300000,
-    "stuckSessionAbortMs": 900000
+    "stuckSessionWarnMs": 300000
   },
   "logging": {
     "level": "info",

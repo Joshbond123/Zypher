@@ -23,7 +23,6 @@ print(f'  botToken set        : {bool(tg.get("botToken", ""))}')
 print(f'  primary model       : {m.get("primary")}')
 print(f'  fallbacks count     : {len(m.get("fallbacks", []))}')
 print(f'  providers           : {providers}')
-print(f'  stuckSessionAbortMs : {diag.get("stuckSessionAbortMs")}')
 
 issues = []
 if tg.get('streaming', {}).get('mode') != 'block':

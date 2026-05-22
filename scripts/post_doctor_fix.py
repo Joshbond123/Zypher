@@ -54,11 +54,8 @@ for pname, prov in cfg.get('models', {}).get('providers', {}).items():
         prov['timeoutSeconds'] = 300
         changed.append(f'{pname}.timeoutSeconds -> 300')
 
-# Fix stuckSessionAbortMs — 15min minimum for long pentest tasks
-diag = cfg.setdefault('diagnostics', {})
-if diag.get('stuckSessionAbortMs', 0) < 900000:
-    diag['stuckSessionAbortMs'] = 900000
-    changed.append('stuckSessionAbortMs -> 900000')
+# Keep diagnostics object present for compatibility
+cfg.setdefault('diagnostics', {})
 
 if changed:
     json.dump(cfg, open(CONFIG, 'w'), indent=2)
