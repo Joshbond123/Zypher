@@ -20,9 +20,7 @@
   assert dm_policy == 'allowlist', f'telegram.dmPolicy must be "allowlist", got "{dm_policy}"'
   assert len(allow_from) > 0, 'telegram.allowFrom must list at least one chat ID'
 
-  # BUG FIX: allowFrom must contain integers, not strings.
-  # Grammy (OpenClaw's Telegram library) provides ctx.chat.id as a number.
-  # Strict JS comparison "6317345496" === 6317345496 is FALSE → messages silently dropped.
+  # allowFrom must be integers — grammy uses strict === (6317345496 !== "6317345496")
   for entry in allow_from:
       assert isinstance(entry, int), (
           f'telegram.allowFrom must contain integers (not strings). '
@@ -34,25 +32,24 @@
   primary = model_cfg.get('primary', '')
   fallbacks = model_cfg.get('fallbacks', [])
   assert primary, 'model.primary not configured'
-  assert len(fallbacks) > 0, 'model.fallbacks is empty — requests will fail if primary unavailable'
+  assert len(fallbacks) > 0, 'model.fallbacks is empty'
 
   providers = c.get('models', {}).get('providers', {})
   num_providers = len([p for p in providers if 'cerebras' in p.lower()])
-  streaming = tg.get('streaming', {}).get('mode', 'off') if isinstance(tg.get('streaming'), dict) else 'off'
+  streaming_cfg = tg.get('streaming', {})
+  streaming = streaming_cfg.get('mode', 'off') if isinstance(streaming_cfg, dict) else 'off'
   assert streaming in ('off', 'partial', 'block', 'progress'), f'streaming.mode invalid: "{streaming}"'
   assert streaming == 'block', (
-      f'streaming.mode must be "block" for reliable Telegram delivery, got "{streaming}". '
-      f'Known upstream bug: streaming.mode=partial causes gateway to buffer tool responses '
-      f'and never deliver them (openclaw issue #66509).'
+      f'streaming.mode must be "block". Got "{streaming}". '
+      f'openclaw issue #66509: partial mode buffers tool responses and never delivers them.'
   )
-  sb_enabled = c.get('plugins', {}).get('entries', {}).get('supabase', {}).get('enabled', False)
 
-  # Validate timeouts
   for pname, prov in providers.items():
       if 'cerebras' in pname:
           ts = prov.get('timeoutSeconds', 0)
-          assert ts >= 300, f'{pname}.timeoutSeconds={ts} is too low (need >= 300 for qwen3-32b)'
+          assert ts >= 300, f'{pname}.timeoutSeconds={ts} is too low (need >= 300)'
 
-  print('Config OK: primary=%s fallbacks=%d providers=%d streaming=%s allowFrom=%s supabase_plugin=%s' % (
-      primary, len(fallbacks), num_providers, streaming, allow_from, sb_enabled))
+  sb_enabled = c.get('plugins', {}).get('entries', {}).get('supabase', {}).get('enabled', False)
+  print('Config OK: primary=%s fallbacks=%d providers=%d streaming=%s allowFrom=%s' % (
+      primary, len(fallbacks), num_providers, streaming, allow_from))
   
