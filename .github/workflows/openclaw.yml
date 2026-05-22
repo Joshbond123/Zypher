@@ -426,8 +426,55 @@ jobs:
             -d "text=Zypher online | Run #${GITHUB_RUN_NUMBER} | Ready for tasks" \
             || echo "WARN: startup notification failed (non-fatal)"
 
-          # Main loop: run 3.5 hours then rotate
-          sleep 12600
+          # ─── WATCHDOG MAIN LOOP (3.5h) ────────────────────────────────────
+          # Monitors the gateway process every 30s and restarts it if it dies,
+          # so the bot doesn't go silently offline mid-run after a crash.
+          RESTART_COUNT=0
+          MAX_RESTARTS=3
+          START_TIME=$(date +%s)
+          END_TIME=$(( START_TIME + 12600 ))
+
+          while true; do
+            NOW=$(date +%s)
+            [ "$NOW" -ge "$END_TIME" ] && break
+
+            sleep 30
+
+            if ! kill -0 $TEE_PID 2>/dev/null; then
+              RESTART_COUNT=$(( RESTART_COUNT + 1 ))
+              echo "[$(date -u +%H:%M:%SZ)] WARN: gateway process died (restart #${RESTART_COUNT}/${MAX_RESTARTS})"
+              tail -20 /tmp/openclaw.log 2>/dev/null || true
+
+              if [ "$RESTART_COUNT" -gt "$MAX_RESTARTS" ]; then
+                echo "ERROR: gateway crashed ${MAX_RESTARTS} times — aborting run, triggering emergency rotation"
+                break
+              fi
+
+              # Clean stale locks before restart
+              rm -rf ~/.openclaw/agents/ 2>/dev/null || true
+              find ~/.openclaw -name "*.lock" -type d -exec rm -rf {} + 2>/dev/null || true
+              find ~/.openclaw -name "*.lock" -type f -delete 2>/dev/null || true
+              sleep 5
+
+              # Restart gateway
+              openclaw gateway 2>&1 | tee -a /tmp/openclaw.log &
+              TEE_PID=$!
+
+              # Notify on first restart only (avoid spam)
+              if [ "$RESTART_COUNT" -eq 1 ]; then
+                curl -sf -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                  -d "chat_id=6317345496" \
+                  -d "text=Zypher restarted | Run #${GITHUB_RUN_NUMBER} | Back online" \
+                  2>/dev/null || true
+              fi
+
+              echo "[$(date -u +%H:%M:%SZ)] Gateway restarted (PID=$TEE_PID)"
+              # Give it 20s to stabilise before next watchdog check
+              sleep 20
+            fi
+          done
+
+          echo "[$(date -u +%H:%M:%SZ)] Watchdog loop ended (restarts: ${RESTART_COUNT})"
 
           # Save memory before rotation (persist to GitHub artifact for next run)
           if [ -f ~/.openclaw/workspace/MEMORY.md ]; then
