@@ -364,17 +364,9 @@ jobs:
           rm -f openclaw.config.json 2>/dev/null || true
 
           # -- FIX: delete any active Telegram webhook before starting gateway --
-          # If a webhook is set, Telegram delivers ALL messages to the webhook URL
-          # and NOTHING to the long-polling gateway. The bot appears online but
-          # silently ignores every message. This is a very common silent failure.
-          echo "=== Telegram webhook check ==="
-          WH_JSON=$(curl -sf "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getWebhookInfo" || echo '{}')
-          WH_URL=$(echo "$WH_JSON" | python3 -c "import json,sys; r=json.load(sys.stdin).get('result',{}); print(r.get('url',''))" 2>/dev/null || true)
-          WH_PND=$(echo "$WH_JSON" | python3 -c "import json,sys; r=json.load(sys.stdin).get('result',{}); print(r.get('pending_update_count',0))" 2>/dev/null || echo 0)
-          echo "  url='${WH_URL}' pending=${WH_PND}"
-          [ -n "$WH_URL" ] && echo "  CRITICAL: webhook active — will block all polling!" || true
-          DEL=$(curl -sf -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true" || echo '{"ok":false}')
-          echo "  deleteWebhook: $(echo $DEL | python3 -c \"import json,sys; d=json.load(sys.stdin); print('OK' if d.get('ok') else d)\" 2>/dev/null || echo $DEL)"
+          # Webhook mode silently blocks all long-polling. Python script checks
+          # and clears any webhook so the gateway can receive messages via polling.
+          python3 scripts/telegram_webhook_fix.py || echo "WARN: webhook fix script failed (non-fatal)"
           python3 scripts/config_dump.py
           python3 scripts/preflight_check.py || exit 1
 
