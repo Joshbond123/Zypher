@@ -1,0 +1,69 @@
+name: Confirm Fix — Send Test Task
+  on:
+    workflow_dispatch:
+
+  jobs:
+    confirm-fix:
+      runs-on: ubuntu-latest
+      timeout-minutes: 5
+      steps:
+        - name: Send test task to bot
+          env:
+            TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+            CHAT_ID: "6317345496"
+          run: |
+            echo "=== Sending test task to Zypher bot ==="
+            TASK="Hello Zypher — quick fix confirmation task: What is 2+2? Reply in one sentence."
+
+            SEND_RESULT=$(curl -sf \
+              -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "{\"chat_id\": \"${CHAT_ID}\", \"text\": \"${TASK}\"}" 2>&1)
+
+            echo "Send result:"
+            echo "$SEND_RESULT" | python3 -m json.tool || echo "$SEND_RESULT"
+
+            MSG_ID=$(echo "$SEND_RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['result']['message_id'])" 2>/dev/null || echo "")
+            echo "Sent message_id: $MSG_ID"
+
+        - name: Wait for bot response (30s)
+          run: sleep 30
+
+        - name: Fetch recent updates and find bot reply
+          env:
+            TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+            CHAT_ID: "6317345496"
+          run: |
+            echo "=== Fetching recent updates from Telegram ==="
+
+            UPDATES=$(curl -sf \
+              "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?limit=20&allowed_updates=message" 2>&1)
+
+            echo "Updates count: $(echo "$UPDATES" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('result', [])))" 2>/dev/null)"
+            echo ""
+
+            # Extract last 5 messages from the chat
+            echo "=== Last 5 messages in chat ${CHAT_ID} ==="
+            echo "$UPDATES" | python3 -c "
+  import sys, json
+  d = json.load(sys.stdin)
+  msgs = [u for u in d.get('result', []) if str(u.get('message', {}).get('chat', {}).get('id', '')) == '${CHAT_ID}']
+  for u in msgs[-5:]:
+      m = u.get('message', {})
+      sender = m.get('from', {}).get('username', m.get('from', {}).get('first_name', 'unknown'))
+      text = m.get('text', '(no text)')[:200]
+      print(f'  [{sender}]: {text}')
+  " 2>/dev/null || echo "Could not parse updates"
+
+            echo ""
+            echo "=== Check: does any recent message contain the error phrase? ==="
+            if echo "$UPDATES" | grep -q "Something went wrong"; then
+              echo "FAIL: bot returned error message — fix NOT working"
+            else
+              echo "PASS: no error message detected in recent replies"
+            fi
+
+            echo ""
+            echo "=== Bot info ==="
+            curl -sf "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe" | python3 -m json.tool
+  
