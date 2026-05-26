@@ -20,7 +20,6 @@ on:
 
 concurrency:
   group: zypher-singleton
-  cancel-in-progress: true
 
 jobs:
   run-agent:
@@ -236,7 +235,7 @@ jobs:
           if-no-files-found: warn
 
       - name: Trigger next run
-        if: always()
+        if: success()
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
           REPO: ${{ github.repository }}
