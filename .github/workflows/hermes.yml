@@ -4,15 +4,17 @@ on:
   workflow_dispatch:
     inputs:
       instance_number:
-        description: 'Instance number for tracking'
+        description: 'Instance number'
         required: false
         default: '1'
       reset_memory:
-        description: 'Reset all memory'
+        description: 'Reset memory'
         required: false
         default: 'false'
         type: choice
-        options: ['false', 'true']
+        options:
+          - 'false'
+          - 'true'
   schedule:
     - cron: '0 */4 * * *'
 
@@ -39,12 +41,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
           THIS_RUN: ${{ github.run_id }}
-          REPO:     ${{ github.repository }}
+          REPO: ${{ github.repository }}
         run: |
           RUNS=$(curl -sf -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github.v3+json" "https://api.github.com/repos/$REPO/actions/runs?status=in_progress&per_page=20" | jq -r --arg T "$THIS_RUN" '.workflow_runs[]|select(.id|tostring!=$T)|.id' 2>/dev/null || true)
-          for RID in $RUNS; do
-            curl -sf -X POST -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github.v3+json" "https://api.github.com/repos/$REPO/actions/runs/$RID/cancel" && echo "Cancelled $RID" || true
-          done
+          for RID in $RUNS; do curl -sf -X POST -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github.v3+json" "https://api.github.com/repos/$REPO/actions/runs/$RID/cancel" && echo "Cancelled $RID" || true; done
           echo "Cancel step done"
 
       - name: Setup Python 3.11
@@ -56,13 +56,14 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends nmap nikto sqlmap gobuster hydra netcat-openbsd masscan curl wget git jq openssl net-tools whois dnsutils dirb wfuzz ripgrep ffmpeg python3-pip 2>/dev/null || true
-          wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -O /tmp/chrome.deb && (sudo apt-get install -y /tmp/chrome.deb 2>/dev/null || sudo dpkg -i /tmp/chrome.deb && sudo apt-get -f install -y) || true
+          wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -O /tmp/chrome.deb
+          sudo apt-get install -y /tmp/chrome.deb 2>/dev/null || (sudo dpkg -i /tmp/chrome.deb && sudo apt-get -f install -y) || true
           pip install playwright -q && python -m playwright install chromium --with-deps 2>/dev/null || true
 
       - name: Validate secrets
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          CEREBRAS_API_KEY:   ${{ secrets.CEREBRAS_KEY_1 }}
+          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_KEY_1 }}
         run: |
           [ -z "$TELEGRAM_BOT_TOKEN" ] && echo 'ERROR: TELEGRAM_BOT_TOKEN not set' && exit 1 || true
           [ -z "$CEREBRAS_API_KEY" ] && echo 'ERROR: CEREBRAS_KEY_1 not set' && exit 1 || true
@@ -78,36 +79,36 @@ jobs:
       - name: Install Hermes Agent
         run: pip install hermes-agent --upgrade -q
 
-      - name: Configure Hermes
+      - name: Configure Hermes directories
         run: mkdir -p ~/.hermes/memories ~/.hermes/workspace ~/.hermes/skills
 
       - name: Write Hermes config.yaml
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_USER_ID:   ${{ secrets.TELEGRAM_USER_ID }}
-          CEREBRAS_API_KEY:   ${{ secrets.CEREBRAS_KEY_1 }}
+          TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
+          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_KEY_1 }}
         run: |
           python3 scripts/hermes_setup.py write-config
           cat ~/.hermes/config.yaml
 
       - name: Write Hermes .env
         env:
-          TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          CEREBRAS_API_KEY:     ${{ secrets.CEREBRAS_KEY_1 }}
-          TAVILY_API_KEY:       ${{ secrets.TAVILY_KEY_1 }}
-          TAVILY_API_KEY_2:     ${{ secrets.TAVILY_KEY_2 }}
-          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_KEY_1 }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_KEY_1 }}
+          TAVILY_API_KEY_2: ${{ secrets.TAVILY_KEY_2 }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-          GITHUB_TOKEN:         ${{ secrets.GH_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
         run: python3 scripts/hermes_setup.py write-env
 
       - name: Cerebras key rotation
         env:
-          CEREBRAS_API_KEY:   ${{ secrets.CEREBRAS_KEY_1 }}
+          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_KEY_1 }}
           CEREBRAS_API_KEY_2: ${{ secrets.CEREBRAS_KEY_2 }}
           CEREBRAS_API_KEY_3: ${{ secrets.CEREBRAS_KEY_3 }}
           CEREBRAS_API_KEY_4: ${{ secrets.CEREBRAS_KEY_4 }}
-          GITHUB_RUN_ID:      ${{ github.run_id }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
         run: python3 scripts/hermes_key_rotator.py
 
       - name: Cerebras preflight
@@ -117,9 +118,9 @@ jobs:
 
       - name: Bootstrap memory
         env:
-          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-          GITHUB_RUN_ID:        ${{ github.run_id }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
           mkdir -p ~/.hermes/memories
           [ -f /tmp/memory-restore/MEMORY.md ] && cp /tmp/memory-restore/MEMORY.md ~/.hermes/memories/ || true
@@ -127,10 +128,10 @@ jobs:
           python3 scripts/hermes_bootstrap_memory.py || true
           cp AGENTS.md ~/.hermes/AGENTS.md && echo 'AGENTS.md installed'
 
-      - name: Reset memory (if requested)
-        if: ${{ github.event.inputs.reset_memory == 'true' }}
+      - name: Reset memory
+        if: github.event.inputs.reset_memory == 'true'
         env:
-          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: |
           rm -f ~/.hermes/memories/MEMORY.md ~/.hermes/memories/USER.md
@@ -138,61 +139,64 @@ jobs:
 
       - name: Ensure Supabase schema
         env:
-          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-          GITHUB_RUN_ID:        ${{ github.run_id }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
         run: python3 scripts/setup_schema.py || true
 
       - name: Start Hermes agent
         env:
-          TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          CEREBRAS_API_KEY:     ${{ secrets.CEREBRAS_KEY_1 }}
-          TAVILY_API_KEY:       ${{ secrets.TAVILY_KEY_1 }}
-          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_KEY_1 }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_KEY_1 }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-          GITHUB_RUN_ID:        ${{ github.run_id }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
           nohup hermes start --no-interactive --telegram --config ~/.hermes/config.yaml > /tmp/hermes.log 2>&1 &
           HERMES_PID=$!
           echo "HERMES_PID=$HERMES_PID" >> $GITHUB_ENV
-          echo "Hermes started with PID=$HERMES_PID"
+          echo "Hermes started PID=$HERMES_PID"
           sleep 30
           head -50 /tmp/hermes.log || true
 
       - name: Send startup notification
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_USER_ID:   ${{ secrets.TELEGRAM_USER_ID }}
-          GITHUB_RUN_ID:      ${{ github.run_id }}
+          TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
         run: python3 scripts/hermes_startup_notify.py
 
       - name: Start Supabase sidecar
         env:
-          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-          GITHUB_RUN_ID:        ${{ github.run_id }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
           nohup python3 scripts/hermes_sidecar.py > /tmp/hermes-sidecar.log 2>&1 &
           echo "SIDECAR_PID=$!" >> $GITHUB_ENV
           echo 'Sidecar started'
 
-      - name: Keep agent alive (rotation loop)
+      - name: Keep agent alive
         env:
-          TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_USER_ID:     ${{ secrets.TELEGRAM_USER_ID }}
-          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-          GITHUB_TOKEN:         ${{ secrets.GH_PAT }}
-          GITHUB_REPO:          ${{ github.repository }}
-          GITHUB_RUN_ID:        ${{ github.run_id }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
-          TIMEOUT=13500; ELAPSED=0; INTERVAL=30
-          echo "Rotation loop: ${TIMEOUT}s"
+          TIMEOUT=13500
+          ELAPSED=0
+          INTERVAL=30
+          echo "Loop: ${TIMEOUT}s"
           while [ $ELAPSED -lt $TIMEOUT ]; do
             sleep $INTERVAL
             ELAPSED=$((ELAPSED+INTERVAL))
-            kill -0 $HERMES_PID 2>/dev/null || { nohup hermes start --no-interactive --telegram --config ~/.hermes/config.yaml >> /tmp/hermes.log 2>&1 & HERMES_PID=$!; echo "Restarted at ${ELAPSED}s"; sleep 5; }
-            [ $((ELAPSED % 300)) -eq 0 ] && { python3 scripts/hermes_sidecar.py --flush-memory 2>/dev/null || true; echo "Flush at ${ELAPSED}s"; } || true
+            kill -0 $HERMES_PID 2>/dev/null || {
+              nohup hermes start --no-interactive --telegram --config ~/.hermes/config.yaml >> /tmp/hermes.log 2>&1 &
+              HERMES_PID=$!
+              echo "Restarted at ${ELAPSED}s PID=$HERMES_PID"
+              sleep 5
+            }
+            [ $((ELAPSED % 300)) -eq 0 ] && { python3 scripts/hermes_sidecar.py --flush-memory 2>/dev/null || true; echo "Flush ${ELAPSED}s"; } || true
             [ $((ELAPSED % 600)) -eq 0 ] && tail -3 /tmp/hermes.log 2>/dev/null || true
           done
           echo 'Rotation complete'
@@ -200,9 +204,9 @@ jobs:
       - name: Save memory
         if: always()
         env:
-          SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-          GITHUB_RUN_ID:        ${{ github.run_id }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
         run: python3 scripts/hermes_sidecar.py --flush-memory 2>/dev/null || true
 
       - name: Stop Hermes
@@ -213,9 +217,12 @@ jobs:
         if: always()
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_USER_ID:   ${{ secrets.TELEGRAM_USER_ID }}
-          GITHUB_RUN_ID:      ${{ github.run_id }}
-        run: curl -sf -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" -d "chat_id=${TELEGRAM_USER_ID}" -d "text=Zypher rotating (Run #${GITHUB_RUN_ID}). Memory saved." || true
+          TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          curl -sf -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${TELEGRAM_USER_ID}" \
+            -d "text=Zypher rotating Run ${GITHUB_RUN_ID}. Memory saved." || true
 
       - name: Upload memory artifact
         if: always()
@@ -231,6 +238,11 @@ jobs:
       - name: Trigger next run
         if: always()
         env:
-          GH_TOKEN:   ${{ secrets.GH_PAT }}
-          REPO:       ${{ github.repository }}
-        run: curl -sf -X POST -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github.v3+json" "https://api.github.com/repos/$REPO/actions/workflows/hermes.yml/dispatches" -d '{"ref":"main"}' && echo 'Next run triggered' || echo 'WARN: trigger failed'
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          REPO: ${{ github.repository }}
+        run: |
+          curl -sf -X POST \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/$REPO/actions/workflows/hermes.yml/dispatches" \
+            -d '{"ref":"main"}' && echo 'Next run triggered' || echo 'WARN: trigger failed'
