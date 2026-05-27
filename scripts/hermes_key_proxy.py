@@ -5,7 +5,14 @@ hermes_key_proxy.py — Local OpenAI-compatible proxy with per-request Cerebras 
 Listens on localhost:7860/v1
 Every request gets a fresh Cerebras API key (round-robin across all configured keys).
 Handles streaming (SSE) responses transparently.
-If a key returns 429/401/403, it is skipped and the next key is tried automatically.
+
+Rate-limit strategy (fixed May 2026):
+  - On HTTP 429, read Retry-After header (default: 5s), wait, then try the NEXT key.
+  - If ALL keys return 429, wait up to 30s total before giving up.
+  - This ensures transient rate-limit blips are absorbed by the proxy and never
+    seen by Hermes as a provider failure that triggers a fallback cascade.
+  - The key insight: Cerebras's 60K TPM free-tier budget resets every 60 seconds.
+    Waiting a few seconds typically restores quota.
 """
 import http.server
 import http.client
@@ -15,6 +22,7 @@ import os
 import ssl
 import logging
 import sys
+import time
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s [key-proxy] %(message)s",
@@ -47,43 +55,78 @@ def next_key() -> str:
     return key
 
 
-def try_request(method, path, headers, body, retries=3):
+def try_request(method, path, headers, body):
+    """
+    Attempt the request with key rotation and 429 backoff.
+
+    Strategy:
+      1. Try each key in rotation.
+      2. On 429: read Retry-After header, wait, rotate to next key.
+      3. After all keys are exhausted on 429, wait 10s and retry the full cycle once.
+      4. On 401/403: skip key immediately (bad key), don't wait.
+      5. Other errors: retry up to 3 times total.
+    """
     ctx = ssl.create_default_context()
     last_err = None
-    tried = set()
+    n_keys = len(KEYS)
 
-    for attempt in range(retries):
-        key = next_key()
-        if key in tried and len(tried) >= len(KEYS):
-            break
-        tried.add(key)
+    # Two full passes: first pass tries every key, second pass is a 10s-wait retry.
+    for cycle in range(2):
+        if cycle == 1:
+            log.warning("All %d key(s) rate-limited — waiting 10s for quota reset...", n_keys)
+            time.sleep(10)
 
-        req_headers = dict(headers)
-        req_headers["Authorization"] = f"Bearer {key}"
+        for ki in range(n_keys):
+            key = next_key()
+            req_headers = dict(headers)
+            req_headers["Authorization"] = f"Bearer {key}"
 
-        try:
-            conn = http.client.HTTPSConnection(
-                UPSTREAM_HOST, UPSTREAM_PORT, context=ctx, timeout=120
-            )
-            conn.request(method, path, body=body, headers=req_headers)
-            resp = conn.getresponse()
-
-            if resp.status in (401, 403, 429) and attempt < retries - 1:
-                log.warning("Key attempt %d got HTTP %d — rotating", attempt + 1, resp.status)
-                resp.read()
-                conn.close()
-                continue
-
-            return conn, resp
-        except Exception as e:
-            last_err = e
-            log.warning("Upstream error attempt %d: %s", attempt + 1, e)
             try:
-                conn.close()
-            except Exception:
-                pass
+                conn = http.client.HTTPSConnection(
+                    UPSTREAM_HOST, UPSTREAM_PORT, context=ctx, timeout=120
+                )
+                conn.request(method, path, body=body, headers=req_headers)
+                resp = conn.getresponse()
 
-    raise RuntimeError(f"All key attempts failed. Last: {last_err}")
+                if resp.status == 429:
+                    body_bytes = resp.read()
+                    conn.close()
+                    retry_after = resp.getheader("Retry-After", "")
+                    try:
+                        wait = min(int(retry_after), 30)
+                    except (ValueError, TypeError):
+                        wait = 5
+                    log.warning(
+                        "Key[%d/%d] rate-limited (429) — waiting %ds then rotating",
+                        ki + 1, n_keys, wait,
+                    )
+                    time.sleep(wait)
+                    continue
+
+                if resp.status in (401, 403):
+                    log.warning(
+                        "Key[%d/%d] auth error HTTP %d — skipping",
+                        ki + 1, n_keys, resp.status,
+                    )
+                    resp.read()
+                    conn.close()
+                    continue
+
+                return conn, resp
+
+            except Exception as e:
+                last_err = e
+                log.warning("Upstream error key[%d/%d]: %s", ki + 1, n_keys, e)
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    raise RuntimeError(
+        f"All {n_keys} key(s) failed after retry cycle. "
+        f"Likely sustained rate-limit — try adding more CEREBRAS_API_KEY_N env vars. "
+        f"Last error: {last_err}"
+    )
 
 
 class ProxyHandler(http.server.BaseHTTPRequestHandler):
@@ -145,6 +188,7 @@ def main():
         sys.exit(1)
     log.info("Key-rotation proxy on 127.0.0.1:%d with %d key(s)", PROXY_PORT, len(KEYS))
     log.info("Upstream: https://%s", UPSTREAM_HOST)
+    log.info("Rate-limit strategy: wait Retry-After per key, then 10s cycle retry")
     server = http.server.ThreadingHTTPServer(("127.0.0.1", PROXY_PORT), ProxyHandler)
     server.daemon_threads = True
     server.serve_forever()
