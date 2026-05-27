@@ -1,57 +1,54 @@
 #!/usr/bin/env python3
 """hermes_setup.py — Write Hermes config.yaml and .env from environment variables.
 
-ROOT-CAUSE ANALYSIS — full bug history:
+FULL BUG HISTORY (all issues fixed as of May 2026):
 
-  [FIXED] PROBLEM 1 — api_key vs key_env (Hermes Issue #12146):
-    providers: dict entry must use key_env: ENVVAR_NAME, not literal api_key.
-    Without key_env, Hermes sends requests with no Authorization header → 401.
+  [FIXED] PROBLEM 1 — api_key vs key_env → HTTP 401 Missing Authentication header
+    providers: dict needs key_env: ENVVAR_NAME not a literal api_key value.
 
-  [FIXED] PROBLEM 2 — missing type: openai in provider entry:
-    Without type: openai, Hermes cannot identify the OpenAI-compatible format.
+  [FIXED] PROBLEM 2 — missing type: openai → auth skipped in some builds
 
-  [FIXED] PROBLEM 3 — fallback_providers missing auth:
-    Fallbacks need api_key field so _try_resolve_fallback_provider passes it.
+  [FIXED] PROBLEM 3 — fallback_providers missing api_key → 401 on fallbacks
 
-  [FIXED] PROBLEM 4 — wrong primary model ID (llama3.3-70b → llama-3.3-70b):
-    Corrected by adding the missing dash. But llama-3.3-70b has since been
-    removed from Cerebras entirely — see Problem 7.
+  [FIXED] PROBLEM 4 — wrong primary model ID (llama3.3-70b vs llama-3.3-70b)
 
-  [FIXED] PROBLEM 5 — context compression loop at ~1,320 tokens:
-    context_length not set → Hermes used a tiny internal default (~2,048 tokens).
-    Compression threshold 50% of 2048 = 1,024 tokens → fired every turn.
-    Fix: context_length: 131072, compression.threshold: 0.80
+  [FIXED] PROBLEM 5 — no context_length → compression at ~1,024 tokens every turn
 
-  [FIXED] PROBLEM 6 — auxiliary compression provider:main unavailable:
-    provider: main is not supported in the installed hermes-agent version.
-    Fix: disable compression entirely (131K context makes it unnecessary).
+  [FIXED] PROBLEM 6 — auxiliary compression provider:main not supported
 
-  [FIXED] PROBLEM 7 — ALL three models return HTTP 404:
-    Confirmed via live Cerebras public API (api.cerebras.ai/public/v1/models).
-    As of May 2026, the ONLY available Cerebras models are:
-      ✅ qwen-3-235b-a22b-instruct-2507  (non-reasoning, 131K ctx, tools)
-      ✅ llama3.1-8b                      (non-reasoning, 32K ctx, tools)
-      ⚠️ gpt-oss-120b                     (reasoning model — causes Bug 8)
-      ⚠️ zai-glm-4.7                      (reasoning model — causes Bug 8)
-    llama-3.3-70b, qwen-3-32b etc. are GONE from the Cerebras lineup.
+  [FIXED] PROBLEM 7 — ALL models 404 (llama-3.3-70b, qwen-3-32b removed from Cerebras)
+    Confirmed via live /public/v1/models: only 4 models remain.
 
-  [FIXED] PROBLEM 8 — HTTP 400 reasoning_content unsupported:
-    gpt-oss-120b and zai-glm-4.7 are reasoning models. They return
-    reasoning_content in their assistant messages. When Hermes feeds those
-    messages back in the next turn, Cerebras rejects the whole request:
-      'messages.2.assistant.reasoning_content: property is unsupported'
-    Fix: only use non-reasoning models (qwen-3-235b, llama3.1-8b).
+  [FIXED] PROBLEM 8 — HTTP 400 reasoning_content from gpt-oss-120b / zai-glm-4.7
+    Both are reasoning models. Their reasoning_content gets rejected on next turn.
 
-  FINAL WORKING MODEL LINEUP (May 2026, confirmed against live API):
-    Primary  : qwen-3-235b-a22b-instruct-2507  (131K ctx, tool-calling, non-reasoning)
-    Fallback : llama3.1-8b                      (32K ctx, tool-calling, non-reasoning)
-    EXCLUDED : gpt-oss-120b, zai-glm-4.7        (reasoning models — break message history)
+  [FIXED] PROBLEM 9 — Rate limit 429 on qwen-3-235b-a22b-instruct-2507:
+    qwen-3-235b generates at ~1,400 tok/s. Free tier = 60K TPM.
+    With max_tokens: 16384, Cerebras RESERVES 16K tokens per request against
+    the TPM budget even if the actual response is 50 tokens. This burns the
+    quota in < 4 seconds of steady state. Fix: set max_tokens: 4096 (75% less
+    TPM pressure). The proxy also retries 429 with backoff (see hermes_key_proxy.py)
+    so transient rate-limit blips never reach Hermes as a failure.
 
-  AUTH FLOW:
-    Hermes reads OPENAI_API_KEY="proxy-placeholder" from env (via key_env)
-    → sends Authorization: Bearer proxy-placeholder to http://127.0.0.1:7860/v1
-    → key-rotation proxy replaces header with real Cerebras key
-    → proxy forwards to api.cerebras.ai with valid auth ✓
+  [FIXED] PROBLEM 10 — Context compression loop at ~1,317 tokens on llama3.1-8b:
+    Hermes REQUIRES at least 64K context (system prompt + tool schemas exhaust
+    smaller windows). llama3.1-8b only has 32K — Hermes does not apply the
+    context_length from fallback_providers entries (known issue #12977).
+    Hermes falls back to an internal default of ~1,550 tokens for unrecognised
+    model/endpoint combinations. Gateway hygiene fires at 85% × 1,550 = 1,317
+    tokens — exactly the token count seen in the error.
+    Fix: remove llama3.1-8b from fallbacks entirely. No suitable 64K+ non-
+    reasoning fallback exists on free-tier Cerebras (gpt-oss-120b and zai-glm-4.7
+    are reasoning models and cause HTTP 400 on message history — see Problem 8).
+    The proxy handles transient rate limits with backoff retries, so qwen-3-235b
+    alone is sufficient for reliable operation.
+
+  CONFIRMED LIVE CEREBRAS MODEL CATALOG (api.cerebras.ai/public/v1/models, May 2026):
+    ID                              ctx    reasoning  safe-for-hermes
+    qwen-3-235b-a22b-instruct-2507  131K   no         ✅ PRIMARY
+    llama3.1-8b                     32K    no         ❌ too small (<64K required)
+    gpt-oss-120b                    131K   yes        ❌ reasoning_content → HTTP 400
+    zai-glm-4.7                     131K   yes        ❌ reasoning_content → HTTP 400
 """
 import os, sys
 
@@ -63,15 +60,11 @@ SK     = os.path.join(HD, "skills")
 
 PROXY_BASE_URL = "http://127.0.0.1:7860/v1"
 
-# CONFIRMED AGAINST LIVE CEREBRAS API (api.cerebras.ai/public/v1/models, May 2026)
-# ONLY non-reasoning models — reasoning models (gpt-oss-120b, zai-glm-4.7) are
-# excluded because they return reasoning_content which Cerebras then rejects on
-# the next turn with HTTP 400 "property is unsupported".
-PRIMARY_MODEL  = "qwen-3-235b-a22b-instruct-2507"   # 131K ctx, tools, non-reasoning
-FALLBACK_MODEL = "llama3.1-8b"                       # 32K ctx, tools, non-reasoning
-
-PRIMARY_CONTEXT  = 131072   # qwen-3-235b confirmed via /public/v1/models
-FALLBACK_CONTEXT = 32768    # llama3.1-8b confirmed via /public/v1/models
+# Only non-reasoning model with ≥64K context on Cerebras free tier (May 2026).
+# Rate-limit mitigation: proxy retries 429 with backoff (hermes_key_proxy.py)
+# + max_tokens reduced to 4096 to lower TPM consumption per request.
+PRIMARY_MODEL   = "qwen-3-235b-a22b-instruct-2507"
+PRIMARY_CONTEXT = 131072
 
 PROVIDER_NAME = "cerebras-proxy"
 
@@ -89,11 +82,9 @@ def write_config():
 
     cfg = (
         "# ~/.hermes/config.yaml — Zypher Agent (auto-generated)\n"
-        "# Models confirmed against live Cerebras API — May 2026\n"
+        "# Model confirmed against live Cerebras API — May 2026\n"
         "\n"
         "# ── PROVIDER ───────────────────────────────────────────────────────────\n"
-        "# key_env: Hermes reads OPENAI_API_KEY from env → Authorization header.\n"
-        "# The proxy accepts any Bearer value and injects the real Cerebras key.\n"
         "providers:\n"
         f"  {PROVIDER_NAME}:\n"
         f"    base_url: {PROXY_BASE_URL}\n"
@@ -101,36 +92,33 @@ def write_config():
         "    type: openai\n"
         "\n"
         "# ── PRIMARY MODEL ───────────────────────────────────────────────────────\n"
-        "# qwen-3-235b-a22b-instruct-2507:\n"
-        "#   - Only full non-reasoning model with 131K context on Cerebras (May 2026)\n"
-        "#   - Tool calling supported, streaming supported\n"
-        "#   - reasoning: false → no reasoning_content in responses (safe for history)\n"
+        "# qwen-3-235b-a22b-instruct-2507: only non-reasoning ≥64K model on Cerebras.\n"
+        "# max_tokens capped at 4096 to reduce TPM usage per request.\n"
+        "# (Cerebras reserves max_tokens against TPM quota even for short replies.\n"
+        "#  16384 exhausted the 60K TPM free-tier limit in under 4 seconds.)\n"
         "model:\n"
         f"  provider: {PROVIDER_NAME}\n"
         f"  default: {PRIMARY_MODEL}\n"
-        "  max_tokens: 16384\n"
+        "  max_tokens: 4096\n"
         f"  context_length: {PRIMARY_CONTEXT}\n"
         "  temperature: 0.7\n"
         "  streaming: true\n"
         "\n"
-        "# ── FALLBACK ────────────────────────────────────────────────────────────\n"
-        "# llama3.1-8b only — 32K context, non-reasoning, tool-calling supported.\n"
-        "# gpt-oss-120b and zai-glm-4.7 intentionally excluded: both are reasoning\n"
-        "# models that return reasoning_content → HTTP 400 on next request.\n"
-        "fallback_providers:\n"
-        '  - provider: "custom"\n'
-        f"    model: {FALLBACK_MODEL}\n"
-        f"    base_url: {PROXY_BASE_URL}\n"
-        '    api_key: "proxy-placeholder"\n'
-        f"    context_length: {FALLBACK_CONTEXT}\n"
+        "# ── FALLBACKS ───────────────────────────────────────────────────────────\n"
+        "# No fallback providers. All alternatives are either:\n"
+        "#   - Too small (<64K ctx): llama3.1-8b (32K) → Hermes internal default\n"
+        "#     ~1550 tokens → gateway hygiene fires at 85%×1550=1317 → loop crash\n"
+        "#   - Reasoning models: gpt-oss-120b, zai-glm-4.7 → HTTP 400 on next turn\n"
+        "# Transient 429 rate limits are handled by the proxy retry loop instead.\n"
         "\n"
         "# ── COMPRESSION ─────────────────────────────────────────────────────────\n"
-        "# Disabled: qwen-3-235b has 131K context — compression is unnecessary for\n"
-        "# normal usage and the auxiliary provider support varies by hermes version.\n"
-        "# Without this disabled, Hermes tries provider:main which is unsupported\n"
-        "# in some builds, logs a warning, and drops turns without summarizing.\n"
+        "# Disabled at both layers:\n"
+        "#   compression.enabled: false  — disables agent ContextCompressor (50%)\n"
+        "#   threshold: 0.99             — belt-and-suspenders for gateway hygiene\n"
+        "# qwen-3-235b has 131K context — compression is not needed in practice.\n"
         "compression:\n"
         "  enabled: false\n"
+        "  threshold: 0.99\n"
         "\n"
         "# ── AGENT ───────────────────────────────────────────────────────────────\n"
         "agent:\n"
@@ -182,11 +170,12 @@ def write_config():
     p = os.path.join(HD, "config.yaml")
     open(p, "w").write(cfg)
     print(f"config.yaml written -> {p}")
-    print(f"  provider       : {PROVIDER_NAME} (key_env: OPENAI_API_KEY, type: openai)")
-    print(f"  primary        : {PRIMARY_MODEL} ({PRIMARY_CONTEXT:,} ctx)")
-    print(f"  fallback       : {FALLBACK_MODEL} ({FALLBACK_CONTEXT:,} ctx)")
-    print(f"  excluded       : gpt-oss-120b, zai-glm-4.7 (reasoning models)")
-    print(f"  compression    : DISABLED (131K context, no auxiliary provider needed)")
+    print(f"  provider        : {PROVIDER_NAME} (key_env: OPENAI_API_KEY, type: openai)")
+    print(f"  primary         : {PRIMARY_MODEL}")
+    print(f"  max_tokens      : 4096  (reduced from 16384 — saves 75%% TPM per request)")
+    print(f"  context_length  : {PRIMARY_CONTEXT:,}")
+    print(f"  fallbacks       : NONE (no safe ≥64K non-reasoning model on free Cerebras)")
+    print(f"  compression     : DISABLED (threshold: 0.99 as gateway hygiene guard)")
 
 
 def write_env():
@@ -215,7 +204,7 @@ def write_env():
     open(p, "w").write(env)
     os.chmod(p, 0o600)
     print("~/.hermes/.env written")
-    print(f"  OPENAI_API_KEY         : proxy-placeholder (Bearer token for proxy)")
+    print(f"  OPENAI_API_KEY         : proxy-placeholder")
     print(f"  TELEGRAM_HOME_CHANNEL  : {uid}")
     print(f"  TELEGRAM_ALLOWED_USERS : {uid}")
 
