@@ -101,7 +101,7 @@ jobs:
           CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_KEY_1 }}
         run: |
           python3 scripts/hermes_setup.py write-config
-          cat ~/.hermes/config.yaml
+          echo "=== ~/.hermes/config.yaml ===" && cat ~/.hermes/config.yaml
 
       - name: Write Hermes .env
         env:
@@ -160,18 +160,49 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
         run: python3 scripts/setup_schema.py || true
 
-      # ── CRITICAL: Pre-approve owner so they never see a pairing prompt ──
       - name: Pre-approve bot owner (bypass pairing)
         env:
           TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
         run: python3 scripts/hermes_preapprove.py
 
+      # ─── Start key-rotation proxy BEFORE the gateway ───────────────────────
+      - name: Start Cerebras key-rotation proxy
+        env:
+          CEREBRAS_API_KEY:   ${{ secrets.CEREBRAS_KEY_1 }}
+          CEREBRAS_API_KEY_2: ${{ secrets.CEREBRAS_KEY_2 }}
+          CEREBRAS_API_KEY_3: ${{ secrets.CEREBRAS_KEY_3 }}
+          CEREBRAS_API_KEY_4: ${{ secrets.CEREBRAS_KEY_4 }}
+          CEREBRAS_API_KEY_5: ${{ secrets.CEREBRAS_KEY_5 }}
+          KEY_PROXY_PORT: "7860"
+        run: |
+          nohup python3 scripts/hermes_key_proxy.py > /tmp/hermes-proxy.log 2>&1 &
+          PROXY_PID=$!
+          echo "PROXY_PID=$PROXY_PID" >> $GITHUB_ENV
+          echo "Proxy PID=$PROXY_PID"
+          # Wait up to 15 s for proxy to start accepting connections
+          for i in $(seq 1 15); do
+            sleep 1
+            curl -sf http://127.0.0.1:7860/v1/models \
+              -H "Authorization: Bearer test" -o /dev/null 2>/dev/null \
+              && echo "Proxy ready after ${i}s" && break || true
+          done
+          echo "=== proxy startup log ==="
+          cat /tmp/hermes-proxy.log || true
+
+      # ─── Start Hermes gateway ───────────────────────────────────────────────
       - name: Start Hermes gateway
         env:
-          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_KEY_1 }}
+          # CRITICAL FIXES:
+          # 1. OPENAI_API_KEY must be set (non-empty) — hermes reads it when
+          #    provider=openai with a custom base_url (issue #560 in hermes)
+          # 2. TELEGRAM_HOME_CHANNEL — hermes reads this env var to set the
+          #    home channel (NOT the home_chat_id key in config.yaml)
+          OPENAI_API_KEY: "proxy-placeholder"
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
           TELEGRAM_ALLOWED_USERS: ${{ secrets.TELEGRAM_USER_ID }}
+          TELEGRAM_HOME_CHANNEL: ${{ secrets.TELEGRAM_USER_ID }}
+          TELEGRAM_HOME_CHANNEL_NAME: "Zypher Home"
           TAVILY_API_KEY: ${{ secrets.TAVILY_KEY_1 }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
@@ -180,10 +211,10 @@ jobs:
           nohup hermes gateway run --accept-hooks > /tmp/hermes.log 2>&1 &
           HERMES_PID=$!
           echo "HERMES_PID=$HERMES_PID" >> $GITHUB_ENV
-          echo "Hermes gateway started PID=$HERMES_PID"
-          sleep 30
-          echo "=== Hermes startup log (first 60 lines) ==="
-          head -60 /tmp/hermes.log || true
+          echo "Hermes gateway PID=$HERMES_PID"
+          sleep 35
+          echo "=== Hermes startup log (first 80 lines) ==="
+          head -80 /tmp/hermes.log || true
 
       - name: Start pairing auto-approver
         env:
@@ -208,36 +239,52 @@ jobs:
         run: |
           nohup python3 scripts/hermes_sidecar.py > /tmp/hermes-sidecar.log 2>&1 &
           echo "SIDECAR_PID=$!" >> $GITHUB_ENV
-          echo 'Supabase sidecar started'
+          echo "Supabase sidecar started"
 
+      # ─── Keep-alive loop ────────────────────────────────────────────────────
       - name: Keep agent alive
         env:
-          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_KEY_1 }}
+          CEREBRAS_API_KEY:   ${{ secrets.CEREBRAS_KEY_1 }}
           CEREBRAS_API_KEY_2: ${{ secrets.CEREBRAS_KEY_2 }}
+          CEREBRAS_API_KEY_3: ${{ secrets.CEREBRAS_KEY_3 }}
+          CEREBRAS_API_KEY_4: ${{ secrets.CEREBRAS_KEY_4 }}
+          CEREBRAS_API_KEY_5: ${{ secrets.CEREBRAS_KEY_5 }}
+          OPENAI_API_KEY: "proxy-placeholder"
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
           TELEGRAM_ALLOWED_USERS: ${{ secrets.TELEGRAM_USER_ID }}
+          TELEGRAM_HOME_CHANNEL: ${{ secrets.TELEGRAM_USER_ID }}
+          TELEGRAM_HOME_CHANNEL_NAME: "Zypher Home"
           TAVILY_API_KEY: ${{ secrets.TAVILY_KEY_1 }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           GITHUB_RUN_ID: ${{ github.run_id }}
+          KEY_PROXY_PORT: "7860"
         run: |
           TIMEOUT=13500
           ELAPSED=0
           INTERVAL=30
-          echo "Keep-alive loop: ${TIMEOUT}s max"
+          echo "Keep-alive: ${TIMEOUT}s total"
+
           while [ $ELAPSED -lt $TIMEOUT ]; do
             sleep $INTERVAL
             ELAPSED=$((ELAPSED+INTERVAL))
 
-            # Restart hermes if it died
+            # Restart key proxy if it died
+            if ! kill -0 $PROXY_PID 2>/dev/null; then
+              echo "[${ELAPSED}s] Key proxy died — restarting..."
+              nohup python3 scripts/hermes_key_proxy.py >> /tmp/hermes-proxy.log 2>&1 &
+              PROXY_PID=$!
+              sleep 5
+            fi
+
+            # Restart hermes gateway if it died
             if ! kill -0 $HERMES_PID 2>/dev/null; then
               echo "[${ELAPSED}s] Hermes died — restarting..."
-              # Re-apply pre-approval in case pairing state was lost
               python3 scripts/hermes_preapprove.py 2>/dev/null || true
               nohup hermes gateway run --accept-hooks >> /tmp/hermes.log 2>&1 &
               HERMES_PID=$!
-              echo "[${ELAPSED}s] Restarted hermes PID=$HERMES_PID"
+              echo "[${ELAPSED}s] Hermes restarted PID=$HERMES_PID"
               sleep 10
             fi
 
@@ -245,7 +292,6 @@ jobs:
             if ! kill -0 $PAIRING_PID 2>/dev/null; then
               nohup python3 scripts/hermes_pairing_watcher.py >> /tmp/hermes-pairing.log 2>&1 &
               PAIRING_PID=$!
-              echo "[${ELAPSED}s] Pairing watcher restarted PID=$PAIRING_PID"
             fi
 
             # Flush memory every 5 minutes
@@ -255,9 +301,12 @@ jobs:
             } || true
 
             # Log tail every 10 minutes
-            [ $((ELAPSED % 600)) -eq 0 ] && tail -5 /tmp/hermes.log 2>/dev/null || true
+            [ $((ELAPSED % 600)) -eq 0 ] && {
+              echo "=== hermes.log tail ===" && tail -5 /tmp/hermes.log 2>/dev/null || true
+              echo "=== proxy.log tail ===" && tail -3 /tmp/hermes-proxy.log 2>/dev/null || true
+            } || true
           done
-          echo 'Session rotation complete'
+          echo "Session rotation complete"
 
       - name: Save memory
         if: always()
@@ -267,10 +316,11 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
         run: python3 scripts/hermes_sidecar.py --flush-memory 2>/dev/null || true
 
-      - name: Stop Hermes
+      - name: Stop all processes
         if: always()
         run: |
           kill -TERM $HERMES_PID  2>/dev/null || true
+          kill -TERM $PROXY_PID   2>/dev/null || true
           kill -TERM $PAIRING_PID 2>/dev/null || true
           kill -TERM $SIDECAR_PID 2>/dev/null || true
 
@@ -283,8 +333,7 @@ jobs:
         run: |
           curl -sf -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d "chat_id=${TELEGRAM_USER_ID}" \
-            -d "text=Zypher rotating (Run #${GITHUB_RUN_ID}). Memory saved. Restarting now..." \
-            || true
+            -d "text=Zypher rotating (Run #${GITHUB_RUN_ID}). Back in seconds..." || true
 
       - name: Upload memory artifact
         if: always()
@@ -297,7 +346,7 @@ jobs:
           retention-days: 90
           if-no-files-found: warn
 
-      - name: Trigger next run immediately (zero-gap rotation)
+      - name: Trigger next run (zero-gap rotation)
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
@@ -307,4 +356,4 @@ jobs:
             -H "Authorization: token $GH_TOKEN" \
             -H "Accept: application/vnd.github.v3+json" \
             "https://api.github.com/repos/$REPO/actions/workflows/hermes.yml/dispatches" \
-            -d '{"ref":"main"}' && echo 'Next run triggered immediately' || echo 'WARN: trigger failed'
+            -d '{"ref":"main"}' && echo 'Next run triggered' || echo 'WARN: trigger failed'
