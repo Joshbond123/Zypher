@@ -31,7 +31,8 @@ def upsert(table,rows):
     ok,r=sb("POST",table,rows)
     if not ok:log.debug("upsert %s: %s",table,r[:60])
 def set_status(s):
-    upsert("agent_status",{"id":"zypher","status":s,"framework":"hermes","run_id":RUN_ID,"updated_at":datetime.now(timezone.utc).isoformat()})
+    # Uses github_run_id column to match setup_schema.py DDL
+    upsert("agent_status",{"github_run_id":RUN_ID,"status":s,"current_task":"","last_tool":"","tools_called":0,"last_activity":datetime.now(timezone.utc).isoformat(),"updated_at":datetime.now(timezone.utc).isoformat()})
 def flush_memory():
     for fn,key in[("MEMORY.md","hermes_memory"),("USER.md","hermes_user")]:
         p=os.path.join(MEMORY_DIR,fn)
@@ -62,7 +63,13 @@ def main():
     set_status("running");log.info("Monitoring %s",LOG_FILE)
     while True:
         n+=1
-        if n%HB==0:upsert("active_sessions",{"session_id":f"hermes-{RUN_ID}","framework":"hermes","run_id":RUN_ID,"last_heartbeat":datetime.now(timezone.utc).isoformat()})
+        if n%HB==0:
+            upsert("active_sessions",{
+                "github_run_id":RUN_ID,
+                "is_active":True,
+                "instance_num":1,
+                "updated_at":datetime.now(timezone.utc).isoformat()
+            })
         if n%MF==0:flush_memory()
         if os.path.exists(LOG_FILE):
             try:
@@ -75,7 +82,14 @@ def main():
                     seen.add(h)
                     if len(seen)>2000:seen=set(list(seen)[-1000:])
                     if m["type"] in("telegram","response","tool","task"):
-                        upsert("task_log",{"run_id":RUN_ID,"role":m["role"],"content":m["content"][:2000],"framework":"hermes","created_at":datetime.now(timezone.utc).isoformat()})
+                        upsert("task_log",{
+                            "task_id":h[:16],
+                            "session_id":f"hermes-{RUN_ID}",
+                            "status":m["type"],
+                            "message":m["content"][:2000],
+                            "tool_name":m["type"],
+                            "created_at":datetime.now(timezone.utc).isoformat()
+                        })
             except Exception as e:log.warning("log read: %s",e)
         time.sleep(POLL)
 if __name__=="__main__":
