@@ -2,12 +2,16 @@
 """hermes_sidecar.py — Supabase bridge sidecar for Hermes Agent v0.14.0.
 
 FIXES (May 2026):
+  - state.db backup now uses Python sqlite3.backup() API (WAL-safe online backup)
+    Previously used direct file copy which is UNSAFE for WAL-mode databases:
+    the WAL file may contain uncommitted transactions not yet flushed to the main db.
+    sqlite3.backup() uses the SQLite Online Backup API — works safely even while
+    Hermes gateway has the database open (no exclusive lock required).
   - Added state.db backup to Supabase (base64-encoded, key=hermes_state_db)
-  - Added --flush-statedb CLI flag for one-shot state.db flush
-  - SQLite integrity_check before upload to skip corrupt snapshots
-  - Skills directory sync to Supabase (individual skill files as hermes_skill_<name>)
+  - Added skills directory sync to Supabase
+  - Corruption detection before upload
 """
-import os,json,time,logging,hashlib,sys,base64,sqlite3,glob
+import os,json,time,logging,hashlib,sys,base64,sqlite3,glob,shutil
 from datetime import datetime,timezone
 from urllib.request import urlopen,Request
 from urllib.error import HTTPError
@@ -25,7 +29,7 @@ STATE_DB=os.path.join(HERMES_HOME,"state.db")
 SKILLS_DIR=os.path.join(HERMES_HOME,"skills")
 
 POLL=5;HB=6;MF=60;SBT=8;RT=2
-# Flush state.db every 15 min (180 × 5s) to avoid Supabase row-size pressure
+# Flush state.db every 15 min (180 × 5s) — avoids Supabase row-size pressure
 STATEDB_FLUSH_INTERVAL=180
 
 def sb(method,path,body=None,params="",retries=RT):
@@ -64,45 +68,93 @@ def flush_memory():
             log.info("Flushed %s (%d chars)",fn,len(c))
         except Exception as e:log.warning("flush %s: %s",fn,e)
 
-def check_statedb_integrity(path):
-    """Returns True if state.db passes SQLite integrity check."""
+def backup_statedb_wal_safe(source_path,dest_path):
+    """
+    WAL-safe SQLite backup using Python's sqlite3.backup() API.
+
+    WHY THIS MATTERS (Issue #5563 root cause):
+      state.db operates in WAL mode. Direct file copy (shutil.copy) is UNSAFE:
+      - The WAL file (-wal) may contain transactions not yet in the main db file
+      - Copying only the .db without the .wal produces an incomplete snapshot
+      - If Hermes is writing, a raw copy may capture the db mid-transaction
+
+    The sqlite3.backup() API uses SQLite's Online Backup API (C level):
+      - Works safely while another process has the database open
+      - Correctly handles WAL mode — reads a consistent snapshot
+      - Does not require exclusive locks
+      - Returns a clean, self-contained database file (no -wal dependency)
+
+    This is the ONLY safe method for online backup of a WAL-mode SQLite DB.
+    """
     try:
-        con=sqlite3.connect(path,timeout=5)
+        src=sqlite3.connect(f"file:{source_path}?mode=ro",uri=True,timeout=30)
+        dst=sqlite3.connect(dest_path)
+        with dst:
+            src.backup(dst,pages=0)  # pages=0 = copy entire DB in one step
+        src.close()
+        dst.close()
+        return True
+    except Exception as e:
+        log.warning("WAL-safe backup failed: %s",e)
+        return False
+
+def check_statedb_integrity(path):
+    """Returns True if path is a valid non-corrupt SQLite database."""
+    try:
+        con=sqlite3.connect(f"file:{path}?mode=ro",uri=True,timeout=5)
         res=con.execute("PRAGMA integrity_check").fetchone()
         con.close()
         return res and res[0]=="ok"
     except Exception as e:
-        log.warning("state.db integrity check failed: %s",e)
+        log.warning("integrity check %s: %s",path,e)
         return False
 
 def flush_statedb():
-    """Backup ~/.hermes/state.db to Supabase as base64-encoded blob."""
+    """Backup ~/.hermes/state.db to Supabase using WAL-safe sqlite3.backup() API."""
     if not os.path.exists(STATE_DB):
-        log.debug("state.db not found, skipping flush")
+        log.debug("state.db not found — skipping")
         return
-    size=os.path.getsize(STATE_DB)
-    if size==0:
-        log.debug("state.db is empty, skipping flush")
+    if os.path.getsize(STATE_DB)==0:
+        log.debug("state.db is empty — skipping")
         return
-    if not check_statedb_integrity(STATE_DB):
-        log.warning("state.db failed integrity check — skipping Supabase backup to avoid storing corrupt snapshot")
-        return
+
+    # Create a clean WAL-safe copy in /tmp first
+    tmp_backup="/tmp/state_backup.db"
     try:
-        with open(STATE_DB,"rb") as f:raw=f.read()
+        if os.path.exists(tmp_backup):os.remove(tmp_backup)
+    except:pass
+
+    if not backup_statedb_wal_safe(STATE_DB,tmp_backup):
+        log.warning("state.db WAL-safe backup to /tmp failed — skipping Supabase upload")
+        return
+
+    if not check_statedb_integrity(tmp_backup):
+        log.warning("state.db backup copy failed integrity check — skipping upload")
+        try:os.remove(tmp_backup)
+        except:pass
+        return
+
+    try:
+        with open(tmp_backup,"rb") as f:raw=f.read()
         encoded=base64.b64encode(raw).decode("ascii")
         sha=hashlib.sha256(raw).hexdigest()[:16]
+        size=len(raw)
         upsert("longterm_memory",{
             "key":"hermes_state_db",
             "value":encoded,
             "updated_at":datetime.now(timezone.utc).isoformat()
         })
-        log.info("Flushed state.db to Supabase (%d bytes, sha256=%s)",size,sha)
+        log.info("Flushed state.db → Supabase (%d bytes, sha256=%s, WAL-safe backup API)",size,sha)
     except Exception as e:
-        log.warning("flush state.db: %s",e)
+        log.warning("flush state.db Supabase upload: %s",e)
+    finally:
+        try:os.remove(tmp_backup)
+        except:pass
 
 def flush_skills():
-    """Backup each skill file in ~/.hermes/skills/ to Supabase."""
+    """Backup skill files in ~/.hermes/skills/ to Supabase."""
     if not os.path.isdir(SKILLS_DIR):return
+    count=0
     for fpath in glob.glob(os.path.join(SKILLS_DIR,"*.md"))+glob.glob(os.path.join(SKILLS_DIR,"*.py"))+glob.glob(os.path.join(SKILLS_DIR,"*.json")):
         fname=os.path.basename(fpath)
         key=f"hermes_skill_{fname}"
@@ -110,9 +162,10 @@ def flush_skills():
             c=open(fpath).read()
             if not c.strip():continue
             upsert("longterm_memory",{"key":key,"value":c,"updated_at":datetime.now(timezone.utc).isoformat()})
-            log.debug("Flushed skill %s",fname)
+            count+=1
         except Exception as e:
             log.warning("flush skill %s: %s",fname,e)
+    if count:log.info("Flushed %d skill file(s) to Supabase",count)
 
 def classify(line):
     line=line.strip()
@@ -171,7 +224,7 @@ def main():
 
 if __name__=="__main__":
     if "--flush-memory" in sys.argv:
-        log.info("One-shot memory flush")
+        log.info("One-shot full flush (memory + skills + state.db)")
         flush_memory()
         flush_skills()
         flush_statedb()
