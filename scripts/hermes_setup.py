@@ -1,28 +1,47 @@
 #!/usr/bin/env python3
 """hermes_setup.py — Write Hermes config.yaml and .env from environment variables.
 
-ROOT-CAUSE ANALYSIS (confirmed against Hermes runtime_provider.py source):
+ROOT-CAUSE ANALYSIS (confirmed against Hermes runtime_provider.py source +
+official Hermes docs at hermes-agent.nousresearch.com/docs/integrations/providers):
 
-  Call chain for primary provider (gateway → _resolve_runtime_agent_kwargs):
-    resolve_runtime_provider()           ← no args (explicit_base_url=None)
-    → _resolve_named_custom_runtime("custom", None, None)
-       condition: requested_norm=="custom" AND explicit_base_url  ← explicit_base_url is None!
-       Falls to _get_named_custom_provider("custom") → None (no entry named "custom")
-       Returns None
-    → _resolve_explicit_runtime(explicit_api_key=None, explicit_base_url=None)
-       if not explicit_api_key and not explicit_base_url: return None
-       Returns None
-    → No custom/pool match → falls through to auto (openrouter placeholder) → 401
+  PROBLEM 1 — api_key vs key_env (Hermes Issue #12146):
+    The providers: dict entry must use `key_env: ENVVAR_NAME` (an env var reference)
+    not `api_key: "literal-value"`. Without key_env, Hermes cannot resolve the
+    auth token and sends requests with NO Authorization header → HTTP 401
+    "Missing Authentication header".
 
-  model.base_url is SILENTLY IGNORED for provider:"custom" on primary calls.
+    WRONG (old broken config):
+      providers:
+        cerebras-proxy:
+          base_url: http://127.0.0.1:7860/v1
+          api_key: "proxy-placeholder"   ← Hermes ignores literal api_key here
 
-  THE ONLY WORKING PATH is the providers: DICT (v0.12+ format):
-    _get_named_custom_provider("cerebras-proxy") looks up key in providers: dict
-    Found → builds runtime with base_url + api_key from the dict entry ✓
+    CORRECT (this file):
+      providers:
+        cerebras-proxy:
+          base_url: http://127.0.0.1:7860/v1
+          key_env: OPENAI_API_KEY        ← Hermes reads env var OPENAI_API_KEY
+          type: openai                   ← required to identify the API format
 
-  Fallback_providers DO work with provider:"custom" + base_url because
-  _try_resolve_fallback_provider passes explicit_base_url=entry.get("base_url"),
-  which triggers the explicit_base_url branch in _resolve_named_custom_runtime.
+  PROBLEM 2 — missing type: openai field:
+    Without `type: openai`, some Hermes versions fail to identify the endpoint
+    as OpenAI-compatible and fall through to auto-detection, which may skip auth.
+
+  PROBLEM 3 — fallback_providers missing auth:
+    The fallback entries also need an auth field. Using api_key: "proxy-placeholder"
+    in each fallback entry works because _try_resolve_fallback_provider passes
+    explicit_api_key=entry.get("api_key") to the resolver.
+
+  PROBLEM 4 — invalid primary model ID:
+    "qwen-3-235b-a22b-instruct-2507" uses an unofficial suffix. The correct
+    Cerebras model IDs are: llama3.3-70b, llama3.1-8b, qwen-3-32b.
+    Using llama3.3-70b as primary (confirmed available on Cerebras).
+
+  FLOW (after fix):
+    Hermes reads OPENAI_API_KEY="proxy-placeholder" from env
+    → sends Authorization: Bearer proxy-placeholder to http://127.0.0.1:7860/v1
+    → key-rotation proxy replaces header with real Cerebras key
+    → proxy forwards to api.cerebras.ai with valid auth ✓
 """
 import os, sys
 
@@ -35,11 +54,12 @@ SK     = os.path.join(HD, "skills")
 # Key-rotation proxy (started before gateway in workflow)
 PROXY_BASE_URL = "http://127.0.0.1:7860/v1"
 
-# Cerebras model IDs (validated against /v1/models)
-PRIMARY_MODEL   = "qwen-3-235b-a22b-instruct-2507"
-FALLBACK_MODELS = ["llama3.3-70b", "llama3.1-8b"]
+# Cerebras model IDs — confirmed available on api.cerebras.ai
+PRIMARY_MODEL   = "llama3.3-70b"
+FALLBACK_MODELS = ["llama3.1-8b", "qwen-3-32b"]
 
 # Named entry in providers: dict — referenced by model.provider
+# Must match exactly (model.provider: cerebras-proxy → providers.cerebras-proxy)
 PROVIDER_NAME = "cerebras-proxy"
 
 
@@ -54,19 +74,22 @@ def write_config():
     uid       = os.environ.get("TELEGRAM_USER_ID", "6317345496")
     agents_md = os.path.join(HD, "AGENTS.md")
 
-    # providers: dict (v0.12+ format) — read by _get_named_custom_provider() at runtime.
-    # This is what makes the proxy base_url actually take effect.
-    # model.provider must match the dict key exactly.
+    # KEY FIX: use key_env: OPENAI_API_KEY (not api_key: literal).
+    # Hermes reads the named env var at runtime to build the Authorization header.
+    # OPENAI_API_KEY is set to "proxy-placeholder" in the workflow env — the proxy
+    # accepts any Bearer token and injects a real Cerebras key before forwarding.
+    # type: openai is required so Hermes knows the endpoint is OpenAI-compatible.
     cfg = (
         "# ~/.hermes/config.yaml — Zypher Agent (auto-generated)\n"
         "\n"
-        "# providers: DICT (v0.12+ format) — the ONLY way to get a custom base_url\n"
-        "# applied at runtime for the primary provider.\n"
-        "# _get_named_custom_provider(model.provider) looks up by key in this dict.\n"
+        "# providers: DICT — named custom provider referenced by model.provider.\n"
+        "# key_env tells Hermes which env var holds the Bearer token.\n"
+        "# OPENAI_API_KEY=proxy-placeholder in workflow env → proxy injects real key.\n"
         "providers:\n"
         f"  {PROVIDER_NAME}:\n"
         f"    base_url: {PROXY_BASE_URL}\n"
-        '    api_key: "proxy-placeholder"\n'
+        "    key_env: OPENAI_API_KEY\n"
+        "    type: openai\n"
         "\n"
         "model:\n"
         f"  provider: {PROVIDER_NAME}\n"
@@ -75,17 +98,18 @@ def write_config():
         "  temperature: 0.7\n"
         "  streaming: true\n"
         "\n"
-        "# Fallback chain — top-level key read by get_fallback_chain().\n"
-        "# provider:custom + explicit base_url works here because\n"
-        "# _try_resolve_fallback_provider passes explicit_base_url to\n"
-        "# resolve_runtime_provider, triggering the explicit_base_url branch.\n"
+        "# fallback_providers — tried in order when primary fails.\n"
+        "# api_key: literal value works here because _try_resolve_fallback_provider\n"
+        "# passes explicit_api_key=entry.get('api_key') directly to the resolver.\n"
         "fallback_providers:\n"
         '  - provider: "custom"\n'
         f"    model: {FALLBACK_MODELS[0]}\n"
         f"    base_url: {PROXY_BASE_URL}\n"
+        '    api_key: "proxy-placeholder"\n'
         '  - provider: "custom"\n'
         f"    model: {FALLBACK_MODELS[1]}\n"
         f"    base_url: {PROXY_BASE_URL}\n"
+        '    api_key: "proxy-placeholder"\n'
         "\n"
         "agent:\n"
         "  name: Zypher\n"
@@ -133,10 +157,13 @@ def write_config():
     p = os.path.join(HD, "config.yaml")
     open(p, "w").write(cfg)
     print(f"config.yaml written -> {p}")
-    print(f"  providers dict  : {PROVIDER_NAME} -> {PROXY_BASE_URL}")
+    print(f"  provider entry  : {PROVIDER_NAME}")
+    print(f"    base_url      : {PROXY_BASE_URL}")
+    print(f"    key_env       : OPENAI_API_KEY  (reads Bearer token from env)")
+    print(f"    type          : openai")
     print(f"  model.provider  : {PROVIDER_NAME}")
     print(f"  model.default   : {PRIMARY_MODEL}")
-    print(f"  fallbacks       : {FALLBACK_MODELS[0]}, {FALLBACK_MODELS[1]} (provider:custom + explicit base_url)")
+    print(f"  fallbacks       : {FALLBACK_MODELS[0]}, {FALLBACK_MODELS[1]} (api_key: proxy-placeholder)")
 
 
 def write_env():
@@ -148,9 +175,10 @@ def write_env():
     sb_key = os.environ.get("SUPABASE_SERVICE_KEY", "")
     gh     = os.environ.get("GITHUB_TOKEN", "")
     uid    = os.environ.get("TELEGRAM_USER_ID", "6317345496")
-    # OPENAI_API_KEY: guard for any auxiliary task that might fall back
-    # to an openai-compatible path. Value irrelevant — proxy injects real key.
-    # OPENROUTER_API_KEY: guard against auxiliary tasks hitting openrouter.
+    # OPENAI_API_KEY: referenced by key_env: OPENAI_API_KEY in the providers dict.
+    # The proxy ignores incoming auth and injects a real Cerebras key — but Hermes
+    # needs a non-empty value here or it sends no Authorization header (Issue #12146).
+    # OPENROUTER_API_KEY: guard against auxiliary tasks hitting openrouter with no key.
     env = (
         f"CEREBRAS_API_KEY={k1}\n"
         "OPENAI_API_KEY=proxy-placeholder\n"
@@ -168,8 +196,9 @@ def write_env():
     open(p, "w").write(env)
     os.chmod(p, 0o600)
     print("~/.hermes/.env written")
-    print(f"  TELEGRAM_HOME_CHANNEL : {uid}")
-    print(f"  TELEGRAM_ALLOWED_USERS: {uid}")
+    print(f"  OPENAI_API_KEY          : proxy-placeholder  (Bearer token for proxy)")
+    print(f"  TELEGRAM_HOME_CHANNEL   : {uid}")
+    print(f"  TELEGRAM_ALLOWED_USERS  : {uid}")
 
 
 if __name__ == "__main__":
