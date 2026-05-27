@@ -2,12 +2,14 @@
 """hermes_bootstrap_memory.py — Restore Hermes memory and state on startup.
 
 FIXES (May 2026):
-  - Added state.db restore from Supabase (base64-decoded, integrity-checked)
-  - Added corruption detection: if restored state.db fails integrity_check,
-    it is renamed to state.db.corrupt and a fresh one is created
-  - Added skills restore from Supabase (hermes_skill_* keys)
-  - Artifact-first: if /tmp/memory-restore/state.db exists (from artifact),
-    it is always preferred over the Supabase copy
+  - state.db restore now handles WAL mode correctly:
+    After restoring, runs PRAGMA wal_checkpoint(FULL) to flush WAL → main db
+    and PRAGMA journal_mode=WAL to ensure WAL mode is active on the fresh copy.
+  - Uses sqlite3.backup() API for the clean copy operation
+  - Artifact-first strategy: /tmp/memory-restore/{file} always wins over Supabase
+  - Corruption detection: corrupt files renamed to .corrupt, fresh db started
+  - Skills restore from Supabase (hermes_skill_* keys)
+  - Handles state.db-wal and state.db-shm cleanup after restore
 """
 import os,json,datetime,base64,sqlite3,shutil,glob
 from urllib.request import urlopen,Request
@@ -36,15 +38,57 @@ def sb_get_value(key):
     return None
 
 def check_integrity(path):
-    """Returns True if path is a valid, non-corrupt SQLite database."""
+    """Returns True if path is a valid non-corrupt SQLite database."""
     try:
-        con=sqlite3.connect(path,timeout=5)
+        con=sqlite3.connect(f"file:{path}?mode=ro",uri=True,timeout=5)
         res=con.execute("PRAGMA integrity_check").fetchone()
         con.close()
         return res and res[0]=="ok"
     except Exception as e:
         print(f"WARN integrity check {path}: {e}")
         return False
+
+def clean_copy_statedb(src,dst):
+    """
+    Copy a WAL-mode SQLite database safely using sqlite3.backup() API.
+    Creates a clean, self-contained snapshot with no -wal dependency.
+    """
+    try:
+        source=sqlite3.connect(f"file:{src}?mode=ro",uri=True,timeout=30)
+        dest=sqlite3.connect(dst)
+        with dest:
+            source.backup(dest,pages=0)
+        source.close()
+        dest.close()
+        return True
+    except Exception as e:
+        print(f"WARN sqlite3.backup() failed: {e}")
+        return False
+
+def checkpoint_and_activate_wal(path):
+    """
+    After restoring a WAL-mode database:
+    1. Checkpoint to flush any remaining WAL transactions into main db
+    2. Re-enable WAL mode (in case the restored copy is in DELETE mode)
+    """
+    try:
+        con=sqlite3.connect(path,timeout=10)
+        # Enable WAL mode (idempotent if already WAL)
+        con.execute("PRAGMA journal_mode=WAL")
+        # Checkpoint: flush WAL file into main db, then truncate WAL
+        con.execute("PRAGMA wal_checkpoint(FULL)")
+        con.close()
+        print(f"  WAL checkpoint complete on {os.path.basename(path)}")
+    except Exception as e:
+        print(f"WARN WAL checkpoint {path}: {e}")
+
+def remove_wal_files(db_path):
+    """Remove stale -wal and -shm files that could corrupt a restored db."""
+    for ext in ["-wal","-shm"]:
+        p=db_path+ext
+        if os.path.exists(p):
+            os.remove(p)
+            print(f"  Removed stale {os.path.basename(p)}")
 
 def restore_text(fname,key,default):
     """Restore a text memory file (MEMORY.md, USER.md)."""
@@ -55,56 +99,85 @@ def restore_text(fname,key,default):
         shutil.copy2(artifact_path,path)
         print(f"{fname}: restored from artifact ({os.path.getsize(path)}b)")
         return
-    # 2. Already present on disk (from a previous step)
+    # 2. Already present on disk
     if os.path.exists(path) and os.path.getsize(path)>50:
-        print(f"{fname}: present ({os.path.getsize(path)}b)");return
+        print(f"{fname}: already on disk ({os.path.getsize(path)}b)");return
     # 3. Supabase fallback
     val=sb_get_value(key)
     if val:open(path,"w").write(val);print(f"{fname}: restored from Supabase ({len(val)}c)")
     else:open(path,"w").write(default);print(f"{fname}: fresh init")
 
 def restore_statedb():
-    """Restore ~/.hermes/state.db from artifact or Supabase."""
+    """
+    Restore ~/.hermes/state.db with full WAL-mode safety.
+
+    Priority: artifact > Supabase > fresh start
+    After restore: checkpoint, activate WAL, remove stale WAL files.
+    """
+    print("state.db: starting restore...")
+
     # 1. Artifact takes priority
     artifact_db=os.path.join(ARTIFACT_DIR,"state.db")
     if os.path.exists(artifact_db) and os.path.getsize(artifact_db)>0:
-        if check_integrity(artifact_db):
-            shutil.copy2(artifact_db,STATE_DB)
-            print(f"state.db: restored from artifact ({os.path.getsize(STATE_DB):,} bytes) — integrity OK")
-            return
+        # Use clean_copy to avoid -wal dependency issues
+        tmp=STATE_DB+".restore_tmp"
+        if clean_copy_statedb(artifact_db,tmp):
+            if check_integrity(tmp):
+                # Remove any stale WAL files before placing restored copy
+                remove_wal_files(STATE_DB)
+                shutil.move(tmp,STATE_DB)
+                checkpoint_and_activate_wal(STATE_DB)
+                print(f"state.db: restored from artifact ({os.path.getsize(STATE_DB):,}b) — integrity OK")
+                return
+            else:
+                print(f"WARN state.db: artifact copy failed integrity check — trying Supabase")
+                try:os.remove(tmp)
+                except:pass
         else:
-            print(f"WARN state.db: artifact copy failed integrity check — trying Supabase")
+            # Fallback: try direct copy of artifact
+            remove_wal_files(STATE_DB)
+            shutil.copy2(artifact_db,STATE_DB)
+            if check_integrity(STATE_DB):
+                checkpoint_and_activate_wal(STATE_DB)
+                print(f"state.db: restored from artifact (direct copy, {os.path.getsize(STATE_DB):,}b)")
+                return
+            else:
+                print(f"WARN state.db: artifact direct copy corrupt — trying Supabase")
 
-    # 2. If already present and valid, keep it
+    # 2. Already present and valid
     if os.path.exists(STATE_DB) and os.path.getsize(STATE_DB)>0:
         if check_integrity(STATE_DB):
-            print(f"state.db: already present on disk ({os.path.getsize(STATE_DB):,} bytes) — integrity OK")
+            checkpoint_and_activate_wal(STATE_DB)
+            print(f"state.db: already on disk ({os.path.getsize(STATE_DB):,}b) — integrity OK")
             return
         else:
             corrupt_path=STATE_DB+".corrupt"
+            remove_wal_files(STATE_DB)
             shutil.move(STATE_DB,corrupt_path)
-            print(f"WARN state.db: existing copy corrupt — moved to {corrupt_path}")
+            print(f"WARN state.db: on-disk copy corrupt → moved to state.db.corrupt")
 
     # 3. Supabase fallback
     encoded=sb_get_value("hermes_state_db")
     if encoded:
         try:
             raw=base64.b64decode(encoded)
-            tmp_path=STATE_DB+".tmp"
-            with open(tmp_path,"wb") as f:f.write(raw)
-            if check_integrity(tmp_path):
-                shutil.move(tmp_path,STATE_DB)
-                print(f"state.db: restored from Supabase ({len(raw):,} bytes) — integrity OK")
+            tmp=STATE_DB+".supabase_tmp"
+            with open(tmp,"wb") as f:f.write(raw)
+            if check_integrity(tmp):
+                remove_wal_files(STATE_DB)
+                shutil.move(tmp,STATE_DB)
+                checkpoint_and_activate_wal(STATE_DB)
+                print(f"state.db: restored from Supabase ({len(raw):,}b) — integrity OK")
             else:
-                os.remove(tmp_path)
+                os.remove(tmp)
                 print(f"WARN state.db: Supabase copy failed integrity check — starting fresh")
         except Exception as e:
-            print(f"WARN state.db restore from Supabase failed: {e}")
+            print(f"WARN state.db restore from Supabase: {e}")
     else:
-        print("state.db: not found in artifact or Supabase — Hermes will create fresh")
+        print("state.db: not in artifact or Supabase — Hermes will init fresh on first run")
 
 def restore_skills():
-    """Restore skill files from Supabase (hermes_skill_* keys)."""
+    """Restore skill files from Supabase (hermes_skill_* keys, non-destructive)."""
     if not SB_URL or not SB_KEY:return
     try:
         data=sb_get("longterm_memory?key=like.hermes_skill_*&select=key,value")
@@ -115,10 +188,10 @@ def restore_skills():
             if not key.startswith("hermes_skill_") or not val:continue
             fname=key[len("hermes_skill_"):]
             path=os.path.join(SKILLS_DIR,fname)
-            if os.path.exists(path):continue  # don't overwrite existing skills
+            if os.path.exists(path):continue  # never overwrite existing skills
             with open(path,"w") as f:f.write(val)
             restored+=1
-        if restored:print(f"skills: restored {restored} skill file(s) from Supabase")
+        if restored:print(f"skills: restored {restored} skill(s) from Supabase")
         else:print("skills: all present or none in Supabase")
     except Exception as e:
         print(f"WARN skills restore: {e}")
