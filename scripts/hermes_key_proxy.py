@@ -1,23 +1,56 @@
 #!/usr/bin/env python3
 """
-hermes_key_proxy.py — Local OpenAI-compatible proxy with per-request Cerebras key rotation.
+hermes_key_proxy.py — Local OpenAI-compatible proxy with key rotation + Cerebras sanitizer.
 
-Listens on localhost:7860/v1
-Every request gets a fresh Cerebras API key (round-robin across all configured keys).
-Handles streaming (SSE) responses transparently.
+Listens on 127.0.0.1:7860/v1
+Forwards to https://api.cerebras.ai/v1 with per-request API key rotation.
 
-Rate-limit strategy (fixed May 2026):
-  - On HTTP 429, read Retry-After header (default: 5s), wait, then try the NEXT key.
-  - If ALL keys return 429, wait up to 30s total before giving up.
-  - This ensures transient rate-limit blips are absorbed by the proxy and never
-    seen by Hermes as a provider failure that triggers a fallback cascade.
-  - The key insight: Cerebras's 60K TPM free-tier budget resets every 60 seconds.
-    Waiting a few seconds typically restores quota.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SANITIZATION LAYER (added May 2026) — strips Cerebras-incompatible fields
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ROOT CAUSE: _empty_recovery_synthetic HTTP 400
+  Hermes injects synthetic nudge messages when the model returns an empty
+  response after tool calls. These messages carry an internal Python dict
+  key `_empty_recovery_synthetic: True`. Hermes serializes this directly into
+  the JSON payload sent to Cerebras. Cerebras strict-validates every field
+  against its spec and rejects unknown properties:
+    400 "messages.18.assistant._empty_recovery_synthetic: property unsupported"
+  Fix: strip all _* prefixed fields from message objects before forwarding.
+
+FULL LIST of fields stripped by this proxy (confirmed against Cerebras spec):
+
+  Top-level body (Cerebras rejects these entirely):
+    store               — OpenAI request-storage flag
+    maxTokens           — camelCase variant (use max_tokens)
+    thinking            — Anthropic-style reasoning flag
+    prompt_cache_key    — Zed/Anthropic-style prompt caching
+    service_tier        — OpenAI-only routing tier
+    reasoning_effort    — model-specific, unsupported on Cerebras
+    metadata            — OpenAI-only request metadata
+    Any field starting with _
+
+  Message-level (Cerebras rejects these on all message roles):
+    reasoning_content   — Cerebras uses "reasoning" (str|null) instead
+    _empty_recovery_synthetic — Hermes internal nudge marker (the bug field)
+    Any field starting with _
+
+  Message content normalization:
+    assistant messages with tool_calls and content="" → content=null
+      (Cerebras requires null, not empty string, on tool-call assistant turns)
+    role="developer" → role="system"
+      (OpenAI o-series "developer" role not supported by Cerebras)
+
+RATE-LIMIT STRATEGY:
+  On HTTP 429: read Retry-After header (default 5s), wait, try next key.
+  After all keys exhausted: wait 10s for Cerebras quota reset, retry once.
+  Transient rate-limit blips are absorbed here — Hermes never sees them.
 """
+
 import http.server
 import http.client
+import json as _json
 import threading
-import itertools
 import os
 import ssl
 import logging
@@ -43,6 +76,23 @@ UPSTREAM_HOST = "api.cerebras.ai"
 UPSTREAM_PORT = 443
 PROXY_PORT    = int(os.environ.get("KEY_PROXY_PORT", "7860"))
 
+# ── Top-level body fields Cerebras does not accept ────────────────────────────
+_BLOCKED_BODY_FIELDS = frozenset({
+    "store",
+    "maxTokens",
+    "thinking",
+    "prompt_cache_key",
+    "service_tier",
+    "reasoning_effort",
+    "metadata",
+})
+
+# ── Message-level fields Cerebras does not accept ────────────────────────────
+_BLOCKED_MSG_FIELDS = frozenset({
+    "reasoning_content",
+    "_empty_recovery_synthetic",
+})
+
 _counter = 0
 _counter_lock = threading.Lock()
 
@@ -55,25 +105,142 @@ def next_key() -> str:
     return key
 
 
-def try_request(method, path, headers, body):
+# ─────────────────────────────────────────────────────────────────────────────
+# SANITIZATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _sanitize_message(msg: dict) -> dict:
     """
-    Attempt the request with key rotation and 429 backoff.
+    Remove all Cerebras-incompatible fields from a single message object.
+
+    Rules applied (in order):
+      1. Strip explicitly blocked fields (_BLOCKED_MSG_FIELDS).
+      2. Strip any field whose name starts with '_' (Hermes internal markers).
+      3. If role == 'developer': replace with 'system' (Cerebras rejects 'developer').
+      4. If role == 'assistant' AND tool_calls present AND content == '':
+           set content = None  (Cerebras requires null, not empty string).
+    """
+    cleaned = {}
+    for k, v in msg.items():
+        if k in _BLOCKED_MSG_FIELDS:
+            log.debug("  msg sanitizer: stripped message field %r", k)
+            continue
+        if k.startswith("_"):
+            log.info("  msg sanitizer: stripped internal Hermes field %r from message", k)
+            continue
+        cleaned[k] = v
+
+    # Role normalisation
+    if cleaned.get("role") == "developer":
+        log.info("  msg sanitizer: role 'developer' → 'system'")
+        cleaned["role"] = "system"
+
+    # Tool-call content normalisation
+    if (
+        cleaned.get("role") == "assistant"
+        and cleaned.get("tool_calls")
+        and cleaned.get("content") == ""
+    ):
+        log.debug("  msg sanitizer: assistant tool_calls + content='' → null")
+        cleaned["content"] = None
+
+    return cleaned
+
+
+def sanitize_request_body(body_bytes: bytes, path: str) -> bytes:
+    """
+    Parse the JSON request body, strip all Cerebras-incompatible fields, and
+    re-serialise.  Returns the original bytes unchanged if:
+      - the body is empty
+      - JSON parsing fails (pass through as-is, let Cerebras return the 400)
+      - no modifications were needed (avoids pointless re-serialisation)
+    """
+    if not body_bytes:
+        return body_bytes
+
+    # Only chat/completions calls carry message arrays worth sanitizing.
+    # For /v1/models and other GET-style calls the body is empty anyway,
+    # but we also skip non-JSON content types to be safe.
+    if b'"messages"' not in body_bytes and b'"model"' not in body_bytes:
+        return body_bytes
+
+    try:
+        payload = _json.loads(body_bytes)
+    except Exception:
+        log.warning("sanitize_request_body: JSON parse failed — forwarding raw body")
+        return body_bytes
+
+    if not isinstance(payload, dict):
+        return body_bytes
+
+    modified = False
+
+    # ── 1. Strip blocked top-level body fields ────────────────────────────
+    for field in list(payload.keys()):
+        if field in _BLOCKED_BODY_FIELDS:
+            del payload[field]
+            log.info("sanitizer: stripped top-level body field %r", field)
+            modified = True
+        elif field.startswith("_"):
+            del payload[field]
+            log.info("sanitizer: stripped internal top-level field %r", field)
+            modified = True
+
+    # ── 2. Sanitize each message object ───────────────────────────────────
+    messages = payload.get("messages")
+    if isinstance(messages, list):
+        sanitized_msgs = []
+        for i, msg in enumerate(messages):
+            if not isinstance(msg, dict):
+                sanitized_msgs.append(msg)
+                continue
+            cleaned = _sanitize_message(msg)
+            if cleaned != msg:
+                modified = True
+                log.info(
+                    "sanitizer: message[%d] role=%r — stripped fields: %s",
+                    i,
+                    msg.get("role", "?"),
+                    sorted(set(msg) - set(cleaned)),
+                )
+            sanitized_msgs.append(cleaned)
+        payload["messages"] = sanitized_msgs
+
+    if not modified:
+        return body_bytes
+
+    result = _json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    log.info(
+        "sanitizer: body sanitized %d→%d bytes for %s",
+        len(body_bytes), len(result), path,
+    )
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REQUEST EXECUTION WITH KEY ROTATION + 429 BACKOFF
+# ─────────────────────────────────────────────────────────────────────────────
+
+def try_request(method: str, path: str, headers: dict, body: bytes | None):
+    """
+    Attempt the request with full key rotation and 429 backoff.
 
     Strategy:
-      1. Try each key in rotation.
-      2. On 429: read Retry-After header, wait, rotate to next key.
-      3. After all keys are exhausted on 429, wait 10s and retry the full cycle once.
-      4. On 401/403: skip key immediately (bad key), don't wait.
-      5. Other errors: retry up to 3 times total.
+      Pass 0: try every key once; on 429 wait Retry-After then rotate.
+      Pass 1: all keys exhausted on 429 → wait 10s for quota reset, retry all.
+      401/403: skip key immediately (bad or revoked key).
+      Network errors: skip and continue.
     """
     ctx = ssl.create_default_context()
     last_err = None
     n_keys = len(KEYS)
 
-    # Two full passes: first pass tries every key, second pass is a 10s-wait retry.
     for cycle in range(2):
         if cycle == 1:
-            log.warning("All %d key(s) rate-limited — waiting 10s for quota reset...", n_keys)
+            log.warning(
+                "All %d key(s) rate-limited — waiting 10s for Cerebras TPM reset...",
+                n_keys,
+            )
             time.sleep(10)
 
         for ki in range(n_keys):
@@ -89,15 +256,15 @@ def try_request(method, path, headers, body):
                 resp = conn.getresponse()
 
                 if resp.status == 429:
-                    body_bytes = resp.read()
+                    resp.read()
                     conn.close()
-                    retry_after = resp.getheader("Retry-After", "")
+                    retry_after_hdr = resp.getheader("Retry-After", "")
                     try:
-                        wait = min(int(retry_after), 30)
+                        wait = min(int(retry_after_hdr), 30)
                     except (ValueError, TypeError):
                         wait = 5
                     log.warning(
-                        "Key[%d/%d] rate-limited (429) — waiting %ds then rotating",
+                        "Key[%d/%d] 429 rate-limited — waiting %ds then rotating",
                         ki + 1, n_keys, wait,
                     )
                     time.sleep(wait)
@@ -105,7 +272,7 @@ def try_request(method, path, headers, body):
 
                 if resp.status in (401, 403):
                     log.warning(
-                        "Key[%d/%d] auth error HTTP %d — skipping",
+                        "Key[%d/%d] auth error HTTP %d — rotating",
                         ki + 1, n_keys, resp.status,
                     )
                     resp.read()
@@ -124,19 +291,25 @@ def try_request(method, path, headers, body):
 
     raise RuntimeError(
         f"All {n_keys} key(s) failed after retry cycle. "
-        f"Likely sustained rate-limit — try adding more CEREBRAS_API_KEY_N env vars. "
+        f"Add more CEREBRAS_API_KEY_N env vars to increase capacity. "
         f"Last error: {last_err}"
     )
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HTTP HANDLER
+# ─────────────────────────────────────────────────────────────────────────────
 
 class ProxyHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         log.debug(fmt, *args)
 
-    def _proxy(self, method):
+    def _proxy(self, method: str):
         content_length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(content_length) if content_length > 0 else None
-        path = self.path
+        raw_body = self.rfile.read(content_length) if content_length > 0 else None
+
+        # ── SANITIZE before forwarding ────────────────────────────────────
+        body = sanitize_request_body(raw_body, self.path) if raw_body else raw_body
 
         fwd_headers = {
             "Content-Type": self.headers.get("Content-Type", "application/json"),
@@ -144,10 +317,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             "User-Agent":   "hermes-key-proxy/1.0",
         }
         if body:
+            # Recalculate Content-Length after sanitization may have changed body size
             fwd_headers["Content-Length"] = str(len(body))
 
         try:
-            conn, resp = try_request(method, path, fwd_headers, body)
+            conn, resp = try_request(method, self.path, fwd_headers, body)
         except Exception as e:
             log.error("Proxy failed: %s", e)
             self.send_error(502, f"Upstream error: {e}")
@@ -159,7 +333,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             for h, v in resp.getheaders():
                 if h.lower() not in skip:
                     self.send_header(h, v)
-            self.send_header("X-Key-Proxy", "cerebras-rotating")
+            self.send_header("X-Key-Proxy", "cerebras-sanitizing-rotating")
             self.end_headers()
 
             while True:
@@ -182,13 +356,18 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     def do_DELETE(self): self._proxy("DELETE")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
+
 def main():
     if not KEYS:
         log.error("No Cerebras API keys configured. Set CEREBRAS_API_KEY env vars.")
         sys.exit(1)
-    log.info("Key-rotation proxy on 127.0.0.1:%d with %d key(s)", PROXY_PORT, len(KEYS))
+    log.info("Key-rotation + sanitizing proxy on 127.0.0.1:%d with %d key(s)", PROXY_PORT, len(KEYS))
     log.info("Upstream: https://%s", UPSTREAM_HOST)
-    log.info("Rate-limit strategy: wait Retry-After per key, then 10s cycle retry")
+    log.info("Sanitizer: strips _empty_recovery_synthetic + reasoning_content + blocked body fields")
+    log.info("Rate-limit: Retry-After backoff per key, 10s cycle reset")
     server = http.server.ThreadingHTTPServer(("127.0.0.1", PROXY_PORT), ProxyHandler)
     server.daemon_threads = True
     server.serve_forever()
