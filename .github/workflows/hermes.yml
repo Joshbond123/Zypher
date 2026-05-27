@@ -179,25 +179,49 @@ jobs:
           PROXY_PID=$!
           echo "PROXY_PID=$PROXY_PID" >> $GITHUB_ENV
           echo "Proxy PID=$PROXY_PID"
-          # Wait up to 15 s for proxy to start accepting connections
-          for i in $(seq 1 15); do
+
+          # Wait up to 20 s for proxy to start accepting connections
+          PROXY_READY=0
+          for i in $(seq 1 20); do
             sleep 1
-            curl -sf http://127.0.0.1:7860/v1/models \
-              -H "Authorization: Bearer test" -o /dev/null 2>/dev/null \
-              && echo "Proxy ready after ${i}s" && break || true
+            if curl -sf http://127.0.0.1:7860/v1/models \
+              -H "Authorization: Bearer test" -o /dev/null 2>/dev/null; then
+              echo "Proxy ready after ${i}s"
+              PROXY_READY=1
+              break
+            fi
           done
+
           echo "=== proxy startup log ==="
           cat /tmp/hermes-proxy.log || true
+
+          # Hard-fail if proxy never came up — without the proxy, Hermes
+          # will make requests to Cerebras with no auth header (HTTP 401).
+          if [ "$PROXY_READY" -eq 0 ]; then
+            echo "FATAL: key-rotation proxy did not start within 20s. Check CEREBRAS_KEY_1."
+            exit 1
+          fi
+          echo "Proxy health check PASSED"
 
       # ─── Start Hermes gateway ───────────────────────────────────────────────
       - name: Start Hermes gateway
         env:
-          # CRITICAL FIXES:
-          # 1. OPENAI_API_KEY must be set (non-empty) — hermes reads it when
-          #    provider=openai with a custom base_url (issue #560 in hermes)
-          # 2. TELEGRAM_HOME_CHANNEL — hermes reads this env var to set the
-          #    home channel (NOT the home_chat_id key in config.yaml)
+          # AUTH FIX — why these vars are set:
+          #
+          # OPENAI_API_KEY: referenced by `key_env: OPENAI_API_KEY` in the
+          #   custom_providers block of config.yaml (hermes_setup.py).
+          #   The proxy ignores incoming auth and injects a real Cerebras key,
+          #   but Hermes needs a non-empty value here or it sends no
+          #   Authorization header at all. (Hermes Issue #12146 root cause)
+          #
+          # OPENROUTER_API_KEY: belt-and-suspenders — if auxiliary tasks
+          #   use provider:auto and fall back to openrouter, this prevents
+          #   a secondary 401. (Hermes Issue #16829)
+          #
+          # TELEGRAM_HOME_CHANNEL: hermes reads this env var to set the
+          #   home channel (NOT home_chat_id in config.yaml).
           OPENAI_API_KEY: "proxy-placeholder"
+          OPENROUTER_API_KEY: "proxy-placeholder"
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
           TELEGRAM_ALLOWED_USERS: ${{ secrets.TELEGRAM_USER_ID }}
@@ -249,7 +273,10 @@ jobs:
           CEREBRAS_API_KEY_3: ${{ secrets.CEREBRAS_KEY_3 }}
           CEREBRAS_API_KEY_4: ${{ secrets.CEREBRAS_KEY_4 }}
           CEREBRAS_API_KEY_5: ${{ secrets.CEREBRAS_KEY_5 }}
+          # Both placeholder vars must be set in every step that runs hermes,
+          # including restarts in this keep-alive loop.
           OPENAI_API_KEY: "proxy-placeholder"
+          OPENROUTER_API_KEY: "proxy-placeholder"
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
           TELEGRAM_ALLOWED_USERS: ${{ secrets.TELEGRAM_USER_ID }}
@@ -275,7 +302,13 @@ jobs:
               echo "[${ELAPSED}s] Key proxy died — restarting..."
               nohup python3 scripts/hermes_key_proxy.py >> /tmp/hermes-proxy.log 2>&1 &
               PROXY_PID=$!
-              sleep 5
+              # Wait for proxy to be ready before restarting Hermes
+              for i in $(seq 1 15); do
+                sleep 1
+                curl -sf http://127.0.0.1:7860/v1/models \
+                  -H "Authorization: Bearer test" -o /dev/null 2>/dev/null \
+                  && echo "[${ELAPSED}s] Proxy back after ${i}s" && break || true
+              done
             fi
 
             # Restart hermes gateway if it died
