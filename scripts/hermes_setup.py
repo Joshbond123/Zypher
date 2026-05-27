@@ -8,39 +8,38 @@ MEMDIR = os.path.join(HD, "memories")
 WS     = os.path.join(HD, "workspace")
 SK     = os.path.join(HD, "skills")
 
+# Key-rotation proxy (started before gateway in workflow)
+PROXY_BASE_URL = "http://127.0.0.1:7860/v1"
 
-def dirs():
+# Best Cerebras model for agents on free tier: Qwen3 235B MoE (largest, best reasoning)
+PRIMARY_MODEL   = "qwen-3-235b-a22b-instruct-2507"
+FALLBACK_MODELS = ["gpt-oss-120b", "llama3.1-8b"]
+
+
+def ensure_dirs():
     for d in [HD, MEMDIR, WS, SK]:
         os.makedirs(d, exist_ok=True)
 
 
 def write_config():
-    dirs()
-    tok    = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-    uid    = os.environ.get("TELEGRAM_USER_ID", "6317345496")
-    run_id = os.environ.get("GITHUB_RUN_ID", "0")
-
-    # Use only models confirmed present in the Cerebras API
-    models = [
-        "llama3.1-8b",
-        "qwen-3-235b-a22b-instruct-2507",
-        "llama3.1-8b",
-        "qwen-3-235b-a22b-instruct-2507",
-        "llama3.1-8b",
-    ]
-    idx     = int(run_id[-1]) % len(models) if run_id and run_id[-1].isdigit() else 0
-    primary = models[idx]
+    ensure_dirs()
+    tok = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    uid = os.environ.get("TELEGRAM_USER_ID", "6317345496")
     agents_md = os.path.join(HD, "AGENTS.md")
 
-    cfg = f"""# ~/.hermes/config.yaml — Zypher Hermes Agent v0.14.0
+    # IMPORTANT: hermes reads snake_case keys from config.yaml
+    #   base_url  (not baseURL) — points to local key-rotation proxy
+    #   provider: openai       — required for OpenAI-compatible SDK path
+    #   OPENAI_API_KEY         — hermes reads this when provider=openai + custom base_url
+    cfg = f"""# ~/.hermes/config.yaml — Zypher Agent (auto-generated)
 model:
-  provider: custom
-  baseURL: https://api.cerebras.ai/v1
-  name: {primary}
+  provider: openai
+  base_url: {PROXY_BASE_URL}
+  name: {PRIMARY_MODEL}
   fallbacks:
-    - qwen-3-235b-a22b-instruct-2507
-    - llama3.1-8b
-  maxTokens: 8192
+    - {FALLBACK_MODELS[0]}
+    - {FALLBACK_MODELS[1]}
+  max_tokens: 8192
   temperature: 0.7
   streaming: true
 
@@ -61,7 +60,6 @@ gateway:
       streamMode: block
       pollingStallThresholdMs: 120000
       gateway_restart_notification: true
-      home_chat_id: "{uid}"
 
 tools:
   bash:
@@ -90,11 +88,14 @@ skills:
 """
     p = os.path.join(HD, "config.yaml")
     open(p, "w").write(cfg)
-    print(f"config.yaml written: {p}")
+    print(f"config.yaml written → {p}")
+    print(f"  model   : {PRIMARY_MODEL}")
+    print(f"  base_url: {PROXY_BASE_URL}")
+    print(f"  fallbacks: {', '.join(FALLBACK_MODELS)}")
 
 
 def write_env():
-    dirs()
+    ensure_dirs()
     tok    = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     k1     = os.environ.get("CEREBRAS_API_KEY", "")
     tav    = os.environ.get("TAVILY_API_KEY", "") or os.environ.get("TAVILY_API_KEY_2", "")
@@ -103,20 +104,27 @@ def write_env():
     gh     = os.environ.get("GITHUB_TOKEN", "")
     uid    = os.environ.get("TELEGRAM_USER_ID", "6317345496")
 
+    # OPENAI_API_KEY: hermes reads this for custom base_url + provider=openai
+    # The actual auth is done by the proxy; we just need a non-empty value here.
     env = (
         f"CEREBRAS_API_KEY={k1}\n"
+        f"OPENAI_API_KEY=proxy-placeholder\n"
+        f"TELEGRAM_HOME_CHANNEL={uid}\n"
+        f"TELEGRAM_HOME_CHANNEL_NAME=Zypher Home\n"
+        f"TELEGRAM_ALLOWED_USERS={uid}\n"
         f"TELEGRAM_BOT_TOKEN={tok}\n"
         f"TAVILY_API_KEY={tav}\n"
         f"SUPABASE_URL={sb_url}\n"
         f"SUPABASE_SERVICE_KEY={sb_key}\n"
         f"GITHUB_TOKEN={gh}\n"
-        # Critical: tells hermes gateway to allow this user without pairing
-        f"TELEGRAM_ALLOWED_USERS={uid}\n"
     )
     p = os.path.join(HD, ".env")
     open(p, "w").write(env)
     os.chmod(p, 0o600)
-    print(f"~/.hermes/.env written (TELEGRAM_ALLOWED_USERS={uid})")
+    print(f"~/.hermes/.env written")
+    print(f"  OPENAI_API_KEY     : proxy-placeholder (real auth via proxy)")
+    print(f"  TELEGRAM_HOME_CHANNEL    : {uid}")
+    print(f"  TELEGRAM_ALLOWED_USERS   : {uid}")
 
 
 if __name__ == "__main__":
@@ -125,4 +133,4 @@ if __name__ == "__main__":
         write_config()
     if cmd in ("write-env", "all"):
         write_env()
-    print("hermes_setup.py done")
+    print("hermes_setup.py complete")
