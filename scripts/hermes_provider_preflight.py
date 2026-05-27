@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""hermes_provider_preflight.py — Cerebras API + proxy validation with robust fallback."""
+"""hermes_provider_preflight.py — Cerebras API + proxy validation.
+
+Model IDs confirmed against live Cerebras public API (May 2026):
+  qwen-3-235b-a22b-instruct-2507  — non-reasoning, 131K ctx
+  llama3.1-8b                     — non-reasoning, 32K ctx
+  gpt-oss-120b                    — REASONING model (excluded from agent config)
+  zai-glm-4.7                     — REASONING model (excluded from agent config)
+"""
 import os, json, sys, time
 from urllib.request import urlopen, Request
 from urllib.error import HTTPError
@@ -9,12 +16,15 @@ PROXY_PORT   = int(os.environ.get("KEY_PROXY_PORT", "7860"))
 PROXY_BASE   = f"http://127.0.0.1:{PROXY_PORT}/v1"
 CEREBRAS_BASE = "https://api.cerebras.ai/v1"
 
-# Ordered list of models to try (most capable first)
-PREFLIGHT_MODELS = ["qwen-3-235b-a22b-instruct-2507", "llama3.3-70b", "llama3.1-8b"]
+# Confirmed non-reasoning models on Cerebras (May 2026)
+# These are the only models safe to use in Hermes (no reasoning_content blowback)
+PREFLIGHT_MODELS = [
+    "qwen-3-235b-a22b-instruct-2507",
+    "llama3.1-8b",
+]
 
 
 def list_models_direct():
-    """List models directly from Cerebras using the API key."""
     if not KEY:
         print("WARN: CEREBRAS_API_KEY not set — skipping direct API check")
         return []
@@ -36,7 +46,6 @@ def list_models_direct():
 
 
 def test_chat_direct(model):
-    """Test a chat completion directly against Cerebras."""
     if not KEY:
         return False
     payload = json.dumps({
@@ -66,13 +75,6 @@ def test_chat_direct(model):
 
 
 def test_proxy_health():
-    """
-    Verify the local key-rotation proxy is alive and correctly injects auth.
-
-    The proxy accepts requests with ANY Authorization header (or none) and
-    replaces it with a real Cerebras key before forwarding. A /v1/models
-    request through the proxy should succeed with HTTP 200.
-    """
     try:
         req = Request(
             f"{PROXY_BASE}/models",
@@ -81,7 +83,7 @@ def test_proxy_health():
         with urlopen(req, timeout=10) as r:
             data = json.loads(r.read())
             models = [m["id"] for m in data.get("data", [])]
-            print(f"Proxy health OK — models via proxy: {', '.join(models[:3])}")
+            print(f"Proxy health OK — models via proxy: {', '.join(models[:4])}")
             return True
     except Exception as e:
         print(f"WARN: proxy health check failed: {e}")
@@ -89,7 +91,6 @@ def test_proxy_health():
 
 
 def test_chat_via_proxy(model):
-    """Test a chat completion routed through the local key-rotation proxy."""
     payload = json.dumps({
         "model": model,
         "messages": [{"role": "user", "content": "hi"}],
@@ -118,10 +119,9 @@ def test_chat_via_proxy(model):
 
 def check():
     print("=" * 60)
-    print("Hermes provider preflight")
+    print("Hermes provider preflight (May 2026 model IDs)")
     print("=" * 60)
 
-    # 1. Direct Cerebras API check
     print("\n[1/2] Direct Cerebras API check...")
     models = list_models_direct()
     direct_ok = False
@@ -132,7 +132,6 @@ def check():
                     direct_ok = True
                     break
         if not direct_ok:
-            # Try first available model
             for m in models:
                 if test_chat_direct(m):
                     direct_ok = True
@@ -142,10 +141,7 @@ def check():
     else:
         print("WARN: Direct Cerebras API check failed (may be IP-restricted on GitHub Actions)")
 
-    # 2. Proxy health + end-to-end check
-    print("\n[2/2] Key-rotation proxy check (this is the critical path for Hermes)...")
-
-    # Wait a moment for proxy to be fully up if it's still starting
+    print("\n[2/2] Key-rotation proxy check (critical path for Hermes)...")
     proxy_alive = False
     for attempt in range(3):
         if test_proxy_health():
@@ -156,9 +152,6 @@ def check():
 
     if not proxy_alive:
         print("WARN: Proxy is not running — Hermes WILL fail with HTTP 401.")
-        print("      The proxy must be started before running `hermes gateway run`.")
-        # Don't exit(1) — workflow has continue-on-error; the proxy start step
-        # already does a hard-fail if the proxy never comes up.
     else:
         proxy_chat_ok = False
         for m in PREFLIGHT_MODELS:
