@@ -108,6 +108,7 @@ jobs:
         run: python3 scripts/hermes_setup.py write-env
 
       - name: Cerebras key rotation
+        continue-on-error: true
         env:
           CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_KEY_1 }}
           CEREBRAS_API_KEY_2: ${{ secrets.CEREBRAS_KEY_2 }}
@@ -117,6 +118,7 @@ jobs:
         run: python3 scripts/hermes_key_rotator.py
 
       - name: Cerebras preflight
+        continue-on-error: true
         env:
           CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_KEY_1 }}
         run: python3 scripts/hermes_provider_preflight.py
@@ -257,3 +259,4 @@ jobs:
             -H "Accept: application/vnd.github.v3+json" \
             "https://api.github.com/repos/$REPO/actions/workflows/hermes.yml/dispatches" \
             -d '{"ref":"main"}' && echo 'Next run triggered' || echo 'WARN: trigger failed'
+
