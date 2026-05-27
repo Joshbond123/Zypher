@@ -11,9 +11,17 @@ SK     = os.path.join(HD, "skills")
 # Key-rotation proxy (started before gateway in workflow)
 PROXY_BASE_URL = "http://127.0.0.1:7860/v1"
 
-# Best Cerebras model for agents on free tier: Qwen3 235B MoE (largest, best reasoning)
+# Cerebras models available on free tier (validated against /v1/models)
+# Primary: Qwen3 235B MoE — largest, best reasoning
+# Fallbacks: proven stable Cerebras model IDs
 PRIMARY_MODEL   = "qwen-3-235b-a22b-instruct-2507"
-FALLBACK_MODELS = ["gpt-oss-120b", "llama3.1-8b"]
+FALLBACK_MODELS = ["llama3.3-70b", "llama3.1-8b"]
+
+# Named custom provider — used in config.yaml custom_providers block.
+# This is the ONLY correct way to use a custom base_url in Hermes.
+# provider: openrouter / provider: openai both ignore base_url and hit
+# their hardcoded upstream endpoints (confirmed: Hermes Issue #12146).
+CUSTOM_PROVIDER_NAME = "cerebras-proxy"
 
 
 def ensure_dirs():
@@ -27,14 +35,32 @@ def write_config():
     uid = os.environ.get("TELEGRAM_USER_ID", "6317345496")
     agents_md = os.path.join(HD, "AGENTS.md")
 
-    # IMPORTANT: hermes reads snake_case keys from config.yaml
-    #   base_url  (not baseURL) — points to local key-rotation proxy
-    #   provider: openrouter       — required for OpenAI-compatible SDK path
-    #   OPENAI_API_KEY         — hermes reads this when provider=openai + custom base_url
+    # ROOT-CAUSE FIX (Hermes Issue #12146):
+    # ─────────────────────────────────────
+    # `provider: openrouter` and `provider: openai` BOTH ignore `base_url`
+    # in Hermes's PROVIDER_REGISTRY — they always route to their hardcoded
+    # upstream endpoints (openrouter.ai, api.openai.com). The local
+    # key-rotation proxy was never being called, so requests arrived at
+    # openrouter.ai with no OPENROUTER_API_KEY → HTTP 401.
+    #
+    # The correct approach is a NAMED custom provider in `custom_providers:`
+    # with `key_env` pointing to any env var that holds a non-empty value.
+    # Hermes reads `key_env` and sets Authorization: Bearer <value>.
+    # Our proxy IGNORES the incoming auth and injects a real Cerebras key,
+    # so `key_env` just needs to be non-empty — `OPENAI_API_KEY=proxy-placeholder`
+    # serves this purpose perfectly.
     cfg = f"""# ~/.hermes/config.yaml — Zypher Agent (auto-generated)
+
+# ── Named custom provider ── (THE FIX for Issue #12146 / 401 auth errors)
+# Hermes only respects base_url when a custom_providers entry is used.
+# provider: openrouter / provider: openai ignore base_url entirely.
+custom_providers:
+  - name: {CUSTOM_PROVIDER_NAME}
+    base_url: {PROXY_BASE_URL}
+    key_env: OPENAI_API_KEY
+
 model:
-  provider: openrouter
-  base_url: {PROXY_BASE_URL}
+  provider: {CUSTOM_PROVIDER_NAME}
   name: {PRIMARY_MODEL}
   fallbacks:
     - {FALLBACK_MODELS[0]}
@@ -89,8 +115,9 @@ skills:
     p = os.path.join(HD, "config.yaml")
     open(p, "w").write(cfg)
     print(f"config.yaml written → {p}")
-    print(f"  model   : {PRIMARY_MODEL}")
+    print(f"  provider: {CUSTOM_PROVIDER_NAME} (named custom provider → proxy)")
     print(f"  base_url: {PROXY_BASE_URL}")
+    print(f"  model   : {PRIMARY_MODEL}")
     print(f"  fallbacks: {', '.join(FALLBACK_MODELS)}")
 
 
@@ -104,11 +131,17 @@ def write_env():
     gh     = os.environ.get("GITHUB_TOKEN", "")
     uid    = os.environ.get("TELEGRAM_USER_ID", "6317345496")
 
-    # OPENAI_API_KEY: hermes reads this for custom base_url + provider=openai
-    # The actual auth is done by the proxy; we just need a non-empty value here.
+    # OPENAI_API_KEY  — referenced by key_env in the custom provider block.
+    #                   The proxy ignores this value and injects a real key,
+    #                   but Hermes needs a non-empty string or it won't send
+    #                   any Authorization header at all.
+    # OPENROUTER_API_KEY — belt-and-suspenders: if Hermes ever tries the
+    #                   openrouter provider as a fallback (e.g. via provider:auto
+    #                   in an auxiliary task), this prevents a second 401.
     env = (
         f"CEREBRAS_API_KEY={k1}\n"
         f"OPENAI_API_KEY=proxy-placeholder\n"
+        f"OPENROUTER_API_KEY=proxy-placeholder\n"
         f"TELEGRAM_HOME_CHANNEL={uid}\n"
         f"TELEGRAM_HOME_CHANNEL_NAME=Zypher Home\n"
         f"TELEGRAM_ALLOWED_USERS={uid}\n"
@@ -122,9 +155,10 @@ def write_env():
     open(p, "w").write(env)
     os.chmod(p, 0o600)
     print(f"~/.hermes/.env written")
-    print(f"  OPENAI_API_KEY     : proxy-placeholder (real auth via proxy)")
-    print(f"  TELEGRAM_HOME_CHANNEL    : {uid}")
-    print(f"  TELEGRAM_ALLOWED_USERS   : {uid}")
+    print(f"  OPENAI_API_KEY        : proxy-placeholder (key_env for custom provider)")
+    print(f"  OPENROUTER_API_KEY    : proxy-placeholder (auxiliary task fallback guard)")
+    print(f"  TELEGRAM_HOME_CHANNEL : {uid}")
+    print(f"  TELEGRAM_ALLOWED_USERS: {uid}")
 
 
 if __name__ == "__main__":
