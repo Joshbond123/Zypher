@@ -35,17 +35,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── PERSISTENCE FIX: restore artifact from the PREVIOUS run ─────────────
-      # actions/download-artifact@v4 without run-id only finds artifacts from
-      # the CURRENT run (none exist yet at this point). We use the GitHub CLI
-      # to list recent successful runs and download the latest memory artifact.
+      # ── PERSISTENCE: restore artifact from PREVIOUS run ─────────────────────
+      # BUGFIX: actions/download-artifact@v4 without run-id only finds artifacts
+      # from the CURRENT run (none exist yet at this point in a fresh run).
+      # We use the GitHub CLI to walk recent completed runs and download the
+      # latest available zypher-hermes-memory artifact.
       - name: Restore memory artifact from previous run
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
           mkdir -p /tmp/memory-restore
           echo "Searching for latest zypher-hermes-memory artifact..."
-          # Try the last 5 completed runs of this workflow
           RESTORED=0
           RUN_IDS=$(gh run list \
             --workflow hermes.yml \
@@ -53,12 +53,12 @@ jobs:
             --json databaseId,conclusion \
             -q '.[] | select(.conclusion == "success" or .conclusion == "cancelled" or .conclusion == "timed_out") | .databaseId' \
             2>/dev/null || echo "")
-          for RUN_ID in $RUN_IDS; do
-            if gh run download "$RUN_ID" \
+          for RUN_ID_PREV in $RUN_IDS; do
+            if gh run download "$RUN_ID_PREV" \
               --name zypher-hermes-memory \
               --dir /tmp/memory-restore \
               2>/dev/null; then
-              echo "Restored artifact from run $RUN_ID"
+              echo "Restored artifact from run $RUN_ID_PREV"
               RESTORED=1
               break
             fi
@@ -173,8 +173,17 @@ jobs:
         run: |
           mkdir -p ~/.hermes/memories ~/.hermes/skills
           python3 scripts/hermes_bootstrap_memory.py || true
-          cp AGENTS.md ~/.hermes/AGENTS.md && echo 'AGENTS.md installed'
-          echo "=== Restored memory files ==="
+
+          # BUGFIX: Install AGENTS.md as SOUL.md — NOT as AGENTS.md
+          # Hermes v0.14 auto-loads ~/.hermes/SOUL.md as slot #1 of the system prompt.
+          # No config.yaml key exists for this — it is purely file-based.
+          # Previously we installed as ~/.hermes/AGENTS.md and referenced it via
+          # agent.systemPromptFile which is NOT a valid config key (silently ignored).
+          cp AGENTS.md ~/.hermes/SOUL.md && echo 'SOUL.md installed from AGENTS.md'
+
+          echo "=== ~/.hermes/ layout ==="
+          ls -lh ~/.hermes/ 2>/dev/null || true
+          echo "=== memories ==="
           ls -lh ~/.hermes/memories/ 2>/dev/null || true
           echo "=== state.db ==="
           ls -lh ~/.hermes/state.db 2>/dev/null || echo "state.db not present (fresh start)"
@@ -216,8 +225,6 @@ jobs:
           PROXY_PID=$!
           echo "PROXY_PID=$PROXY_PID" >> $GITHUB_ENV
           echo "Proxy PID=$PROXY_PID"
-
-          # Wait up to 20 s for proxy to start accepting connections
           PROXY_READY=0
           for i in $(seq 1 20); do
             sleep 1
@@ -228,10 +235,8 @@ jobs:
               break
             fi
           done
-
           echo "=== proxy startup log ==="
           cat /tmp/hermes-proxy.log || true
-
           if [ "$PROXY_READY" -eq 0 ]; then
             echo "FATAL: key-rotation proxy did not start within 20s. Check CEREBRAS_KEY_1."
             exit 1
@@ -241,6 +246,9 @@ jobs:
       # ─── Start Hermes gateway ───────────────────────────────────────────────
       - name: Start Hermes gateway
         env:
+          # OPENAI_API_KEY: referenced by key_env: OPENAI_API_KEY in config.yaml.
+          # The proxy ignores incoming auth and injects a real Cerebras key,
+          # but Hermes requires a non-empty value or it sends no Authorization header.
           OPENAI_API_KEY: "proxy-placeholder"
           OPENROUTER_API_KEY: "proxy-placeholder"
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -258,8 +266,8 @@ jobs:
           echo "HERMES_PID=$HERMES_PID" >> $GITHUB_ENV
           echo "Hermes gateway PID=$HERMES_PID"
           sleep 35
-          echo "=== Hermes startup log (first 80 lines) ==="
-          head -80 /tmp/hermes.log || true
+          echo "=== Hermes startup log (first 100 lines) ==="
+          head -100 /tmp/hermes.log || true
 
       - name: Start pairing auto-approver
         env:
@@ -345,10 +353,10 @@ jobs:
               PAIRING_PID=$!
             fi
 
-            # Flush memory + state.db every 5 minutes
+            # Flush memory + state.db every 5 minutes (WAL-safe backup)
             [ $((ELAPSED % 300)) -eq 0 ] && {
               python3 scripts/hermes_sidecar.py --flush-memory 2>/dev/null || true
-              echo "[${ELAPSED}s] Memory + state.db flushed"
+              echo "[${ELAPSED}s] Memory + state.db flushed (WAL-safe)"
             } || true
 
             # Log tail every 10 minutes
@@ -359,7 +367,7 @@ jobs:
           done
           echo "Session rotation complete"
 
-      - name: Save memory and state (final flush)
+      - name: Save memory and state (final WAL-safe flush)
         if: always()
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -386,7 +394,9 @@ jobs:
             -d "chat_id=${TELEGRAM_USER_ID}" \
             -d "text=Zypher rotating (Run #${GITHUB_RUN_ID}). Back in seconds..." || true
 
-      # ── PERSISTENCE FIX: upload artifact with overwrite:true + state.db + skills ─
+      # ── PERSISTENCE: upload artifact with overwrite + state.db + skills ─────
+      # BUGFIX: overwrite:true prevents silent upload failure on retry runs.
+      # state.db and skills/ are included so they survive workflow rotation.
       - name: Upload memory artifact
         if: always()
         uses: actions/upload-artifact@v4
@@ -396,6 +406,7 @@ jobs:
             ~/.hermes/memories/MEMORY.md
             ~/.hermes/memories/USER.md
             ~/.hermes/state.db
+            ~/.hermes/SOUL.md
             ~/.hermes/skills/
           retention-days: 90
           if-no-files-found: warn
