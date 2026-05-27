@@ -35,12 +35,39 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Restore memory artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: zypher-hermes-memory
-          path: /tmp/memory-restore
-        continue-on-error: true
+      # ── PERSISTENCE FIX: restore artifact from the PREVIOUS run ─────────────
+      # actions/download-artifact@v4 without run-id only finds artifacts from
+      # the CURRENT run (none exist yet at this point). We use the GitHub CLI
+      # to list recent successful runs and download the latest memory artifact.
+      - name: Restore memory artifact from previous run
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          mkdir -p /tmp/memory-restore
+          echo "Searching for latest zypher-hermes-memory artifact..."
+          # Try the last 5 completed runs of this workflow
+          RESTORED=0
+          RUN_IDS=$(gh run list \
+            --workflow hermes.yml \
+            --limit 10 \
+            --json databaseId,conclusion \
+            -q '.[] | select(.conclusion == "success" or .conclusion == "cancelled" or .conclusion == "timed_out") | .databaseId' \
+            2>/dev/null || echo "")
+          for RUN_ID in $RUN_IDS; do
+            if gh run download "$RUN_ID" \
+              --name zypher-hermes-memory \
+              --dir /tmp/memory-restore \
+              2>/dev/null; then
+              echo "Restored artifact from run $RUN_ID"
+              RESTORED=1
+              break
+            fi
+          done
+          if [ "$RESTORED" -eq 0 ]; then
+            echo "No prior artifact found — fresh start"
+          fi
+          echo "=== Restored files ==="
+          ls -lh /tmp/memory-restore/ 2>/dev/null || echo "(empty)"
 
       - name: Cancel other in-progress runs
         env:
@@ -138,17 +165,21 @@ jobs:
           CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_KEY_1 }}
         run: python3 scripts/hermes_provider_preflight.py
 
-      - name: Bootstrap memory
+      - name: Bootstrap memory and state
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
-          mkdir -p ~/.hermes/memories
-          [ -f /tmp/memory-restore/MEMORY.md ] && cp /tmp/memory-restore/MEMORY.md ~/.hermes/memories/ || true
-          [ -f /tmp/memory-restore/USER.md ]   && cp /tmp/memory-restore/USER.md   ~/.hermes/memories/ || true
+          mkdir -p ~/.hermes/memories ~/.hermes/skills
           python3 scripts/hermes_bootstrap_memory.py || true
           cp AGENTS.md ~/.hermes/AGENTS.md && echo 'AGENTS.md installed'
+          echo "=== Restored memory files ==="
+          ls -lh ~/.hermes/memories/ 2>/dev/null || true
+          echo "=== state.db ==="
+          ls -lh ~/.hermes/state.db 2>/dev/null || echo "state.db not present (fresh start)"
+          echo "=== skills ==="
+          ls -lh ~/.hermes/skills/ 2>/dev/null || echo "no skills yet"
 
       - name: Reset memory
         if: github.event.inputs.reset_memory == 'true'
@@ -201,8 +232,6 @@ jobs:
           echo "=== proxy startup log ==="
           cat /tmp/hermes-proxy.log || true
 
-          # Hard-fail if proxy never came up — without the proxy, Hermes
-          # will make requests to Cerebras with no auth header (HTTP 401).
           if [ "$PROXY_READY" -eq 0 ]; then
             echo "FATAL: key-rotation proxy did not start within 20s. Check CEREBRAS_KEY_1."
             exit 1
@@ -212,20 +241,6 @@ jobs:
       # ─── Start Hermes gateway ───────────────────────────────────────────────
       - name: Start Hermes gateway
         env:
-          # AUTH FIX — why these vars are set:
-          #
-          # OPENAI_API_KEY: referenced by `key_env: OPENAI_API_KEY` in the
-          #   custom_providers block of config.yaml (hermes_setup.py).
-          #   The proxy ignores incoming auth and injects a real Cerebras key,
-          #   but Hermes needs a non-empty value here or it sends no
-          #   Authorization header at all. (Hermes Issue #12146 root cause)
-          #
-          # OPENROUTER_API_KEY: belt-and-suspenders — if auxiliary tasks
-          #   use provider:auto and fall back to openrouter, this prevents
-          #   a secondary 401. (Hermes Issue #16829)
-          #
-          # TELEGRAM_HOME_CHANNEL: hermes reads this env var to set the
-          #   home channel (NOT home_chat_id in config.yaml).
           OPENAI_API_KEY: "proxy-placeholder"
           OPENROUTER_API_KEY: "proxy-placeholder"
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -279,8 +294,6 @@ jobs:
           CEREBRAS_API_KEY_3: ${{ secrets.CEREBRAS_KEY_3 }}
           CEREBRAS_API_KEY_4: ${{ secrets.CEREBRAS_KEY_4 }}
           CEREBRAS_API_KEY_5: ${{ secrets.CEREBRAS_KEY_5 }}
-          # Both placeholder vars must be set in every step that runs hermes,
-          # including restarts in this keep-alive loop.
           OPENAI_API_KEY: "proxy-placeholder"
           OPENROUTER_API_KEY: "proxy-placeholder"
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -308,7 +321,6 @@ jobs:
               echo "[${ELAPSED}s] Key proxy died — restarting..."
               nohup python3 scripts/hermes_key_proxy.py >> /tmp/hermes-proxy.log 2>&1 &
               PROXY_PID=$!
-              # Wait for proxy to be ready before restarting Hermes
               for i in $(seq 1 15); do
                 sleep 1
                 curl -sf http://127.0.0.1:7860/v1/models \
@@ -333,10 +345,10 @@ jobs:
               PAIRING_PID=$!
             fi
 
-            # Flush memory every 5 minutes
+            # Flush memory + state.db every 5 minutes
             [ $((ELAPSED % 300)) -eq 0 ] && {
               python3 scripts/hermes_sidecar.py --flush-memory 2>/dev/null || true
-              echo "[${ELAPSED}s] Memory flushed"
+              echo "[${ELAPSED}s] Memory + state.db flushed"
             } || true
 
             # Log tail every 10 minutes
@@ -347,7 +359,7 @@ jobs:
           done
           echo "Session rotation complete"
 
-      - name: Save memory
+      - name: Save memory and state (final flush)
         if: always()
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -374,6 +386,7 @@ jobs:
             -d "chat_id=${TELEGRAM_USER_ID}" \
             -d "text=Zypher rotating (Run #${GITHUB_RUN_ID}). Back in seconds..." || true
 
+      # ── PERSISTENCE FIX: upload artifact with overwrite:true + state.db + skills ─
       - name: Upload memory artifact
         if: always()
         uses: actions/upload-artifact@v4
@@ -382,8 +395,11 @@ jobs:
           path: |
             ~/.hermes/memories/MEMORY.md
             ~/.hermes/memories/USER.md
+            ~/.hermes/state.db
+            ~/.hermes/skills/
           retention-days: 90
           if-no-files-found: warn
+          overwrite: true
 
       - name: Trigger next run (zero-gap rotation)
         if: always()
