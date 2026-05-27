@@ -8,7 +8,8 @@ def write_config():
     dirs()
     tok=os.environ.get("TELEGRAM_BOT_TOKEN","");uid=os.environ.get("TELEGRAM_USER_ID","6317345496")
     run_id=os.environ.get("GITHUB_RUN_ID","0")
-    models=["cerebras/qwen3-32b","cerebras/llama-3.3-70b","cerebras/qwen3-32b","cerebras/llama-3.3-70b","cerebras/llama3.1-8b"]
+    # Use only models confirmed present in the Cerebras API
+    models=["llama3.1-8b","qwen-3-235b-a22b-instruct-2507","llama3.1-8b","qwen-3-235b-a22b-instruct-2507","llama3.1-8b"]
     idx=int(run_id[-1])%len(models) if run_id and run_id[-1].isdigit() else 0
     primary=models[idx];agents_md=os.path.join(HD,"AGENTS.md")
     cfg=f"""# ~/.hermes/config.yaml — Zypher Hermes Agent v0.14.0
@@ -17,9 +18,8 @@ model:
   baseURL: https://api.cerebras.ai/v1
   name: {primary}
   fallbacks:
-    - cerebras/llama-3.3-70b
-    - cerebras/llama3.1-8b
-    - cerebras/qwen3-32b
+    - qwen-3-235b-a22b-instruct-2507
+    - llama3.1-8b
   maxTokens: 8192
   temperature: 0.7
   streaming: true
