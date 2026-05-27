@@ -75,6 +75,12 @@ jobs:
           RESP=$(curl -sf "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe")
           echo "$RESP" | grep -q '"ok":true' && echo 'Telegram OK' || { echo 'ERROR: invalid token'; exit 1; }
 
+      - name: Clear Telegram webhook (ensure polling mode)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          python3 scripts/telegram_webhook_fix.py
+
       - name: Install Hermes Agent
         run: pip install hermes-agent --upgrade -q
 
@@ -143,21 +149,22 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
         run: python3 scripts/setup_schema.py || true
 
-      - name: Start Hermes agent
+      - name: Start Hermes gateway
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_KEY_1 }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
           TAVILY_API_KEY: ${{ secrets.TAVILY_KEY_1 }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
-          nohup hermes start --no-interactive --telegram --config ~/.hermes/config.yaml > /tmp/hermes.log 2>&1 &
+          nohup hermes gateway run --accept-hooks > /tmp/hermes.log 2>&1 &
           HERMES_PID=$!
           echo "HERMES_PID=$HERMES_PID" >> $GITHUB_ENV
-          echo "Hermes started PID=$HERMES_PID"
+          echo "Hermes gateway started PID=$HERMES_PID"
           sleep 30
-          head -50 /tmp/hermes.log || true
+          head -60 /tmp/hermes.log || true
 
       - name: Send startup notification
         env:
@@ -180,25 +187,30 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_KEY_1 }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_KEY_1 }}
           GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
           TIMEOUT=13500
           ELAPSED=0
           INTERVAL=30
-          echo "Loop: ${TIMEOUT}s"
+          echo "Keep-alive loop: ${TIMEOUT}s max"
           while [ $ELAPSED -lt $TIMEOUT ]; do
             sleep $INTERVAL
             ELAPSED=$((ELAPSED+INTERVAL))
-            kill -0 $HERMES_PID 2>/dev/null || {
-              nohup hermes start --no-interactive --telegram --config ~/.hermes/config.yaml >> /tmp/hermes.log 2>&1 &
+            if ! kill -0 $HERMES_PID 2>/dev/null; then
+              echo "Hermes died at ${ELAPSED}s — restarting..."
+              nohup hermes gateway run --accept-hooks >> /tmp/hermes.log 2>&1 &
               HERMES_PID=$!
               echo "Restarted at ${ELAPSED}s PID=$HERMES_PID"
-              sleep 5
-            }
-            [ $((ELAPSED % 300)) -eq 0 ] && { python3 scripts/hermes_sidecar.py --flush-memory 2>/dev/null || true; echo "Flush ${ELAPSED}s"; } || true
-            [ $((ELAPSED % 600)) -eq 0 ] && tail -3 /tmp/hermes.log 2>/dev/null || true
+              sleep 10
+            fi
+            [ $((ELAPSED % 300)) -eq 0 ] && { python3 scripts/hermes_sidecar.py --flush-memory 2>/dev/null || true; echo "Memory flushed at ${ELAPSED}s"; } || true
+            [ $((ELAPSED % 600)) -eq 0 ] && tail -5 /tmp/hermes.log 2>/dev/null || true
           done
-          echo 'Rotation complete'
+          echo 'Session rotation complete'
 
       - name: Save memory
         if: always()
@@ -235,7 +247,7 @@ jobs:
           if-no-files-found: warn
 
       - name: Trigger next run
-        if: success()
+        if: always()
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
           REPO: ${{ github.repository }}
