@@ -29,11 +29,11 @@ def write_config():
 
     # IMPORTANT: hermes reads snake_case keys from config.yaml
     #   base_url  (not baseURL) — points to local key-rotation proxy
-    #   provider: openai       — required for OpenAI-compatible SDK path
+    #   provider: openrouter       — required for OpenAI-compatible SDK path
     #   OPENAI_API_KEY         — hermes reads this when provider=openai + custom base_url
     cfg = f"""# ~/.hermes/config.yaml — Zypher Agent (auto-generated)
 model:
-  provider: openai
+  provider: openrouter
   base_url: {PROXY_BASE_URL}
   name: {PRIMARY_MODEL}
   fallbacks:
