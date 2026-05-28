@@ -1,50 +1,61 @@
 #!/usr/bin/env python3
 """
-hermes_key_proxy.py — Local OpenAI-compatible proxy with key rotation + Cerebras sanitizer.
+hermes_key_proxy.py — Local OpenAI-compatible proxy with key rotation,
+                       Cerebras sanitizer, and 5xx retry logic.
 
 Listens on 127.0.0.1:7860/v1
 Forwards to https://api.cerebras.ai/v1 with per-request API key rotation.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SANITIZATION LAYER (added May 2026) — strips Cerebras-incompatible fields
+BUG HISTORY
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-ROOT CAUSE: _empty_recovery_synthetic HTTP 400
-  Hermes injects synthetic nudge messages when the model returns an empty
-  response after tool calls. These messages carry an internal Python dict
-  key `_empty_recovery_synthetic: True`. Hermes serializes this directly into
-  the JSON payload sent to Cerebras. Cerebras strict-validates every field
-  against its spec and rejects unknown properties:
-    400 "messages.18.assistant._empty_recovery_synthetic: property unsupported"
-  Fix: strip all _* prefixed fields from message objects before forwarding.
+[FIXED May 2026] HTTP 502 — three causes identified and fixed:
 
-FULL LIST of fields stripped by this proxy (confirmed against Cerebras spec):
+  CAUSE 1: Wrong primary model (zai-glm-4.7, 355B thinking model)
+    zai-glm-4.7 has "Interleaved Thinking" enabled by default — it inserts
+    reasoning tokens between every tool call. At 355B / ~1000 TPM it overloads
+    under long agent conversations and returns HTTP 502.
+    FIX: Switch primary to gpt-oss-120b (120B, 3000 TPM, no thinking mode,
+    pure OpenAI-compatible). Keep zai-glm-4.7 as fallback only.
 
-  Top-level body (Cerebras rejects these entirely):
-    store               — OpenAI request-storage flag
-    maxTokens           — camelCase variant (use max_tokens)
-    thinking            — Anthropic-style reasoning flag
-    prompt_cache_key    — Zed/Anthropic-style prompt caching
-    service_tier        — OpenAI-only routing tier
-    reasoning_effort    — model-specific, unsupported on Cerebras
-    metadata            — OpenAI-only request metadata
-    Any field starting with _
+  CAUSE 2: Proxy never retried on 5xx errors
+    The proxy previously only retried on 429 (rate limit) and skipped on
+    401/403 (auth). Any 500/502/503/504 from Cerebras was forwarded
+    straight to Hermes. Hermes retried the proxy 3× (all 502), then gave up.
+    FIX: Added 5xx retry with 2-second backoff per key, same cycle structure
+    as the 429 handler. Cerebras transient backend errors are now absorbed
+    by the proxy before Hermes ever sees them.
 
-  Message-level (Cerebras rejects these on all message roles):
-    reasoning_content   — Cerebras uses "reasoning" (str|null) instead
-    _empty_recovery_synthetic — Hermes internal nudge marker (the bug field)
-    Any field starting with _
+  CAUSE 3: thinking tokens in responses from zai-glm-4.7 (when used as fallback)
+    zai-glm-4.7 returns `reasoning` field in responses (thinking tokens).
+    This is stripped from response bodies before forwarding to Hermes so
+    Hermes never sees non-standard thinking fields.
+    FIX: strip_response_reasoning() applied to non-streaming responses.
 
-  Message content normalization:
-    assistant messages with tool_calls and content="" → content=null
-      (Cerebras requires null, not empty string, on tool-call assistant turns)
+SANITIZATION LAYER — strips Cerebras-incompatible request fields:
+
+  Top-level body fields stripped:
+    store, maxTokens, thinking, prompt_cache_key, service_tier,
+    reasoning_effort, metadata, and any field starting with _
+
+  Message-level fields stripped:
+    reasoning_content, _empty_recovery_synthetic, and any _ prefixed field
+
+  Message content normalisation:
+    assistant + tool_calls + content="" → content=null
     role="developer" → role="system"
-      (OpenAI o-series "developer" role not supported by Cerebras)
 
-RATE-LIMIT STRATEGY:
-  On HTTP 429: read Retry-After header (default 5s), wait, try next key.
-  After all keys exhausted: wait 10s for Cerebras quota reset, retry once.
-  Transient rate-limit blips are absorbed here — Hermes never sees them.
+  Thinking mode disabled for zai-glm-4.7:
+    Injects thinking: {type: disabled} so the model skips reasoning tokens
+    and returns a standard OpenAI-compatible response.
+
+RATE-LIMIT / ERROR STRATEGY:
+  429: read Retry-After (default 5s), rotate key, retry.
+  5xx: 2s backoff, rotate key, retry (up to N_KEYS times per cycle).
+  Two-cycle structure: after all keys exhausted, wait 10s for quota reset.
+  401/403: skip key (bad/revoked).
+  Network errors: skip key, log, continue.
 """
 
 import http.server
@@ -78,13 +89,8 @@ PROXY_PORT    = int(os.environ.get("KEY_PROXY_PORT", "7860"))
 
 # ── Top-level body fields Cerebras does not accept ────────────────────────────
 _BLOCKED_BODY_FIELDS = frozenset({
-    "store",
-    "maxTokens",
-    "thinking",
-    "prompt_cache_key",
-    "service_tier",
-    "reasoning_effort",
-    "metadata",
+    "store", "maxTokens", "thinking", "prompt_cache_key",
+    "service_tier", "reasoning_effort", "metadata",
 })
 
 # ── Message-level fields Cerebras does not accept ────────────────────────────
@@ -92,6 +98,12 @@ _BLOCKED_MSG_FIELDS = frozenset({
     "reasoning_content",
     "_empty_recovery_synthetic",
 })
+
+# ── HTTP status codes that should trigger retry (transient upstream errors) ───
+_RETRYABLE_5XX = frozenset({500, 502, 503, 504})
+
+# ── Model ID for zai-glm-4.7 (requires thinking mode disabled) ───────────────
+_ZAI_MODEL_ID = "zai-glm-4.7"
 
 _counter = 0
 _counter_lock = threading.Lock()
@@ -106,61 +118,37 @@ def next_key() -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SANITIZATION
+# REQUEST SANITIZATION
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _sanitize_message(msg: dict) -> dict:
-    """
-    Remove all Cerebras-incompatible fields from a single message object.
-
-    Rules applied (in order):
-      1. Strip explicitly blocked fields (_BLOCKED_MSG_FIELDS).
-      2. Strip any field whose name starts with '_' (Hermes internal markers).
-      3. If role == 'developer': replace with 'system' (Cerebras rejects 'developer').
-      4. If role == 'assistant' AND tool_calls present AND content == '':
-           set content = None  (Cerebras requires null, not empty string).
-    """
     cleaned = {}
     for k, v in msg.items():
         if k in _BLOCKED_MSG_FIELDS:
-            log.debug("  msg sanitizer: stripped message field %r", k)
+            log.debug("  msg sanitizer: stripped %r", k)
             continue
         if k.startswith("_"):
-            log.info("  msg sanitizer: stripped internal Hermes field %r from message", k)
+            log.info("  msg sanitizer: stripped internal field %r", k)
             continue
         cleaned[k] = v
 
-    # Role normalisation
     if cleaned.get("role") == "developer":
         log.info("  msg sanitizer: role 'developer' → 'system'")
         cleaned["role"] = "system"
 
-    # Tool-call content normalisation
     if (
         cleaned.get("role") == "assistant"
         and cleaned.get("tool_calls")
         and cleaned.get("content") == ""
     ):
-        log.debug("  msg sanitizer: assistant tool_calls + content='' → null")
         cleaned["content"] = None
 
     return cleaned
 
 
 def sanitize_request_body(body_bytes: bytes, path: str) -> bytes:
-    """
-    Parse the JSON request body, strip all Cerebras-incompatible fields, and
-    re-serialise.  Returns the original bytes unchanged if:
-      - the body is empty
-      - JSON parsing fails (pass through as-is, let Cerebras return the 400)
-      - no modifications were needed (avoids pointless re-serialisation)
-    """
     if not body_bytes:
         return body_bytes
-
-    # Only chat/completions calls carry message arrays worth sanitizing.
-    # For /v1/models and other GET-style calls the body is empty anyway,
-    # but we also skip non-JSON content types to be safe.
     if b'"messages"' not in body_bytes and b'"model"' not in body_bytes:
         return body_bytes
 
@@ -177,16 +165,20 @@ def sanitize_request_body(body_bytes: bytes, path: str) -> bytes:
 
     # ── 1. Strip blocked top-level body fields ────────────────────────────
     for field in list(payload.keys()):
-        if field in _BLOCKED_BODY_FIELDS:
+        if field in _BLOCKED_BODY_FIELDS or field.startswith("_"):
             del payload[field]
-            log.info("sanitizer: stripped top-level body field %r", field)
-            modified = True
-        elif field.startswith("_"):
-            del payload[field]
-            log.info("sanitizer: stripped internal top-level field %r", field)
+            log.info("sanitizer: stripped top-level field %r", field)
             modified = True
 
-    # ── 2. Sanitize each message object ───────────────────────────────────
+    # ── 2. For zai-glm-4.7: inject thinking disabled to prevent reasoning tokens ──
+    model = payload.get("model", "")
+    if _ZAI_MODEL_ID in model:
+        if "thinking" not in payload:
+            payload["thinking"] = {"type": "disabled"}
+            log.info("sanitizer: injected thinking:{type:disabled} for %s", model)
+            modified = True
+
+    # ── 3. Sanitize each message object ───────────────────────────────────
     messages = payload.get("messages")
     if isinstance(messages, list):
         sanitized_msgs = []
@@ -198,10 +190,8 @@ def sanitize_request_body(body_bytes: bytes, path: str) -> bytes:
             if cleaned != msg:
                 modified = True
                 log.info(
-                    "sanitizer: message[%d] role=%r — stripped fields: %s",
-                    i,
-                    msg.get("role", "?"),
-                    sorted(set(msg) - set(cleaned)),
+                    "sanitizer: message[%d] role=%r stripped: %s",
+                    i, msg.get("role", "?"), sorted(set(msg) - set(cleaned)),
                 )
             sanitized_msgs.append(cleaned)
         payload["messages"] = sanitized_msgs
@@ -210,26 +200,58 @@ def sanitize_request_body(body_bytes: bytes, path: str) -> bytes:
         return body_bytes
 
     result = _json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    log.info(
-        "sanitizer: body sanitized %d→%d bytes for %s",
-        len(body_bytes), len(result), path,
-    )
+    log.info("sanitizer: body sanitized %d→%d bytes for %s", len(body_bytes), len(result), path)
     return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# REQUEST EXECUTION WITH KEY ROTATION + 429 BACKOFF
+# RESPONSE SANITIZATION — strip reasoning tokens Hermes can't handle
+# ─────────────────────────────────────────────────────────────────────────────
+
+def strip_response_reasoning(body_bytes: bytes) -> bytes:
+    """
+    Remove 'reasoning' (thinking tokens) from non-streaming Cerebras responses.
+
+    zai-glm-4.7 (and other thinking models) return a 'reasoning' field inside
+    each choice's message object. Hermes v0.14 doesn't know how to handle this
+    field and may include it verbatim in subsequent requests, causing errors.
+    Strip it so Hermes always sees a standard OpenAI-compatible response.
+    """
+    if not body_bytes or b'"reasoning"' not in body_bytes:
+        return body_bytes
+    try:
+        payload = _json.loads(body_bytes)
+        if not isinstance(payload, dict):
+            return body_bytes
+        modified = False
+        for choice in payload.get("choices", []):
+            msg = choice.get("message")
+            if isinstance(msg, dict) and "reasoning" in msg:
+                del msg["reasoning"]
+                modified = True
+                log.info("response sanitizer: stripped 'reasoning' from choice message")
+        if not modified:
+            return body_bytes
+        return _json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    except Exception:
+        return body_bytes
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REQUEST EXECUTION — key rotation + 429 backoff + 5xx retry
 # ─────────────────────────────────────────────────────────────────────────────
 
 def try_request(method: str, path: str, headers: dict, body: bytes | None):
     """
-    Attempt the request with full key rotation and 429 backoff.
+    Attempt the request with full key rotation, 429 backoff, and 5xx retry.
 
-    Strategy:
-      Pass 0: try every key once; on 429 wait Retry-After then rotate.
-      Pass 1: all keys exhausted on 429 → wait 10s for quota reset, retry all.
-      401/403: skip key immediately (bad or revoked key).
-      Network errors: skip and continue.
+    Strategy per cycle (runs up to 2 cycles):
+      - 429: wait Retry-After, rotate key.
+      - 5xx (500/502/503/504): wait 2s, rotate key — transient upstream error.
+      - 401/403: skip key immediately (bad/revoked).
+      - Network error: skip key, log.
+    Cycle 0: try every key once.
+    Cycle 1: all keys exhausted → wait 10s for Cerebras quota reset, retry all.
     """
     ctx = ssl.create_default_context()
     last_err = None
@@ -237,10 +259,7 @@ def try_request(method: str, path: str, headers: dict, body: bytes | None):
 
     for cycle in range(2):
         if cycle == 1:
-            log.warning(
-                "All %d key(s) rate-limited — waiting 10s for Cerebras TPM reset...",
-                n_keys,
-            )
+            log.warning("All %d key(s) exhausted — waiting 10s for Cerebras reset...", n_keys)
             time.sleep(10)
 
         for ki in range(n_keys):
@@ -255,6 +274,7 @@ def try_request(method: str, path: str, headers: dict, body: bytes | None):
                 conn.request(method, path, body=body, headers=req_headers)
                 resp = conn.getresponse()
 
+                # ── 429 Rate limit ─────────────────────────────────────────
                 if resp.status == 429:
                     resp.read()
                     conn.close()
@@ -270,20 +290,30 @@ def try_request(method: str, path: str, headers: dict, body: bytes | None):
                     time.sleep(wait)
                     continue
 
-                if resp.status in (401, 403):
+                # ── 5xx Transient upstream error ───────────────────────────
+                if resp.status in _RETRYABLE_5XX:
+                    err_body = resp.read()[:200].decode("utf-8", errors="replace")
+                    conn.close()
                     log.warning(
-                        "Key[%d/%d] auth error HTTP %d — rotating",
-                        ki + 1, n_keys, resp.status,
+                        "Key[%d/%d] Cerebras %d — rotating key + 2s backoff: %s",
+                        ki + 1, n_keys, resp.status, err_body,
                     )
+                    time.sleep(2)
+                    continue
+
+                # ── Auth failure ────────────────────────────────────────────
+                if resp.status in (401, 403):
+                    log.warning("Key[%d/%d] auth error HTTP %d — rotating", ki + 1, n_keys, resp.status)
                     resp.read()
                     conn.close()
                     continue
 
+                # ── Success (or non-retryable error like 400/404) ──────────
                 return conn, resp
 
             except Exception as e:
                 last_err = e
-                log.warning("Upstream error key[%d/%d]: %s", ki + 1, n_keys, e)
+                log.warning("Upstream network error key[%d/%d]: %s", ki + 1, n_keys, e)
                 try:
                     conn.close()
                 except Exception:
@@ -291,8 +321,7 @@ def try_request(method: str, path: str, headers: dict, body: bytes | None):
 
     raise RuntimeError(
         f"All {n_keys} key(s) failed after retry cycle. "
-        f"Add more CEREBRAS_API_KEY_N env vars to increase capacity. "
-        f"Last error: {last_err}"
+        f"Add more CEREBRAS_API_KEY_N env vars. Last error: {last_err}"
     )
 
 
@@ -308,16 +337,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         content_length = int(self.headers.get("Content-Length", 0))
         raw_body = self.rfile.read(content_length) if content_length > 0 else None
 
-        # ── SANITIZE before forwarding ────────────────────────────────────
         body = sanitize_request_body(raw_body, self.path) if raw_body else raw_body
 
         fwd_headers = {
             "Content-Type": self.headers.get("Content-Type", "application/json"),
             "Accept":       self.headers.get("Accept", "application/json, text/event-stream"),
-            "User-Agent":   "hermes-key-proxy/1.0",
+            "User-Agent":   "hermes-key-proxy/2.0",
         }
         if body:
-            # Recalculate Content-Length after sanitization may have changed body size
             fwd_headers["Content-Length"] = str(len(body))
 
         try:
@@ -328,25 +355,47 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             return
 
         try:
+            # Read response body to apply response sanitization on non-streaming
+            is_streaming = (resp.getheader("Content-Type", "").startswith("text/event-stream"))
+
             self.send_response(resp.status)
             skip = {"transfer-encoding", "connection", "keep-alive"}
-            for h, v in resp.getheaders():
-                if h.lower() not in skip:
-                    self.send_header(h, v)
-            self.send_header("X-Key-Proxy", "cerebras-sanitizing-rotating")
-            self.end_headers()
+            resp_headers = list(resp.getheaders())
 
-            while True:
-                chunk = resp.read(4096)
-                if not chunk:
-                    break
-                try:
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError):
-                    break
+            if not is_streaming:
+                # Read full body, sanitize, then send with correct Content-Length
+                resp_body = resp.read()
+                sanitized_body = strip_response_reasoning(resp_body)
+                for h, v in resp_headers:
+                    if h.lower() in skip:
+                        continue
+                    if h.lower() == "content-length":
+                        continue  # recalculate after sanitization
+                    self.send_header(h, v)
+                self.send_header("Content-Length", str(len(sanitized_body)))
+                self.send_header("X-Key-Proxy", "cerebras-sanitizing-rotating/2.0")
+                self.end_headers()
+                self.wfile.write(sanitized_body)
+                self.wfile.flush()
+            else:
+                # Streaming: forward chunks as-is
+                for h, v in resp_headers:
+                    if h.lower() not in skip:
+                        self.send_header(h, v)
+                self.send_header("X-Key-Proxy", "cerebras-sanitizing-rotating/2.0")
+                self.end_headers()
+                while True:
+                    chunk = resp.read(4096)
+                    if not chunk:
+                        break
+                    try:
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        break
+
         except Exception as e:
-            log.warning("Streaming error: %s", e)
+            log.warning("Response handling error: %s", e)
         finally:
             conn.close()
 
@@ -364,10 +413,10 @@ def main():
     if not KEYS:
         log.error("No Cerebras API keys configured. Set CEREBRAS_API_KEY env vars.")
         sys.exit(1)
-    log.info("Key-rotation + sanitizing proxy on 127.0.0.1:%d with %d key(s)", PROXY_PORT, len(KEYS))
+    log.info("Key-rotation proxy v2.0 on 127.0.0.1:%d with %d key(s)", PROXY_PORT, len(KEYS))
     log.info("Upstream: https://%s", UPSTREAM_HOST)
-    log.info("Sanitizer: strips _empty_recovery_synthetic + reasoning_content + blocked body fields")
-    log.info("Rate-limit: Retry-After backoff per key, 10s cycle reset")
+    log.info("Sanitizer: strips reasoning_content + blocked fields + zai-glm-4.7 thinking mode")
+    log.info("Retry: 429→Retry-After, 5xx→2s backoff, both with key rotation + 10s cycle reset")
     server = http.server.ThreadingHTTPServer(("127.0.0.1", PROXY_PORT), ProxyHandler)
     server.daemon_threads = True
     server.serve_forever()
