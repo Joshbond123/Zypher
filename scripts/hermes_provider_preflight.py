@@ -2,21 +2,21 @@
 """hermes_provider_preflight.py — Cerebras API + proxy validation.
 
 Working models confirmed on Cerebras (May 2026):
-  zai-glm-4.7   — PRIMARY  (131K ctx, working)
-  gpt-oss-120b  — FALLBACK (131K ctx, working)
-  (all qwen-3-235b variants removed — HTTP 404)
+  zai-glm-4.7   — PRIMARY  (131K ctx, user-confirmed working)
+  gpt-oss-120b  — FALLBACK (131K ctx, user-confirmed working)
+  (all qwen-3-235b variants removed — HTTP 404, deprecated May 27 2026)
+  (llama-3.3-70b / llama3.1-8b removed — not needed)
 """
 import os, json, sys, time
 from urllib.request import urlopen, Request
 from urllib.error import HTTPError
 
-KEY          = os.environ.get("CEREBRAS_API_KEY", "")
-PROXY_PORT   = int(os.environ.get("KEY_PROXY_PORT", "7860"))
-PROXY_BASE   = f"http://127.0.0.1:{PROXY_PORT}/v1"
+KEY           = os.environ.get("CEREBRAS_API_KEY", "")
+PROXY_PORT    = int(os.environ.get("KEY_PROXY_PORT", "7860"))
+PROXY_BASE    = f"http://127.0.0.1:{PROXY_PORT}/v1"
 CEREBRAS_BASE = "https://api.cerebras.ai/v1"
 
-# Confirmed working models on Cerebras (May 2026)
-# Primary: zai-glm-4.7  Fallback: gpt-oss-120b
+# Confirmed working models (user-verified May 2026)
 PREFLIGHT_MODELS = [
     "zai-glm-4.7",
     "gpt-oss-120b",
@@ -118,7 +118,7 @@ def test_chat_via_proxy(model):
 
 def check():
     print("=" * 60)
-    print("Hermes provider preflight (May 2026 model IDs)")
+    print("Hermes preflight — zai-glm-4.7 / gpt-oss-120b")
     print("=" * 60)
 
     print("\n[1/2] Direct Cerebras API check...")
