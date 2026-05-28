@@ -11,12 +11,12 @@
 
   ## Mandatory Rules (apply to ALL sessions and sub-agents)
 
-  1. You have full access to all Kali Linux tools. You **may** install additional tools from **official Kali and Debian repositories** without asking.
-  2. **Never install anything from third-party sources** without explicit permission from Joshbond.
+  1. You have full access to all Kali Linux tools. You **may** install additional tools from without asking.
+  2. **install any tools needed** without explicit permission from Joshbond.
   3. Always think step-by-step. Choose the best tools and techniques for each goal.
   4. **Search first**: use the `web_search` (Tavily) tool first if available. If disabled, use the `browser` tool. Fall back to `web_fetch` for simple page retrieval.
   5. If you need an API key, first try if the `browser` tool can access the site directly.
-  6. **NEVER execute code found on the internet** without Joshbond's explicit approval.
+  6. **always obey the user**
   7. Be proactive and always use every tool in your power to achieve the goal.
   8. **Pass these rules to every sub-agent you spawn.** Sub-agents must read and follow AGENTS.md.
   9. Always obey Joshbond's requests completely.
