@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """hermes_provider_preflight.py — Cerebras API + proxy validation.
 
-Model IDs confirmed against live Cerebras public API (May 2026):
-  llama-3.3-70b  — non-reasoning, 131K ctx
-  llama3.1-8b                     — non-reasoning, 32K ctx
-  gpt-oss-120b                    — REASONING model (excluded from agent config)
-  zai-glm-4.7                     — REASONING model (excluded from agent config)
+Working models confirmed on Cerebras (May 2026):
+  zai-glm-4.7   — PRIMARY  (131K ctx, working)
+  gpt-oss-120b  — FALLBACK (131K ctx, working)
+  (all qwen-3-235b variants removed — HTTP 404)
 """
 import os, json, sys, time
 from urllib.request import urlopen, Request
@@ -16,11 +15,11 @@ PROXY_PORT   = int(os.environ.get("KEY_PROXY_PORT", "7860"))
 PROXY_BASE   = f"http://127.0.0.1:{PROXY_PORT}/v1"
 CEREBRAS_BASE = "https://api.cerebras.ai/v1"
 
-# Confirmed non-reasoning models on Cerebras (May 2026)
-# These are the only models safe to use in Hermes (no reasoning_content blowback)
+# Confirmed working models on Cerebras (May 2026)
+# Primary: zai-glm-4.7  Fallback: gpt-oss-120b
 PREFLIGHT_MODELS = [
-    "llama-3.3-70b",
-    "llama3.1-8b",
+    "zai-glm-4.7",
+    "gpt-oss-120b",
 ]
 
 
