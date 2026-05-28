@@ -394,20 +394,31 @@ jobs:
             -d "chat_id=${TELEGRAM_USER_ID}" \
             -d "text=Zypher rotating (Run #${GITHUB_RUN_ID}). Back in seconds..." || true
 
-      # ── PERSISTENCE: upload artifact with overwrite + state.db + skills ─────
-      # BUGFIX: overwrite:true prevents silent upload failure on retry runs.
-      # state.db and skills/ are included so they survive workflow rotation.
+      # ── PERSISTENCE: stage then upload artifact ──────────────────────────────
+      # ROOT CAUSE FIX (primary persistence bug):
+      #   upload-artifact@v4 preserves the full directory structure of absolute paths.
+      #   When we uploaded ~/.hermes/memories/MEMORY.md (absolute path), it was stored
+      #   inside the ZIP as home/runner/.hermes/memories/MEMORY.md.
+      #   After "gh run download --dir /tmp/memory-restore", the file landed at:
+      #     /tmp/memory-restore/home/runner/.hermes/memories/MEMORY.md
+      #   But hermes_bootstrap_memory.py looked for the flat path:
+      #     /tmp/memory-restore/MEMORY.md  <- NEVER FOUND -> always a fresh start
+      #
+      #   Fix: hermes_stage_artifact.py copies all files to /tmp/hermes-artifact/
+      #   with flat names (MEMORY.md, USER.md, state.db, SOUL.md, skills.tar.gz),
+      #   and does a WAL checkpoint on state.db after Hermes is stopped.
+      #   We upload from the flat staging dir so "gh run download" produces the flat
+      #   paths that hermes_bootstrap_memory.py already expects.
+      - name: Stage memory for artifact upload
+        if: always()
+        run: python3 scripts/hermes_stage_artifact.py || true
+
       - name: Upload memory artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: zypher-hermes-memory
-          path: |
-            ~/.hermes/memories/MEMORY.md
-            ~/.hermes/memories/USER.md
-            ~/.hermes/state.db
-            ~/.hermes/SOUL.md
-            ~/.hermes/skills/
+          path: /tmp/hermes-artifact/
           retention-days: 90
           if-no-files-found: warn
           overwrite: true
