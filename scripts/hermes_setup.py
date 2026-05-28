@@ -26,12 +26,11 @@ FULL BUG HISTORY (all issues fixed as of May 2026):
     No config.yaml key exists for this — it is purely file-based.
     FIX: Install AGENTS.md as ~/.hermes/SOUL.md in the workflow.
 
-  CONFIRMED LIVE CEREBRAS MODEL CATALOG (api.cerebras.ai/public/v1/models, May 2026):
-    ID                              ctx    reasoning  safe-for-hermes
-    llama-3.3-70b  131K   no         YES PRIMARY
-    llama3.1-8b                     32K    no         NO too small (<64K required)
-    gpt-oss-120b                    131K   yes        NO reasoning_content HTTP 400
-    zai-glm-4.7                     131K   yes        NO reasoning_content HTTP 400
+  CONFIRMED WORKING MODELS (Cerebras, May 2026):
+    ID                ctx    WORKING
+    zai-glm-4.7       131K   YES  PRIMARY
+    gpt-oss-120b      131K   YES  FALLBACK
+    (all qwen-3-235b-a22b variants removed — HTTP 404, deprecated May 27 2026)
 """
 import os, sys
 
@@ -42,8 +41,8 @@ WS     = os.path.join(HD, "workspace")
 SK     = os.path.join(HD, "skills")
 
 PROXY_BASE_URL  = "http://127.0.0.1:7860/v1"
-PRIMARY_MODEL   = "llama-3.3-70b"
-PRIMARY_CONTEXT = 128000
+PRIMARY_MODEL   = "zai-glm-4.7"
+PRIMARY_CONTEXT = 131072
 PROVIDER_NAME   = "cerebras-proxy"
 
 
@@ -90,14 +89,15 @@ def write_config():
         "    type: openai\n"
         "\n"
         "# ── PRIMARY MODEL ───────────────────────────────────────────────────────────\n"
-        "# llama-3.3-70b: only non-reasoning >=64K model on Cerebras.\n"
+        "# Primary: zai-glm-4.7 (131K ctx, confirmed working May 2026)
+        "# Fallback: gpt-oss-120b (131K ctx, confirmed working May 2026)
         "# max_tokens capped at 4096 to reduce TPM usage (Cerebras reserves max_tokens\n"
         "# against TPM quota — 16384 exhausted 60K TPM free tier in <4 seconds).\n"
         "model:\n"
         f"  provider: {PROVIDER_NAME}\n"
         f"  default: {PRIMARY_MODEL}\n"
         "  max_tokens: 4096\n"
-        f"  context_length: 128000\n"
+        f"  context_length: {PRIMARY_CONTEXT}\n"
         "  temperature: 0.7\n"
         "  streaming: true\n"
         "\n"
