@@ -2,7 +2,7 @@
 """hermes_provider_preflight.py — Cerebras API + proxy validation.
 
 Model IDs confirmed against live Cerebras public API (May 2026):
-  qwen-3-235b-a22b-instruct-2507  — non-reasoning, 131K ctx
+  qwen-3-235b-a22b  — non-reasoning, 131K ctx
   llama3.1-8b                     — non-reasoning, 32K ctx
   gpt-oss-120b                    — REASONING model (excluded from agent config)
   zai-glm-4.7                     — REASONING model (excluded from agent config)
@@ -19,7 +19,7 @@ CEREBRAS_BASE = "https://api.cerebras.ai/v1"
 # Confirmed non-reasoning models on Cerebras (May 2026)
 # These are the only models safe to use in Hermes (no reasoning_content blowback)
 PREFLIGHT_MODELS = [
-    "qwen-3-235b-a22b-instruct-2507",
+    "qwen-3-235b-a22b",
     "llama3.1-8b",
 ]
 
