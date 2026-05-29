@@ -22,6 +22,9 @@ FIXES (May 2026):
   - Corruption detection: corrupt files renamed to .corrupt, fresh db started
   - Skills restore from artifact (skills.tar.gz) and Supabase (hermes_skill_* keys)
   - Handles state.db-wal and state.db-shm cleanup after restore
+  - FIX (2026-05): Added restore_soul_md() so the agent-evolved SOUL.md survives
+    restarts. Previously SOUL.md was always overwritten with static AGENTS.md —
+    the sidecar was backing it up but nobody was reading that backup on restore.
 """
 import os,json,datetime,base64,sqlite3,shutil,glob,tarfile
 from urllib.request import urlopen,Request
@@ -33,6 +36,7 @@ HERMES_HOME=os.path.expanduser("~/.hermes")
 MEM=os.path.join(HERMES_HOME,"memories")
 STATE_DB=os.path.join(HERMES_HOME,"state.db")
 SKILLS_DIR=os.path.join(HERMES_HOME,"skills")
+SOUL_MD=os.path.join(HERMES_HOME,"SOUL.md")
 ARTIFACT_DIR="/tmp/memory-restore"
 NOW=datetime.datetime.now(datetime.timezone.utc).isoformat()
 
@@ -138,6 +142,46 @@ def restore_text(fname,key,default):
     val=sb_get_value(key)
     if val:open(path,"w").write(val);print(f"{fname}: restored from Supabase ({len(val)}c)")
     else:open(path,"w").write(default);print(f"{fname}: fresh init")
+
+def restore_soul_md():
+    """
+    Restore ~/.hermes/SOUL.md from the artifact or Supabase.
+
+    WHY THIS MATTERS (FIX 2026-05):
+      SOUL.md is the agent's evolving identity file. Hermes can update it during
+      a session with learned preferences, evolved rules, and mission context.
+      Previously nobody read the backed-up SOUL.md on restore — the workflow
+      always fell back to 'cp AGENTS.md ~/.hermes/SOUL.md', erasing every change
+      the agent had written. The sidecar diligently backed up SOUL.md to Supabase
+      (hermes_soul_md key) and hermes_stage_artifact.py staged it, but this
+      restore step was missing.
+
+      Now: if the artifact contains a SOUL.md or Supabase has 'hermes_soul_md',
+      we restore it here and the workflow's conditional cp only fires when this
+      function returns False (genuine first run with no prior SOUL.md).
+
+    Priority: artifact > already-on-disk > Supabase
+    Returns True if SOUL.md was restored, False if nothing found.
+    """
+    # 1. Artifact (flat path or recursive search)
+    artifact_path = find_in_artifact("SOUL.md")
+    if artifact_path and os.path.getsize(artifact_path) > 20:
+        shutil.copy2(artifact_path, SOUL_MD)
+        print(f"SOUL.md: restored from artifact ({os.path.getsize(SOUL_MD)}b) [{artifact_path}]")
+        return True
+    # 2. Already on disk (e.g. another step already wrote it)
+    if os.path.exists(SOUL_MD) and os.path.getsize(SOUL_MD) > 20:
+        print(f"SOUL.md: already on disk ({os.path.getsize(SOUL_MD)}b)")
+        return True
+    # 3. Supabase fallback
+    val = sb_get_value("hermes_soul_md")
+    if val:
+        with open(SOUL_MD, "w") as f:
+            f.write(val)
+        print(f"SOUL.md: restored from Supabase ({len(val)}c)")
+        return True
+    print("SOUL.md: not found in artifact or Supabase — workflow will initialize from AGENTS.md")
+    return False
 
 def restore_statedb():
     """
@@ -286,6 +330,9 @@ def main():
     print("\n--- Restoring skills ---")
     restore_skills()
 
+    print("\n--- Restoring SOUL.md ---")
+    restore_soul_md()
+
     print("\n=== Bootstrap complete ===")
     print("~/.hermes/memories/:")
     for f in os.listdir(MEM):
@@ -293,6 +340,8 @@ def main():
         print(f"  {f}: {os.path.getsize(p)}b")
     if os.path.exists(STATE_DB):
         print(f"state.db: {os.path.getsize(STATE_DB):,}b")
+    if os.path.exists(SOUL_MD):
+        print(f"SOUL.md: {os.path.getsize(SOUL_MD)}b")
     print(f"skills: {len(os.listdir(SKILLS_DIR))} file(s)")
 
 if __name__=="__main__":
