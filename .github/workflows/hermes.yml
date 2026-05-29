@@ -47,11 +47,14 @@ jobs:
           mkdir -p /tmp/memory-restore
           echo "Searching for latest zypher-hermes-memory artifact..."
           RESTORED=0
+          # BUG FIX: also include "failure" runs — artifacts are uploaded with
+          # if: always() so they exist even on failed runs. Excluding failure
+          # runs caused cascading memory loss when model errors made runs fail.
           RUN_IDS=$(gh run list \
             --workflow hermes.yml \
-            --limit 10 \
+            --limit 20 \
             --json databaseId,conclusion \
-            -q '.[] | select(.conclusion == "success" or .conclusion == "cancelled" or .conclusion == "timed_out") | .databaseId' \
+            -q '.[] | select(.conclusion == "success" or .conclusion == "cancelled" or .conclusion == "timed_out" or .conclusion == "failure") | .databaseId' \
             2>/dev/null || echo "")
           for RUN_ID_PREV in $RUN_IDS; do
             if gh run download "$RUN_ID_PREV" \
