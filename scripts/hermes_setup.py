@@ -23,6 +23,45 @@ CONFIG FORMAT NOTE (v0.15.x):
   - fallback_model section added so Hermes can auto-switch if primary fails.
   - hermes_provider_preflight.py patches model.default after startup if the
     primary model is unavailable (e.g. deprecated by Cerebras).
+
+STUCK-TASK FIXES (v2 — May 2026):
+  ROOT CAUSE 1 — gateway_notify_interval defaults to 180s (3 min):
+    Users saw zero feedback for 3+ minutes; bot appeared "stuck".
+    FIX: Explicit agent.gateway_notify_interval: 30 so users get a
+    "⏳ Working — N min — running: <tool>" heartbeat every 30 seconds.
+
+  ROOT CAUSE 2 — No agent: section → max_turns defaults to 90:
+    Complex multi-step tasks exhausted the budget silently. The agent
+    received ONE grace call to summarize then stopped, appearing stuck.
+    FIX: max_turns: 200 (enough for complex research/coding tasks).
+
+  ROOT CAUSE 3 — bash timeoutSec: 300 (5 minutes):
+    A single hung bash command blocked the entire agent loop for 5 minutes
+    with NO user feedback whatsoever.
+    FIX: Reduced to 90 seconds — most legitimate commands finish well under
+    60s; 90s gives ample room for slower network/compilation tasks.
+
+  ROOT CAUSE 4 — temperature: 0.7 too high for agentic tasks:
+    Model generated conversational text instead of tool calls, burning
+    iteration budget without making task progress.
+    FIX: temperature: 0.3 — reliable tool-use at lower entropy.
+
+  ROOT CAUSE 5 — compression: disabled → context overflow:
+    Long conversations with many tool calls filled the 131K context window,
+    causing silent API failures after many iterations.
+    FIX: compression enabled at 75% threshold.
+
+  ROOT CAUSE 6 — api_max_retries: 3 (default) — too low for flaky Cerebras:
+    On transient 5xx/network errors the agent gave up too quickly.
+    FIX: api_max_retries: 5.
+
+  ROOT CAUSE 7 — tool_use_enforcement: auto (only gpt/codex pattern match):
+    gpt-oss-120b sometimes generates plain text instead of calling tools.
+    FIX: tool_use_enforcement: true forces the injection for all models.
+
+  ROOT CAUSE 8 — gateway_timeout: 1800s (30 min inactivity kills agent):
+    Long-running tasks (browsing, coding) could be killed mid-task.
+    FIX: gateway_timeout: 7200 (2 hours inactivity limit).
 """
 import os, sys
 
@@ -78,7 +117,8 @@ def write_config():
         f"  provider: {PROVIDER_NAME}\n"
         f"  default: {PRIMARY_MODEL}\n"
         f"  context_length: {PRIMARY_CONTEXT}\n"
-        "  temperature: 0.7\n"
+        # STUCK FIX 4: temperature 0.7 → 0.3 for reliable tool use
+        "  temperature: 0.3\n"
         "  streaming: true\n"
         "\n"
         "# ── FALLBACK MODEL ──────────────────────────────────────────────────────────\n"
@@ -88,10 +128,28 @@ def write_config():
         f"  provider: {PROVIDER_NAME}\n"
         f"  model: {FALLBACK_MODEL}\n"
         "\n"
+        "# ── AGENT BEHAVIOUR ─────────────────────────────────────────────────────────\n"
+        "# STUCK FIXES: All agent timing/budget settings — see header comments above.\n"
+        "agent:\n"
+        # STUCK FIX 2: max_turns 90 (default) → 200
+        "  max_turns: 200\n"
+        # STUCK FIX 1: gateway_notify_interval 180s (default) → 30s
+        # Users see '⏳ Working — N min — running: <tool>' every 30 seconds.
+        "  gateway_notify_interval: 30\n"
+        # STUCK FIX 8: gateway_timeout 1800s (default) → 7200s (2 hours)
+        "  gateway_timeout: 7200\n"
+        # Warning fires at 1 hour of inactivity (not at 15 min default)
+        "  gateway_timeout_warning: 3600\n"
+        # STUCK FIX 6: api_max_retries 3 (default) → 5
+        "  api_max_retries: 5\n"
+        # STUCK FIX 7: force tool use enforcement for all models
+        "  tool_use_enforcement: true\n"
+        "\n"
         "# ── COMPRESSION ─────────────────────────────────────────────────────────────\n"
+        # STUCK FIX 5: enable compression to prevent context overflow on long tasks
         "compression:\n"
-        "  enabled: false\n"
-        "  threshold: 0.99\n"
+        "  enabled: true\n"
+        "  threshold: 0.75\n"
         "\n"
         "# ── MEMORY ──────────────────────────────────────────────────────────────────\n"
         "memory:\n"
@@ -115,7 +173,9 @@ def write_config():
         "tools:\n"
         "  bash:\n"
         "    enabled: true\n"
-        "    timeoutSec: 300\n"
+        # STUCK FIX 3: bash timeout 300s (5 min) → 90s to prevent hung commands
+        # from silently blocking the agent loop for 5 minutes.
+        "    timeoutSec: 90\n"
         "  web_search:\n"
         "    provider: tavily\n"
         "    enabled: true\n"
@@ -133,6 +193,13 @@ def write_config():
     print(f"  primary model      : {PRIMARY_MODEL}")
     print(f"  fallback model     : {FALLBACK_MODEL}")
     print(f"  context_length     : {PRIMARY_CONTEXT:,}")
+    print(f"  temperature        : 0.3  (was 0.7 — lowered for reliable tool use)")
+    print(f"  max_turns          : 200  (was default 90 — raised for complex tasks)")
+    print(f"  gateway_notify     : 30s  (was default 180s — faster heartbeat)")
+    print(f"  gateway_timeout    : 7200s / 2h  (was default 1800s)")
+    print(f"  compression        : enabled @ 75%  (was disabled)")
+    print(f"  bash timeoutSec    : 90   (was 300 — prevent 5-min hangs)")
+    print(f"  tool_use_enforc.   : true (was auto)")
     print(f"  memory_char_limit  : 2200")
     print(f"  user_char_limit    : 1375")
     print(f"  SOUL.md            : auto-loaded from ~/.hermes/SOUL.md")
