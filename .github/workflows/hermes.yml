@@ -30,7 +30,13 @@ concurrency:
 jobs:
   run-agent:
     runs-on: ubuntu-latest
-    timeout-minutes: 235
+    # FIX-1: Increased from 235 to 240 minutes.
+    # ROOT CAUSE: TIMEOUT=13500 (225 min) + startup overhead (~15 min) totals ~240 min
+    # which hit or exceeded the old 235-min job limit. Cleanup steps (upload-artifact
+    # etc.) were never guaranteed to run in the remaining post-cancellation grace
+    # window. Increasing to 240 and reducing TIMEOUT to 12000 (200 min) guarantees
+    # ~25 min of startup+cleanup headroom every run.
+    timeout-minutes: 240
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -162,6 +168,7 @@ jobs:
         run: |
           mkdir -p ~/.hermes/memories ~/.hermes/skills
           R="/tmp/memory-restore"
+          # Restore MEMORY.md (flat path first, then nested for old-format artifacts)
           for SRC in "$R/MEMORY.md" "$R/memories/MEMORY.md"; do
             [ -f "$SRC" ] && cp "$SRC" ~/.hermes/memories/MEMORY.md \
               && echo "restored: MEMORY.md from $SRC" && break || true
@@ -169,17 +176,29 @@ jobs:
           [ -f ~/.hermes/memories/MEMORY.md ] || \
             find "$R" -name "MEMORY.md" 2>/dev/null | head -1 | \
             xargs -I{} sh -c 'cp "{}" ~/.hermes/memories/MEMORY.md && echo "restored: MEMORY.md (search)"' 2>/dev/null || true
+          # Restore USER.md
           for SRC in "$R/USER.md" "$R/memories/USER.md"; do
             [ -f "$SRC" ] && cp "$SRC" ~/.hermes/memories/USER.md \
               && echo "restored: USER.md from $SRC" && break || true
           done
+          # Restore state.db (artifact already WAL-safe via sqlite3.backup)
           [ -f "$R/state.db" ] && cp "$R/state.db" ~/.hermes/state.db \
             && echo "restored: state.db" || echo "state.db: not in artifact"
+          # Restore skills
           [ -f "$R/skills.tar.gz" ] && \
             tar xzf "$R/skills.tar.gz" -C ~/.hermes/skills/ 2>/dev/null \
             && echo "restored: skills" || true
+          # Run Python bootstrap (WAL-safe state.db restore + Supabase fallback + SOUL.md restore)
           python3 scripts/hermes_bootstrap_memory.py || true
-          cp AGENTS.md ~/.hermes/SOUL.md && echo "SOUL.md installed from AGENTS.md"
+          # FIX-4: SOUL.md conditional — only fall back to AGENTS.md if no prior SOUL.md
+          # was restored. hermes_bootstrap_memory.py writes ~/.hermes/SOUL.md when it finds
+          # one in the artifact or Supabase; we only overwrite when nothing was found.
+          if [ ! -s ~/.hermes/SOUL.md ]; then
+            cp AGENTS.md ~/.hermes/SOUL.md
+            echo "SOUL.md: initialized from AGENTS.md (no prior SOUL.md in artifact)"
+          else
+            echo "SOUL.md: retained from artifact/Supabase ($(wc -c < ~/.hermes/SOUL.md)b)"
+          fi
           echo "=== Memory layout after bootstrap ==="
           find ~/.hermes -maxdepth 2 -type f 2>/dev/null | sort
 
@@ -204,7 +223,7 @@ jobs:
           TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
         run: python3 scripts/hermes_preapprove.py
 
-      # ─── Start key-rotation proxy BEFORE the gateway ───────────────────────
+      # ─── Start key-rotation proxy BEFORE the gateway ────────────────────────
       - name: Start Cerebras key-rotation proxy
         env:
           CEREBRAS_API_KEY:   ${{ secrets.CEREBRAS_KEY_1 }}
@@ -236,7 +255,7 @@ jobs:
           fi
           echo "Proxy health check PASSED"
 
-      # ─── Cerebras preflight AFTER proxy starts ──────────────────────────────
+      # ─── Cerebras preflight AFTER proxy starts ───────────────────────────────
       - name: Cerebras preflight (model validation + config auto-heal)
         continue-on-error: true
         env:
@@ -244,7 +263,7 @@ jobs:
           KEY_PROXY_PORT: "7860"
         run: python3 scripts/hermes_provider_preflight.py
 
-      # ─── Start Hermes gateway ───────────────────────────────────────────────
+      # ─── Start Hermes gateway ────────────────────────────────────────────────
       - name: Start Hermes gateway
         env:
           OPENAI_API_KEY: "proxy-placeholder"
@@ -258,11 +277,6 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           GITHUB_RUN_ID: ${{ github.run_id }}
-          # AUTONOMOUS EXECUTION: bypass all dangerous-command approval prompts.
-          # tools/approval.py reads HERMES_YOLO_MODE at MODULE IMPORT TIME and
-          # freezes it — must be set in the process env before gateway starts.
-          # Without this, the agent blocks on every nmap/sqlmap/curl/gobuster
-          # call waiting for /approve on Telegram, causing indefinite stalls.
           HERMES_YOLO_MODE: "1"
           HERMES_GATEWAY_SESSION: "1"
         run: |
@@ -299,7 +313,7 @@ jobs:
           echo "SIDECAR_PID=$!" >> $GITHUB_ENV
           echo "Supabase sidecar started"
 
-      # ─── Keep-alive loop ────────────────────────────────────────────────────
+      # ─── Keep-alive loop ──────────────────────────────────────────────────────
       - name: Keep agent alive
         env:
           CEREBRAS_API_KEY:   ${{ secrets.CEREBRAS_KEY_1 }}
@@ -319,13 +333,14 @@ jobs:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           GITHUB_RUN_ID: ${{ github.run_id }}
           KEY_PROXY_PORT: "7860"
-          # AUTONOMOUS EXECUTION: must be present in keep-alive env so that
-          # when Hermes is restarted inside this loop, the new process inherits
-          # HERMES_YOLO_MODE=1 and skips all approval prompts from import time.
           HERMES_YOLO_MODE: "1"
           HERMES_GATEWAY_SESSION: "1"
         run: |
-          TIMEOUT=13500
+          # FIX-1: Reduced from 13500 (225 min) to 12000 (200 min).
+          # Old value + startup overhead hit the 235-min job limit, leaving cleanup
+          # (upload-artifact) unable to run reliably. 12000 leaves ~25 min for
+          # startup + cleanup inside the new 240-min job timeout.
+          TIMEOUT=12000
           ELAPSED=0
           INTERVAL=30
           echo "Keep-alive: ${TIMEOUT}s total"
@@ -336,6 +351,9 @@ jobs:
               echo "[${ELAPSED}s] Key proxy died — restarting..."
               nohup python3 scripts/hermes_key_proxy.py >> /tmp/hermes-proxy.log 2>&1 &
               PROXY_PID=$!
+              # FIX-2: Write updated PID to GITHUB_ENV so "Stop all processes"
+              # kills the correct instance even after an in-session restart.
+              echo "PROXY_PID=$PROXY_PID" >> $GITHUB_ENV
               for i in $(seq 1 15); do
                 sleep 1
                 curl -sf http://127.0.0.1:7860/v1/models \
@@ -348,21 +366,26 @@ jobs:
               python3 scripts/hermes_preapprove.py 2>/dev/null || true
               nohup hermes gateway run --accept-hooks >> /tmp/hermes.log 2>&1 &
               HERMES_PID=$!
+              # FIX-2: Write updated PID to GITHUB_ENV so "Stop all processes"
+              # kills the correct Hermes instance after an in-session restart.
+              echo "HERMES_PID=$HERMES_PID" >> $GITHUB_ENV
               echo "[${ELAPSED}s] Hermes restarted PID=$HERMES_PID"
               sleep 10
             fi
             if ! kill -0 $PAIRING_PID 2>/dev/null; then
               nohup python3 scripts/hermes_pairing_watcher.py >> /tmp/hermes-pairing.log 2>&1 &
               PAIRING_PID=$!
+              echo "PAIRING_PID=$PAIRING_PID" >> $GITHUB_ENV
             fi
             if ! kill -0 $SIDECAR_PID 2>/dev/null; then
               echo "[${ELAPSED}s] Sidecar died — restarting..."
               nohup python3 scripts/hermes_sidecar.py >> /tmp/hermes-sidecar.log 2>&1 &
               SIDECAR_PID=$!
+              echo "SIDECAR_PID=$SIDECAR_PID" >> $GITHUB_ENV
             fi
             [ $((ELAPSED % 300)) -eq 0 ] && {
               python3 scripts/hermes_sidecar.py --flush-memory 2>/dev/null || true
-              echo "[${ELAPSED}s] Memory + state.db flushed"
+              echo "[${ELAPSED}s] Memory + state.db flushed to Supabase"
             } || true
             [ $((ELAPSED % 600)) -eq 0 ] && {
               echo "=== hermes.log tail ===" && tail -5 /tmp/hermes.log 2>/dev/null || true
@@ -371,27 +394,45 @@ jobs:
           done
           echo "Session rotation complete"
 
-      - name: Save memory and state (final WAL-safe flush)
+      # FIX-3: "Stop all processes" now runs BEFORE "Save memory and state".
+      # Previously the Supabase flush ran while Hermes was still active. Any
+      # writes between the flush and the eventual kill were lost from Supabase.
+      # Killing first ensures the flush captures the fully-settled post-kill state.
+      - name: Stop all processes
+        if: always()
+        run: |
+          # Primary kill by PID (GITHUB_ENV — updated on restart by FIX-2)
+          kill -TERM $HERMES_PID  2>/dev/null || true
+          kill -TERM $PROXY_PID   2>/dev/null || true
+          kill -TERM $PAIRING_PID 2>/dev/null || true
+          kill -TERM $SIDECAR_PID 2>/dev/null || true
+          # FIX-2: Belt-and-suspenders kill by process name — catches any instances
+          # whose updated PID was not yet persisted to GITHUB_ENV before the job
+          # was cancelled or timed out.
+          pkill -TERM -f "hermes gateway run"        2>/dev/null || true
+          pkill -TERM -f "hermes_key_proxy.py"       2>/dev/null || true
+          pkill -TERM -f "hermes_pairing_watcher.py" 2>/dev/null || true
+          pkill -TERM -f "hermes_sidecar.py"         2>/dev/null || true
+          # Wait up to 20s for Hermes to exit cleanly (allows SQLite to flush WAL)
+          for i in $(seq 1 20); do
+            sleep 1
+            { kill -0 $HERMES_PID 2>/dev/null || pgrep -f "hermes gateway run" > /dev/null 2>&1; } \
+              || { echo "Hermes exited after ${i}s"; break; }
+          done
+          # Force-kill anything still running
+          kill -KILL $HERMES_PID 2>/dev/null || true
+          pkill -KILL -f "hermes gateway run" 2>/dev/null || true
+          echo "Process cleanup complete"
+
+      # FIX-3 (continued): Flush AFTER kill — Supabase now gets the fully-settled
+      # post-kill state of all memory files and state.db.
+      - name: Save memory and state (final WAL-safe flush to Supabase)
         if: always()
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           GITHUB_RUN_ID: ${{ github.run_id }}
         run: python3 scripts/hermes_sidecar.py --flush-memory 2>/dev/null || true
-
-      - name: Stop all processes
-        if: always()
-        run: |
-          kill -TERM $HERMES_PID  2>/dev/null || true
-          kill -TERM $PROXY_PID   2>/dev/null || true
-          kill -TERM $PAIRING_PID 2>/dev/null || true
-          kill -TERM $SIDECAR_PID 2>/dev/null || true
-          for i in $(seq 1 20); do
-            sleep 1
-            kill -0 $HERMES_PID 2>/dev/null || { echo "Hermes exited after ${i}s"; break; }
-          done
-          kill -KILL $HERMES_PID 2>/dev/null || true
-          echo "Process cleanup complete"
 
       - name: Send rotation notification
         if: always()
