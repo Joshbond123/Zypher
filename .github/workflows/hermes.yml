@@ -426,37 +426,19 @@ jobs:
       - name: Stage memory for artifact upload
         if: always()
         run: |
-          mkdir -p /tmp/hermes-artifact
-          # Flat copy — avoids upload-artifact@v4 nested-path structure bug
-          cp ~/.hermes/memories/MEMORY.md /tmp/hermes-artifact/MEMORY.md 2>/dev/null \
-            && echo "staged: MEMORY.md" || echo "SKIP: MEMORY.md"
-          cp ~/.hermes/memories/USER.md   /tmp/hermes-artifact/USER.md   2>/dev/null \
-            && echo "staged: USER.md"   || echo "SKIP: USER.md"
-          cp ~/.hermes/SOUL.md            /tmp/hermes-artifact/SOUL.md   2>/dev/null \
-            && echo "staged: SOUL.md"   || echo "SKIP: SOUL.md"
-          # WAL-safe state.db
-          if [ -f ~/.hermes/state.db ]; then
-            python3 - <<'PYEOF'
-import sqlite3, shutil, os
-db = os.path.expanduser("~/.hermes/state.db")
-try:
-    con = sqlite3.connect(db, timeout=10)
-    con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    con.close()
-    print("WAL checkpoint: OK")
-except Exception as e:
-    print(f"WAL checkpoint warning: {e}")
-shutil.copy2(db, "/tmp/hermes-artifact/state.db")
-print("staged: state.db")
-PYEOF
+          # Python script handles WAL checkpoint + flat copy (indentation fixed)
+          python3 scripts/hermes_stage_artifact.py && STAGED=1 || STAGED=0
+          # Shell fallback if Python script fails
+          if [ "$STAGED" -eq 0 ]; then
+            mkdir -p /tmp/hermes-artifact
+            cp ~/.hermes/memories/MEMORY.md /tmp/hermes-artifact/MEMORY.md 2>/dev/null || true
+            cp ~/.hermes/memories/USER.md   /tmp/hermes-artifact/USER.md   2>/dev/null || true
+            cp ~/.hermes/SOUL.md            /tmp/hermes-artifact/SOUL.md   2>/dev/null || true
+            [ -f ~/.hermes/state.db ] && cp ~/.hermes/state.db /tmp/hermes-artifact/state.db || true
+            echo 'Shell fallback staging used'
           fi
-          # Pack skills
-          if [ -d ~/.hermes/skills ] && [ -n "$(ls -A ~/.hermes/skills 2>/dev/null)" ]; then
-            tar czf /tmp/hermes-artifact/skills.tar.gz -C ~/.hermes/skills . \
-              && echo "staged: skills.tar.gz" || true
-          fi
-          echo "=== Staged files ==="
-          ls -lh /tmp/hermes-artifact/ 2>/dev/null || echo "(nothing staged — check above errors)"
+          echo '=== Staged files ==='
+          ls -lh /tmp/hermes-artifact/ 2>/dev/null || echo '(nothing staged)'
 
       - name: Upload memory artifact
         if: always()
