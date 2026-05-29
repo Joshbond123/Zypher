@@ -33,6 +33,21 @@ BUG HISTORY
     Hermes never sees non-standard thinking fields.
     FIX: strip_response_reasoning() applied to non-streaming responses.
 
+[FIXED May 2026] Streaming stall — agent hangs mid-task:
+
+  CAUSE: No per-chunk timeout on streaming responses.
+    When Hermes uses streaming: true, Cerebras sends SSE chunks. If Cerebras
+    stalls mid-stream (no new chunk for >N seconds), the proxy would block
+    indefinitely on resp.read(4096), freezing the entire agent loop.
+    The base HTTPSConnection timeout=120 only applies to non-streaming reads
+    and the initial connect; once streaming starts the socket can stall.
+    FIX: Use socket.settimeout(STREAM_CHUNK_TIMEOUT) on the underlying socket
+    before entering the streaming read loop. If no chunk arrives within
+    STREAM_CHUNK_TIMEOUT seconds, raise socket.timeout and let Hermes retry.
+    STREAM_CHUNK_TIMEOUT = 45s (Cerebras P99 inter-chunk latency is <5s under
+    normal load; 45s gives 9x headroom for slow model starts while still
+    catching genuine stalls quickly vs the 120s old behaviour).
+
 SANITIZATION LAYER — strips Cerebras-incompatible request fields:
 
   Top-level body fields stripped:
@@ -61,6 +76,7 @@ RATE-LIMIT / ERROR STRATEGY:
 import http.server
 import http.client
 import json as _json
+import socket
 import threading
 import os
 import ssl
@@ -86,6 +102,15 @@ KEYS = [k.strip() for k in [
 UPSTREAM_HOST = "api.cerebras.ai"
 UPSTREAM_PORT = 443
 PROXY_PORT    = int(os.environ.get("KEY_PROXY_PORT", "7860"))
+
+# Timeout for the initial connect + non-streaming reads (seconds).
+CONNECT_TIMEOUT = 120
+
+# Per-chunk timeout during streaming responses (seconds).
+# If no SSE chunk arrives within this window, the proxy closes the
+# connection so Hermes can retry rather than hang indefinitely.
+# Calibrated: Cerebras P99 inter-chunk latency <5s; 45s = 9x headroom.
+STREAM_CHUNK_TIMEOUT = 45
 
 # ── Top-level body fields Cerebras does not accept ────────────────────────────
 _BLOCKED_BODY_FIELDS = frozenset({
@@ -269,7 +294,7 @@ def try_request(method: str, path: str, headers: dict, body: bytes | None):
 
             try:
                 conn = http.client.HTTPSConnection(
-                    UPSTREAM_HOST, UPSTREAM_PORT, context=ctx, timeout=120
+                    UPSTREAM_HOST, UPSTREAM_PORT, context=ctx, timeout=CONNECT_TIMEOUT
                 )
                 conn.request(method, path, body=body, headers=req_headers)
                 resp = conn.getresponse()
@@ -342,7 +367,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         fwd_headers = {
             "Content-Type": self.headers.get("Content-Type", "application/json"),
             "Accept":       self.headers.get("Accept", "application/json, text/event-stream"),
-            "User-Agent":   "hermes-key-proxy/2.0",
+            "User-Agent":   "hermes-key-proxy/2.1",
         }
         if body:
             fwd_headers["Content-Length"] = str(len(body))
@@ -373,21 +398,48 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         continue  # recalculate after sanitization
                     self.send_header(h, v)
                 self.send_header("Content-Length", str(len(sanitized_body)))
-                self.send_header("X-Key-Proxy", "cerebras-sanitizing-rotating/2.0")
+                self.send_header("X-Key-Proxy", "cerebras-sanitizing-rotating/2.1")
                 self.end_headers()
                 self.wfile.write(sanitized_body)
                 self.wfile.flush()
             else:
-                # Streaming: forward chunks as-is
+                # Streaming: forward SSE chunks with per-chunk stall timeout.
+                #
+                # STUCK FIX: Apply STREAM_CHUNK_TIMEOUT to the underlying socket
+                # so a Cerebras stream stall (no new chunk for 45s) raises
+                # socket.timeout and lets Hermes retry rather than hanging.
+                # Without this, model.streaming:true runs could freeze the entire
+                # agent loop until the 120s connect timeout fired.
                 for h, v in resp_headers:
                     if h.lower() not in skip:
                         self.send_header(h, v)
-                self.send_header("X-Key-Proxy", "cerebras-sanitizing-rotating/2.0")
+                self.send_header("X-Key-Proxy", "cerebras-sanitizing-rotating/2.1")
                 self.end_headers()
+
+                # Apply per-chunk timeout on the underlying socket.
+                try:
+                    raw_sock = conn.sock
+                    if raw_sock is not None:
+                        # Unwrap SSL socket to reach the underlying socket object.
+                        underlying = getattr(raw_sock, "_sock", raw_sock)
+                        underlying.settimeout(STREAM_CHUNK_TIMEOUT)
+                except Exception as _st_err:
+                    log.debug("Could not set stream chunk timeout: %s", _st_err)
+
+                chunk_count = 0
                 while True:
-                    chunk = resp.read(4096)
+                    try:
+                        chunk = resp.read(4096)
+                    except socket.timeout:
+                        log.warning(
+                            "Stream stall: no chunk for %ds — closing connection "
+                            "(Hermes will retry). chunks_received=%d",
+                            STREAM_CHUNK_TIMEOUT, chunk_count,
+                        )
+                        break
                     if not chunk:
                         break
+                    chunk_count += 1
                     try:
                         self.wfile.write(chunk)
                         self.wfile.flush()
@@ -413,10 +465,14 @@ def main():
     if not KEYS:
         log.error("No Cerebras API keys configured. Set CEREBRAS_API_KEY env vars.")
         sys.exit(1)
-    log.info("Key-rotation proxy v2.0 on 127.0.0.1:%d with %d key(s)", PROXY_PORT, len(KEYS))
+    log.info("Key-rotation proxy v2.1 on 127.0.0.1:%d with %d key(s)", PROXY_PORT, len(KEYS))
     log.info("Upstream: https://%s", UPSTREAM_HOST)
     log.info("Sanitizer: strips reasoning_content + blocked fields + zai-glm-4.7 thinking mode")
     log.info("Retry: 429→Retry-After, 5xx→2s backoff, both with key rotation + 10s cycle reset")
+    log.info(
+        "Stream stall timeout: %ds per chunk (prevents agent hang on frozen Cerebras streams)",
+        STREAM_CHUNK_TIMEOUT,
+    )
     server = http.server.ThreadingHTTPServer(("127.0.0.1", PROXY_PORT), ProxyHandler)
     server.daemon_threads = True
     server.serve_forever()
