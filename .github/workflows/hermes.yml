@@ -67,7 +67,7 @@ jobs:
             echo "No prior artifact found — fresh start"
           fi
           echo "=== Restored files ==="
-          ls -lh /tmp/memory-restore/ 2>/dev/null || echo "(empty)"
+          find /tmp/memory-restore -type f 2>/dev/null | sort || echo "(empty)"
 
       - name: Cancel other in-progress runs
         env:
@@ -172,23 +172,37 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
           mkdir -p ~/.hermes/memories ~/.hermes/skills
+          R="/tmp/memory-restore"
+
+          # ── Shell-level restore: handles flat (new) AND nested (old) artifact layouts ──
+          for SRC in "$R/MEMORY.md" "$R/memories/MEMORY.md"; do
+            [ -f "$SRC" ] && cp "$SRC" ~/.hermes/memories/MEMORY.md \
+              && echo "restored: MEMORY.md from $SRC" && break || true
+          done
+          [ -f ~/.hermes/memories/MEMORY.md ] || \
+            find "$R" -name "MEMORY.md" 2>/dev/null | head -1 | \
+            xargs -I{} sh -c 'cp "{}" ~/.hermes/memories/MEMORY.md && echo "restored: MEMORY.md (search)"' 2>/dev/null || true
+
+          for SRC in "$R/USER.md" "$R/memories/USER.md"; do
+            [ -f "$SRC" ] && cp "$SRC" ~/.hermes/memories/USER.md \
+              && echo "restored: USER.md from $SRC" && break || true
+          done
+
+          [ -f "$R/state.db" ] && cp "$R/state.db" ~/.hermes/state.db \
+            && echo "restored: state.db" || echo "state.db: not in artifact"
+
+          [ -f "$R/skills.tar.gz" ] && \
+            tar xzf "$R/skills.tar.gz" -C ~/.hermes/skills/ 2>/dev/null \
+            && echo "restored: skills" || true
+
+          # Python bootstrap — Supabase fallback enrichment
           python3 scripts/hermes_bootstrap_memory.py || true
 
-          # BUGFIX: Install AGENTS.md as SOUL.md — NOT as AGENTS.md
-          # Hermes v0.14 auto-loads ~/.hermes/SOUL.md as slot #1 of the system prompt.
-          # No config.yaml key exists for this — it is purely file-based.
-          # Previously we installed as ~/.hermes/AGENTS.md and referenced it via
-          # agent.systemPromptFile which is NOT a valid config key (silently ignored).
-          cp AGENTS.md ~/.hermes/SOUL.md && echo 'SOUL.md installed from AGENTS.md'
+          # Always install SOUL.md from AGENTS.md (authoritative identity)
+          cp AGENTS.md ~/.hermes/SOUL.md && echo "SOUL.md installed from AGENTS.md"
 
-          echo "=== ~/.hermes/ layout ==="
-          ls -lh ~/.hermes/ 2>/dev/null || true
-          echo "=== memories ==="
-          ls -lh ~/.hermes/memories/ 2>/dev/null || true
-          echo "=== state.db ==="
-          ls -lh ~/.hermes/state.db 2>/dev/null || echo "state.db not present (fresh start)"
-          echo "=== skills ==="
-          ls -lh ~/.hermes/skills/ 2>/dev/null || echo "no skills yet"
+          echo "=== Memory layout after bootstrap ==="
+          find ~/.hermes -maxdepth 2 -type f 2>/dev/null | sort
 
       - name: Reset memory
         if: github.event.inputs.reset_memory == 'true'
@@ -411,7 +425,38 @@ jobs:
       #   paths that hermes_bootstrap_memory.py already expects.
       - name: Stage memory for artifact upload
         if: always()
-        run: python3 scripts/hermes_stage_artifact.py || true
+        run: |
+          mkdir -p /tmp/hermes-artifact
+          # Flat copy — avoids upload-artifact@v4 nested-path structure bug
+          cp ~/.hermes/memories/MEMORY.md /tmp/hermes-artifact/MEMORY.md 2>/dev/null \
+            && echo "staged: MEMORY.md" || echo "SKIP: MEMORY.md"
+          cp ~/.hermes/memories/USER.md   /tmp/hermes-artifact/USER.md   2>/dev/null \
+            && echo "staged: USER.md"   || echo "SKIP: USER.md"
+          cp ~/.hermes/SOUL.md            /tmp/hermes-artifact/SOUL.md   2>/dev/null \
+            && echo "staged: SOUL.md"   || echo "SKIP: SOUL.md"
+          # WAL-safe state.db
+          if [ -f ~/.hermes/state.db ]; then
+            python3 - <<'PYEOF'
+import sqlite3, shutil, os
+db = os.path.expanduser("~/.hermes/state.db")
+try:
+    con = sqlite3.connect(db, timeout=10)
+    con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    con.close()
+    print("WAL checkpoint: OK")
+except Exception as e:
+    print(f"WAL checkpoint warning: {e}")
+shutil.copy2(db, "/tmp/hermes-artifact/state.db")
+print("staged: state.db")
+PYEOF
+          fi
+          # Pack skills
+          if [ -d ~/.hermes/skills ] && [ -n "$(ls -A ~/.hermes/skills 2>/dev/null)" ]; then
+            tar czf /tmp/hermes-artifact/skills.tar.gz -C ~/.hermes/skills . \
+              && echo "staged: skills.tar.gz" || true
+          fi
+          echo "=== Staged files ==="
+          ls -lh /tmp/hermes-artifact/ 2>/dev/null || echo "(nothing staged — check above errors)"
 
       - name: Upload memory artifact
         if: always()
