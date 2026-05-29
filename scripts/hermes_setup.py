@@ -1,215 +1,291 @@
 #!/usr/bin/env python3
-  """hermes_setup.py — Write Hermes config.yaml and .env from environment variables.
+"""hermes_setup.py — Write Hermes config.yaml and .env from environment variables.
 
-  MODEL HISTORY:
-    REMOVED: qwen-3-235b-a22b-instruct-2507 — deprecated May 27 2026 (HTTP 404)
-    REMOVED: qwen-3-235b-a22b              — also HTTP 404
-    REMOVED: zai-glm-4.7 as PRIMARY         — 355B thinking model, HTTP 502 under load
-    REMOVED: zai-glm-4.7 as FALLBACK        — also unreliable under fallback load
-      Root cause: zai-glm-4.7 has "Interleaved Thinking" by default. At 355B / ~1000 TPM
-      it overloads during long agent conversations. Even with thinking disabled, it returns
-      502 under fallback load — making it worse than the primary failure it's recovering from.
+MODEL HISTORY:
+  REMOVED: qwen-3-235b-a22b-instruct-2507 — deprecated May 27 2026 (HTTP 404)
+  REMOVED: qwen-3-235b-a22b              — also HTTP 404
+  REMOVED: zai-glm-4.7 as PRIMARY         — 355B thinking model, HTTP 502 under load
+  REMOVED: zai-glm-4.7 as FALLBACK        — also unreliable under fallback load
 
-    PRIMARY:  gpt-oss-120b  (120B, ~3000 TPM, pure OpenAI-compatible, no thinking mode)
-      Used in official Cerebras agent cookbook examples. 3x more throughput than zai-glm-4.7.
-      Standard OpenAI chat completion responses — Hermes v0.15 compatible.
+  PRIMARY:  gpt-oss-120b  (120B, ~3000 TPM, pure OpenAI-compatible, no thinking mode)
+  FALLBACK: llama3.3-70b  (70B, reliable, no thinking mode, well-tested)
 
-    FALLBACK: llama3.3-70b  (70B, reliable, no thinking mode, well-tested)
-      Replaces zai-glm-4.7. Smaller, faster, proven stable as a Cerebras fallback.
+STREAMING FIX (May 2026):
+  ROOT CAUSE: streaming:true → Hermes opens SSE connections → Cerebras stalls → 120s wait
+  FIX 1: streaming:false under model: (requests full JSON, no SSE)
+  FIX 2: providers.cerebras-proxy.request_timeout_seconds:60 — Hermes kills stalled
+         requests at the provider level after 60s. This is the definitive fix using
+         the official Hermes hermes_cli/timeouts.py per-provider timeout API.
+  FIX 3: pollingStallThresholdMs REMOVED from Telegram config
+  FIX 4: fallback changed from zai-glm-4.7 (355B, 502s under load) to llama3.3-70b
 
-  STREAMING FIX (May 2026) — ROOT CAUSE of "waiting for stream response (120s, no chunks yet)":
-    CAUSE: streaming: true caused Hermes to open SSE connections and wait for chunks.
-      Hermes's pollingStallThresholdMs (120s) fired when Cerebras stalled the stream.
-      The proxy's 45s per-chunk socket timeout did not reliably fire through the SSL layer,
-      so Hermes waited the full 120s before declaring failure.
-      After 120s: primary failed → switched to zai-glm-4.7 → zai-glm-4.7 also 502d
-      → "The model provider failed after retries." x3
-    FIX: streaming: false — Hermes requests full JSON responses (no SSE).
-      The proxy reads the complete Cerebras response with a simple CONNECT_TIMEOUT=60.
-      If Cerebras stalls, the timeout fires cleanly in 60s. No SSE, no chunk stalls.
-      Also removed pollingStallThresholdMs from Telegram config (source of 120s message).
+WORKFLOW YAML FIX (May 2026):
+  BUG: on:/concurrency:/jobs: had 2-space leading indentation — invalid GitHub Actions YAML.
+  This caused every push-triggered run to fail instantly with no jobs and conclusion=failure.
+  FIX: All top-level YAML keys moved to column 0.
+"""
+import os, sys
 
-  STUCK-TASK FIXES (v2 — May 2026):
-    ROOT CAUSE 1 — gateway_notify_interval defaults to 180s:
-      FIX: 30s heartbeat so users see activity every 30 seconds.
-    ROOT CAUSE 2 — max_turns defaults to 90:
-      FIX: max_turns: 200 for complex multi-step tasks.
-    ROOT CAUSE 3 — bash timeoutSec: 300:
-      FIX: 60 seconds — fast recovery from hung commands.
-    ROOT CAUSE 4 — temperature: 0.7:
-      FIX: 0.3 for reliable tool-use behavior.
-    ROOT CAUSE 5 — compression disabled:
-      FIX: enabled at 75% to prevent context overflow.
-    ROOT CAUSE 6 — api_max_retries: 3:
-      FIX: 7 — more headroom for transient Cerebras errors.
-    ROOT CAUSE 7 — tool_use_enforcement: auto:
-      FIX: true — forces tool injection for all models.
-    ROOT CAUSE 8 — gateway_timeout: 1800s:
-      FIX: 7200s (2 hours inactivity limit).
-  """
-  import os, sys
+HOME   = os.path.expanduser("~")
+HD     = os.path.join(HOME, ".hermes")
+MEMDIR = os.path.join(HD, "memories")
+WS     = os.path.join(HD, "workspace")
+SK     = os.path.join(HD, "skills")
 
-  HOME   = os.path.expanduser("~")
-  HD     = os.path.join(HOME, ".hermes")
-  MEMDIR = os.path.join(HD, "memories")
-  WS     = os.path.join(HD, "workspace")
-  SK     = os.path.join(HD, "skills")
-
-  PROXY_BASE_URL  = "http://127.0.0.1:7860/v1"
-  PRIMARY_MODEL   = "gpt-oss-120b"
-  PRIMARY_CONTEXT = 131072
-  PROVIDER_NAME   = "cerebras-proxy"
-  FALLBACK_MODEL  = "llama3.3-70b"
+PROXY_BASE_URL  = "http://127.0.0.1:7860/v1"
+PRIMARY_MODEL   = "gpt-oss-120b"
+PRIMARY_CONTEXT = 131072
+PROVIDER_NAME   = "cerebras-proxy"
+FALLBACK_MODEL  = "llama3.3-70b"
+# Provider-level request timeout (seconds). Hermes reads this from config via
+# hermes_cli/timeouts.py get_provider_request_timeout(). Kills stalled requests
+# (streaming or non-streaming) after this many seconds — definitive fix for
+# the "waiting for stream response (120s, no chunks yet)" error.
+PROVIDER_TIMEOUT = 60
 
 
-  def ensure_dirs():
-      for d in [HD, MEMDIR, WS, SK]:
-          os.makedirs(d, exist_ok=True)
+def ensure_dirs():
+    for d in [HD, MEMDIR, WS, SK]:
+        os.makedirs(d, exist_ok=True)
 
 
-  def write_config():
-      ensure_dirs()
-      tok = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+def write_config():
+    ensure_dirs()
+    tok = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 
-      cfg = (
-          "# ~/.hermes/config.yaml — Zypher Agent (auto-generated by hermes_setup.py)\n"
-          "# Hermes v0.15.x\n"
-          "#\n"
-          "# PRIMARY:  gpt-oss-120b  (120B, 3000 TPM, pure OpenAI-compatible)\n"
-          "# FALLBACK: llama3.3-70b  (70B, reliable, replaces zai-glm-4.7)\n"
-          "# STREAMING: false — prevents SSE stalls (root cause of 120s hangs)\n"
-          "\n"
-          "# ── AGENT IDENTITY ──────────────────────────────────────────────────────────\n"
-          "name: Zypher\n"
-          "\n"
-          "# ── PROVIDER ────────────────────────────────────────────────────────────────\n"
-          "providers:\n"
-          f"  {PROVIDER_NAME}:\n"
-          f"    base_url: {PROXY_BASE_URL}\n"
-          "    key_env: OPENAI_API_KEY\n"
-          f"    context_length: {PRIMARY_CONTEXT}\n"
-          "\n"
-          "# ── PRIMARY MODEL ───────────────────────────────────────────────────────────\n"
-          "# gpt-oss-120b: 120B params, ~3000 TPM, pure OpenAI-compatible, no thinking.\n"
-          "# hermes_provider_preflight.py will override model.default if this 404s.\n"
-          "model:\n"
-          f"  provider: {PROVIDER_NAME}\n"
-          f"  default: {PRIMARY_MODEL}\n"
-          f"  context_length: {PRIMARY_CONTEXT}\n"
-          "  temperature: 0.3\n"
-          "  # STREAMING FIX: false eliminates SSE stalls (root cause of 120s no-chunk errors).\n"
-          "  # Non-streaming: proxy reads full JSON response; CONNECT_TIMEOUT=60 handles stalls.\n"
-          "  streaming: false\n"
-          "\n"
-          "# ── FALLBACK MODEL ──────────────────────────────────────────────────────────\n"
-          "# llama3.3-70b: 70B, no thinking mode, proven reliable on Cerebras.\n"
-          "# Replaced zai-glm-4.7 (355B thinking model that 502'd under fallback load).\n"
-          "fallback_model:\n"
-          f"  provider: {PROVIDER_NAME}\n"
-          f"  model: {FALLBACK_MODEL}\n"
-          "\n"
-          "# ── AGENT BEHAVIOUR ─────────────────────────────────────────────────────────\n"
-          "agent:\n"
-          "  max_turns: 200\n"
-          "  gateway_notify_interval: 30\n"
-          "  gateway_timeout: 7200\n"
-          "  gateway_timeout_warning: 3600\n"
-          "  api_max_retries: 7\n"
-          "  tool_use_enforcement: true\n"
-          "\n"
-          "# ── COMPRESSION ─────────────────────────────────────────────────────────────\n"
-          "compression:\n"
-          "  enabled: true\n"
-          "  threshold: 0.75\n"
-          "\n"
-          "# ── MEMORY ──────────────────────────────────────────────────────────────────\n"
-          "memory:\n"
-          "  memory_enabled: true\n"
-          "  user_profile_enabled: true\n"
-          "  memory_char_limit: 2200\n"
-          "  user_char_limit: 1375\n"
-          "\n"
-          "# ── GATEWAY ─────────────────────────────────────────────────────────────────\n"
-          "gateway:\n"
-          "  platforms:\n"
-          "    telegram:\n"
-          "      enabled: true\n"
-          f'      botToken: "{tok}"\n'
-          "      dmPolicy: open\n"
-          "      streamMode: block\n"
-          "      # pollingStallThresholdMs REMOVED — was 120000 (= the 120s in error messages).\n"
-          "      # With streaming: false this setting is irrelevant and caused confusing logs.\n"
-          "      gateway_restart_notification: true\n"
-          "\n"
-          "# ── TOOLS ───────────────────────────────────────────────────────────────────\n"
-          "tools:\n"
-          "  bash:\n"
-          "    enabled: true\n"
-          "    timeoutSec: 60\n"
-          "  web_search:\n"
-          "    provider: tavily\n"
-          "    enabled: true\n"
-          "  web_fetch:\n"
-          "    enabled: true\n"
-          "    maxChars: 60000\n"
-          "  browser:\n"
-          "    enabled: true\n"
-          "    headless: true\n"
-          "    executablePath: /usr/bin/google-chrome-stable\n"
-      )
-      p = os.path.join(HD, "config.yaml")
-      open(p, "w").write(cfg)
-      print(f"config.yaml written -> {p}")
-      print(f"  primary model      : {PRIMARY_MODEL}")
-      print(f"  fallback model     : {FALLBACK_MODEL} (was zai-glm-4.7 — now reliable llama3.3-70b)")
-      print(f"  context_length     : {PRIMARY_CONTEXT:,}")
-      print(f"  streaming          : false  (FIXED — eliminates 120s SSE stall errors)")
-      print(f"  temperature        : 0.3")
-      print(f"  max_turns          : 200")
-      print(f"  gateway_notify     : 30s")
-      print(f"  gateway_timeout    : 7200s / 2h")
-      print(f"  compression        : enabled @ 75%")
-      print(f"  bash timeoutSec    : 60s")
-      print(f"  api_max_retries    : 7")
-      print(f"  tool_use_enforc.   : true")
-      print(f"  pollingStallThresh : REMOVED (was source of 120s error message)")
+    cfg = (
+        "# ~/.hermes/config.yaml — Zypher Agent (auto-generated by hermes_setup.py)
+"
+        "# Hermes v0.15.x
+"
+        "#
+"
+        "# PRIMARY:  gpt-oss-120b  (120B, 3000 TPM, pure OpenAI-compatible)
+"
+        "# FALLBACK: llama3.3-70b  (70B, reliable, replaces zai-glm-4.7)
+"
+        "# TIMEOUT:  60s per request (provider-level, kills SSE stalls)
+"
+        "
+"
+        "# ── AGENT IDENTITY ──────────────────────────────────────────────────────────
+"
+        "name: Zypher
+"
+        "
+"
+        "# ── PROVIDER (with per-provider timeout) ───────────────────────────────────
+"
+        "# providers.<id>.request_timeout_seconds is read by hermes_cli/timeouts.py
+"
+        "# get_provider_request_timeout() and applied to ALL requests (streaming +
+"
+        "# non-streaming). This kills Cerebras SSE stalls after 60s regardless of
+"
+        "# whether model.streaming:false is respected by this Hermes version.
+"
+        "providers:
+"
+        f"  {PROVIDER_NAME}:
+"
+        f"    base_url: {PROXY_BASE_URL}
+"
+        "    key_env: OPENAI_API_KEY
+"
+        f"    context_length: {PRIMARY_CONTEXT}
+"
+        f"    request_timeout_seconds: {PROVIDER_TIMEOUT}
+"
+        f"    stale_timeout_seconds: {PROVIDER_TIMEOUT}
+"
+        "
+"
+        "# ── PRIMARY MODEL ───────────────────────────────────────────────────────────
+"
+        "model:
+"
+        f"  provider: {PROVIDER_NAME}
+"
+        f"  default: {PRIMARY_MODEL}
+"
+        f"  context_length: {PRIMARY_CONTEXT}
+"
+        "  temperature: 0.3
+"
+        "  # streaming:false requests full JSON instead of SSE (eliminates 120s stalls)
+"
+        "  streaming: false
+"
+        "
+"
+        "# ── FALLBACK MODEL ──────────────────────────────────────────────────────────
+"
+        "# llama3.3-70b: 70B, no thinking mode, proven reliable on Cerebras.
+"
+        "# Replaced zai-glm-4.7 (355B thinking model that 502d under fallback load).
+"
+        "fallback_model:
+"
+        f"  provider: {PROVIDER_NAME}
+"
+        f"  model: {FALLBACK_MODEL}
+"
+        "
+"
+        "# ── AGENT BEHAVIOUR ─────────────────────────────────────────────────────────
+"
+        "agent:
+"
+        "  max_turns: 200
+"
+        "  gateway_notify_interval: 30
+"
+        "  gateway_timeout: 7200
+"
+        "  gateway_timeout_warning: 3600
+"
+        "  api_max_retries: 7
+"
+        "  tool_use_enforcement: true
+"
+        "
+"
+        "# ── COMPRESSION ─────────────────────────────────────────────────────────────
+"
+        "compression:
+"
+        "  enabled: true
+"
+        "  threshold: 0.75
+"
+        "
+"
+        "# ── MEMORY ──────────────────────────────────────────────────────────────────
+"
+        "memory:
+"
+        "  memory_enabled: true
+"
+        "  user_profile_enabled: true
+"
+        "  memory_char_limit: 2200
+"
+        "  user_char_limit: 1375
+"
+        "
+"
+        "# ── GATEWAY ─────────────────────────────────────────────────────────────────
+"
+        "gateway:
+"
+        "  platforms:
+"
+        "    telegram:
+"
+        "      enabled: true
+"
+        f'      botToken: "{tok}"
+'
+        "      dmPolicy: open
+"
+        "      streamMode: block
+"
+        "      # pollingStallThresholdMs REMOVED (was 120000 — source of the 120s msg)
+"
+        "      gateway_restart_notification: true
+"
+        "
+"
+        "# ── TOOLS ───────────────────────────────────────────────────────────────────
+"
+        "tools:
+"
+        "  bash:
+"
+        "    enabled: true
+"
+        "    timeoutSec: 60
+"
+        "  web_search:
+"
+        "    provider: tavily
+"
+        "    enabled: true
+"
+        "  web_fetch:
+"
+        "    enabled: true
+"
+        "    maxChars: 60000
+"
+        "  browser:
+"
+        "    enabled: true
+"
+        "    headless: true
+"
+        "    executablePath: /usr/bin/google-chrome-stable
+"
+    )
+    p = os.path.join(HD, "config.yaml")
+    open(p, "w").write(cfg)
+    print(f"config.yaml written -> {p}")
+    print(f"  primary model      : {PRIMARY_MODEL}")
+    print(f"  fallback model     : {FALLBACK_MODEL}")
+    print(f"  context_length     : {PRIMARY_CONTEXT:,}")
+    print(f"  streaming          : false (eliminates SSE stalls)")
+    print(f"  request_timeout    : {PROVIDER_TIMEOUT}s (provider-level — kills SSE stalls)")
+    print(f"  stale_timeout      : {PROVIDER_TIMEOUT}s (non-streaming stale detection)")
+    print(f"  temperature        : 0.3")
+    print(f"  max_turns          : 200")
+    print(f"  gateway_notify     : 30s")
+    print(f"  api_max_retries    : 7")
+    print(f"  pollingStallThresh : REMOVED")
 
 
-  def write_env():
-      ensure_dirs()
-      tok    = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-      k1     = os.environ.get("CEREBRAS_API_KEY", "")
-      tav    = os.environ.get("TAVILY_API_KEY", "") or os.environ.get("TAVILY_API_KEY_2", "")
-      sb_url = os.environ.get("SUPABASE_URL", "")
-      sb_key = os.environ.get("SUPABASE_SERVICE_KEY", "")
-      gh     = os.environ.get("GITHUB_TOKEN", "")
-      uid    = os.environ.get("TELEGRAM_USER_ID", "6317345496")
-      env = (
-          f"CEREBRAS_API_KEY={k1}\n"
-          "OPENAI_API_KEY=proxy-placeholder\n"
-          "OPENROUTER_API_KEY=proxy-placeholder\n"
-          f"TELEGRAM_HOME_CHANNEL={uid}\n"
-          "TELEGRAM_HOME_CHANNEL_NAME=Zypher Home\n"
-          f"TELEGRAM_ALLOWED_USERS={uid}\n"
-          f"TELEGRAM_BOT_TOKEN={tok}\n"
-          f"TAVILY_API_KEY={tav}\n"
-          f"SUPABASE_URL={sb_url}\n"
-          f"SUPABASE_SERVICE_KEY={sb_key}\n"
-          f"GITHUB_TOKEN={gh}\n"
-      )
-      p = os.path.join(HD, ".env")
-      open(p, "w").write(env)
-      os.chmod(p, 0o600)
-      print("~/.hermes/.env written")
-      print(f"  TELEGRAM_HOME_CHANNEL  : {uid}")
-      print(f"  TELEGRAM_ALLOWED_USERS : {uid}")
+def write_env():
+    ensure_dirs()
+    tok    = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    k1     = os.environ.get("CEREBRAS_API_KEY", "")
+    tav    = os.environ.get("TAVILY_API_KEY", "") or os.environ.get("TAVILY_API_KEY_2", "")
+    sb_url = os.environ.get("SUPABASE_URL", "")
+    sb_key = os.environ.get("SUPABASE_SERVICE_KEY", "")
+    gh     = os.environ.get("GITHUB_TOKEN", "")
+    uid    = os.environ.get("TELEGRAM_USER_ID", "6317345496")
+    env = (
+        f"CEREBRAS_API_KEY={k1}
+"
+        "OPENAI_API_KEY=proxy-placeholder
+"
+        "OPENROUTER_API_KEY=proxy-placeholder
+"
+        f"TELEGRAM_HOME_CHANNEL={uid}
+"
+        "TELEGRAM_HOME_CHANNEL_NAME=Zypher Home
+"
+        f"TELEGRAM_ALLOWED_USERS={uid}
+"
+        f"TELEGRAM_BOT_TOKEN={tok}
+"
+        f"TAVILY_API_KEY={tav}
+"
+        f"SUPABASE_URL={sb_url}
+"
+        f"SUPABASE_SERVICE_KEY={sb_key}
+"
+        f"GITHUB_TOKEN={gh}
+"
+    )
+    p = os.path.join(HD, ".env")
+    open(p, "w").write(env)
+    os.chmod(p, 0o600)
+    print("~/.hermes/.env written")
 
 
-  if __name__ == "__main__":
-      cmd = sys.argv[1] if len(sys.argv) > 1 else "all"
-      if cmd in ("write-config", "all"):
-          write_config()
-      if cmd in ("write-env", "all"):
-          write_env()
-      print("hermes_setup.py complete")
-  
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "all"
+    if cmd in ("write-config", "all"):
+        write_config()
+    if cmd in ("write-env", "all"):
+        write_env()
+    print("hermes_setup.py complete")
