@@ -258,6 +258,13 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           GITHUB_RUN_ID: ${{ github.run_id }}
+          # AUTONOMOUS EXECUTION: bypass all dangerous-command approval prompts.
+          # tools/approval.py reads HERMES_YOLO_MODE at MODULE IMPORT TIME and
+          # freezes it — must be set in the process env before gateway starts.
+          # Without this, the agent blocks on every nmap/sqlmap/curl/gobuster
+          # call waiting for /approve on Telegram, causing indefinite stalls.
+          HERMES_YOLO_MODE: "1"
+          HERMES_GATEWAY_SESSION: "1"
         run: |
           nohup hermes gateway run --accept-hooks > /tmp/hermes.log 2>&1 &
           HERMES_PID=$!
@@ -312,6 +319,11 @@ jobs:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           GITHUB_RUN_ID: ${{ github.run_id }}
           KEY_PROXY_PORT: "7860"
+          # AUTONOMOUS EXECUTION: must be present in keep-alive env so that
+          # when Hermes is restarted inside this loop, the new process inherits
+          # HERMES_YOLO_MODE=1 and skips all approval prompts from import time.
+          HERMES_YOLO_MODE: "1"
+          HERMES_GATEWAY_SESSION: "1"
         run: |
           TIMEOUT=13500
           ELAPSED=0
