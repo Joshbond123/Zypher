@@ -367,6 +367,14 @@ jobs:
               PAIRING_PID=$!
             fi
 
+            # Restart Supabase sidecar if it died (memory backups stop if sidecar exits)
+            if ! kill -0 $SIDECAR_PID 2>/dev/null; then
+              echo "[${ELAPSED}s] Sidecar died -- restarting..."
+              nohup python3 scripts/hermes_sidecar.py >> /tmp/hermes-sidecar.log 2>&1 &
+              SIDECAR_PID=$!
+              echo "[${ELAPSED}s] Sidecar restarted PID=$SIDECAR_PID"
+            fi
+
             # Flush memory + state.db every 5 minutes (WAL-safe backup)
             [ $((ELAPSED % 300)) -eq 0 ] && {
               python3 scripts/hermes_sidecar.py --flush-memory 2>/dev/null || true
@@ -392,10 +400,21 @@ jobs:
       - name: Stop all processes
         if: always()
         run: |
+          # Send SIGTERM to all processes
           kill -TERM $HERMES_PID  2>/dev/null || true
           kill -TERM $PROXY_PID   2>/dev/null || true
           kill -TERM $PAIRING_PID 2>/dev/null || true
           kill -TERM $SIDECAR_PID 2>/dev/null || true
+          # Wait for Hermes to fully exit before WAL staging.
+          # Stage script uses sqlite3.backup() (safe while DB open),
+          # but waiting ensures the cleanest possible snapshot.
+          for i in $(seq 1 20); do
+            sleep 1
+            kill -0 $HERMES_PID 2>/dev/null || { echo "Hermes exited after ${i}s"; break; }
+          done
+          # Force-kill if still alive after 20s
+          kill -KILL $HERMES_PID 2>/dev/null || true
+          echo "Process cleanup complete"
 
       - name: Send rotation notification
         if: always()
