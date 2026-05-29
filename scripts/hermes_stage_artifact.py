@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
-"""hermes_stage_artifact.py — Stage Hermes memory files for artifact upload.
+"""hermes_stage_artifact.py -- Stage Hermes memory files for artifact upload.
 
 ROOT CAUSE FIX (primary persistence bug):
-  actions/upload-artifact@v4 preserves the full directory structure of absolute
-  paths inside the artifact ZIP. When uploaded with:
-    ~/.hermes/memories/MEMORY.md  ->  stored as  home/runner/.hermes/memories/MEMORY.md
-  After "gh run download --dir /tmp/memory-restore", files land at:
-    /tmp/memory-restore/home/runner/.hermes/memories/MEMORY.md
+  upload-artifact@v4 preserves the full directory structure of absolute paths.
+  When uploaded as ~/.hermes/memories/MEMORY.md it is stored inside the ZIP as
+  home/runner/.hermes/memories/MEMORY.md. After download to /tmp/memory-restore,
+  the file lands at /tmp/memory-restore/home/runner/.hermes/memories/MEMORY.md.
+  But hermes_bootstrap_memory.py looks for the FLAT path /tmp/memory-restore/MEMORY.md
+  and never finds it. Fix: stage files to /tmp/hermes-artifact/ with flat names.
 
-  BUT hermes_bootstrap_memory.py expects flat paths:
-    /tmp/memory-restore/MEMORY.md  <-- NEVER FOUND
+WAL SAFETY FIX (race condition -- v2):
+  Original code used PRAGMA wal_checkpoint(TRUNCATE) which requires exclusive
+  access and fails (returns busy>0) if Hermes has not fully exited yet.
+  When busy>0, WAL frames are NOT checkpointed but we removed the WAL files,
+  causing data loss of everything written since the last checkpoint.
 
-  Fix: Copy all files to /tmp/hermes-artifact/ with flat names BEFORE upload.
-  hermes_bootstrap_memory.py already expects flat paths — no changes needed there.
-
-Additional fixes applied here:
-  - WAL checkpoint on state.db AFTER Hermes is killed (safe, exclusive access)
-  - Skills directory packed into skills.tar.gz for artifact transport
-  - SOUL.md backed up (though always re-written from AGENTS.md on startup)
-  - Graceful handling of missing files (non-fatal)
+  Fix: use sqlite3.backup() API (same as hermes_sidecar.py):
+  - Safe to call while another process has the database open
+  - Uses SQLite Online Backup API -- reads a consistent WAL snapshot
+  - Does NOT require exclusive locks
+  - Produces a clean self-contained database file (no -wal dependency)
+  This eliminates the race condition between kill -TERM and WAL staging.
 """
 import os, sys, shutil, sqlite3, tarfile, glob
 from datetime import datetime, timezone
@@ -38,32 +40,68 @@ print(f"  source: {HERMES_HOME}")
 print(f"  dest  : {STAGING_DIR}")
 
 
-def checkpoint_wal(db_path):
+def stage_statedb(db_path, dst_name):
     """
-    Checkpoint WAL into the main database file after Hermes is stopped.
-    Since the process is dead, we can safely open in read-write mode and
-    run PRAGMA wal_checkpoint(TRUNCATE) to flush all WAL transactions and
-    truncate the WAL file.  This ensures state.db is a self-contained file
-    with no outstanding -wal dependency.
+    Stage state.db using sqlite3.backup() -- WAL-safe online backup.
+
+    WHY sqlite3.backup() INSTEAD OF wal_checkpoint(TRUNCATE):
+      TRUNCATE requires that no readers are using the WAL file. If Hermes is
+      still shutting down (SIGTERM received but not yet exited), it still has
+      the database open. TRUNCATE then returns busy>0 meaning some WAL frames
+      were NOT flushed. We removed the WAL files, losing that data.
+
+      sqlite3.backup() uses the SQLite Online Backup API:
+      - Works safely while another process has the database open
+      - Reads a consistent snapshot including all WAL data
+      - Produces a clean self-contained file with no -wal dependency
+      Identical approach to hermes_sidecar.py Supabase backups.
     """
     if not os.path.exists(db_path):
-        print("  state.db: not present — skipping WAL checkpoint")
+        print(f"  SKIP {dst_name}: source not found ({db_path})")
         return False
+    if os.path.getsize(db_path) == 0:
+        print(f"  SKIP {dst_name}: source is empty")
+        return False
+
+    dst = os.path.join(STAGING_DIR, dst_name)
+    tmp = dst + ".tmp"
     try:
-        con = sqlite3.connect(db_path, timeout=20)
-        con.execute("PRAGMA journal_mode=WAL")
-        mode, size, ckpt = con.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-        con.close()
-        print(f"  state.db: WAL checkpoint OK (mode={mode} size={size} ckpt={ckpt})")
-        # Remove residual WAL/SHM files so the artifact is self-contained
-        for ext in ("-wal", "-shm"):
-            p = db_path + ext
-            if os.path.exists(p):
-                os.remove(p)
-                print(f"  state.db: removed {os.path.basename(p)}")
+        # WAL-safe online backup -- safe even if Hermes is still open
+        src_con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=30)
+        dst_con = sqlite3.connect(tmp)
+        with dst_con:
+            src_con.backup(dst_con, pages=0)  # pages=0 = entire DB in one step
+        src_con.close()
+        dst_con.close()
+
+        # Verify integrity of the backup copy
+        chk = sqlite3.connect(f"file:{tmp}?mode=ro", uri=True, timeout=5)
+        res = chk.execute("PRAGMA integrity_check").fetchone()
+        chk.close()
+
+        if res and res[0] == "ok":
+            if os.path.exists(dst):
+                os.remove(dst)
+            os.rename(tmp, dst)
+            size = os.path.getsize(dst)
+            print(f"  STAGED {dst_name}: {size:,} bytes (WAL-safe backup, integrity OK)")
+            return True
+        else:
+            print(f"  WARN {dst_name}: backup integrity check failed ({res}) -- falling back to direct copy")
+            try: os.remove(tmp)
+            except Exception: pass
+    except Exception as e:
+        print(f"  WARN {dst_name} sqlite3.backup() failed: {e} -- falling back to direct copy")
+        try: os.remove(tmp)
+        except Exception: pass
+
+    # Fallback: direct copy (less safe but better than nothing)
+    try:
+        shutil.copy2(db_path, dst)
+        print(f"  STAGED {dst_name}: {os.path.getsize(dst):,} bytes (direct copy fallback)")
         return True
     except Exception as e:
-        print(f"  WARN state.db WAL checkpoint: {e}")
+        print(f"  FAIL {dst_name}: {e}")
         return False
 
 
@@ -108,7 +146,7 @@ def write_manifest():
     """Write a small manifest so we can verify artifact integrity on restore."""
     staged = os.listdir(STAGING_DIR)
     manifest_lines = [
-        f"# Hermes artifact manifest",
+        "# Hermes artifact manifest",
         f"# Staged: {now}",
         f"# Files: {len(staged)}",
     ]
@@ -117,25 +155,24 @@ def write_manifest():
         manifest_lines.append(f"{f}: {os.path.getsize(p)} bytes")
     p = os.path.join(STAGING_DIR, "manifest.txt")
     open(p, "w").write("\n".join(manifest_lines) + "\n")
-    print(f"  STAGED manifest.txt")
+    print("  STAGED manifest.txt")
 
 
-# ── Step 1: WAL checkpoint (Hermes must be stopped first) ──────────────────
-print("\n[1/4] WAL checkpoint...")
-checkpoint_wal(STATE_DB)
+# -- Step 1: Stage state.db via WAL-safe sqlite3.backup() -------------------
+print("\n[1/4] Staging state.db (WAL-safe backup)...")
+stage_statedb(STATE_DB, "state.db")
 
-# ── Step 2: Copy flat files ─────────────────────────────────────────────────
+# -- Step 2: Copy flat text files -------------------------------------------
 print("\n[2/4] Staging files...")
 safe_copy(os.path.join(MEM_DIR, "MEMORY.md"), "MEMORY.md")
 safe_copy(os.path.join(MEM_DIR, "USER.md"),   "USER.md")
-safe_copy(STATE_DB,                            "state.db")
 safe_copy(SOUL_MD,                             "SOUL.md")
 
-# ── Step 3: Pack skills ──────────────────────────────────────────────────────
+# -- Step 3: Pack skills -----------------------------------------------------
 print("\n[3/4] Packing skills...")
 pack_skills()
 
-# ── Step 4: Write manifest ───────────────────────────────────────────────────
+# -- Step 4: Write manifest --------------------------------------------------
 print("\n[4/4] Writing manifest...")
 write_manifest()
 
