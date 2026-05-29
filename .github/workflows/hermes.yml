@@ -1,485 +1,473 @@
 name: Zypher Hermes Agent
 
-on:
-  push:
-    branches:
-      - main
-    paths-ignore:
-      - "**.md"
-      - "frontend/**"
-  workflow_dispatch:
-    inputs:
-      instance_number:
-        description: 'Instance number'
-        required: false
-        default: '1'
-      reset_memory:
-        description: 'Reset memory'
-        required: false
-        default: 'false'
-        type: choice
-        options:
-          - 'false'
-          - 'true'
-  schedule:
-    - cron: '0 */4 * * *'
+  on:
+    push:
+      branches:
+        - main
+      paths-ignore:
+        - "**.md"
+        - "frontend/**"
+    workflow_dispatch:
+      inputs:
+        instance_number:
+          description: 'Instance number'
+          required: false
+          default: '1'
+        reset_memory:
+          description: 'Reset memory'
+          required: false
+          default: 'false'
+          type: choice
+          options:
+            - 'false'
+            - 'true'
+    schedule:
+      - cron: '0 */4 * * *'
 
-concurrency:
-  group: zypher-singleton
+  concurrency:
+    group: zypher-singleton
 
-jobs:
-  run-agent:
-    runs-on: ubuntu-latest
-    timeout-minutes: 235
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+  jobs:
+    run-agent:
+      runs-on: ubuntu-latest
+      timeout-minutes: 235
+      steps:
+        - name: Checkout repository
+          uses: actions/checkout@v4
 
-      # ── PERSISTENCE: restore artifact from PREVIOUS run ─────────────────────
-      # BUGFIX: actions/download-artifact@v4 without run-id only finds artifacts
-      # from the CURRENT run (none exist yet at this point in a fresh run).
-      # We use the GitHub CLI to walk recent completed runs and download the
-      # latest available zypher-hermes-memory artifact.
-      - name: Restore memory artifact from previous run
-        env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
-        run: |
-          mkdir -p /tmp/memory-restore
-          echo "Searching for latest zypher-hermes-memory artifact..."
-          RESTORED=0
-          # BUG FIX: also include "failure" runs — artifacts are uploaded with
-          # if: always() so they exist even on failed runs. Excluding failure
-          # runs caused cascading memory loss when model errors made runs fail.
-          RUN_IDS=$(gh run list \
-            --workflow hermes.yml \
-            --limit 20 \
-            --json databaseId,conclusion \
-            -q '.[] | select(.conclusion == "success" or .conclusion == "cancelled" or .conclusion == "timed_out" or .conclusion == "failure") | .databaseId' \
-            2>/dev/null || echo "")
-          for RUN_ID_PREV in $RUN_IDS; do
-            if gh run download "$RUN_ID_PREV" \
-              --name zypher-hermes-memory \
-              --dir /tmp/memory-restore \
-              2>/dev/null; then
-              echo "Restored artifact from run $RUN_ID_PREV"
-              RESTORED=1
-              break
+        # ── PERSISTENCE: restore artifact from PREVIOUS run ─────────────────────
+        # BUGFIX: actions/download-artifact@v4 without run-id only finds artifacts
+        # from the CURRENT run (none exist yet at this point in a fresh run).
+        # We use the GitHub CLI to walk recent completed runs and download the
+        # latest available zypher-hermes-memory artifact.
+        - name: Restore memory artifact from previous run
+          env:
+            GH_TOKEN: ${{ secrets.GH_PAT }}
+          run: |
+            mkdir -p /tmp/memory-restore
+            echo "Searching for latest zypher-hermes-memory artifact..."
+            RESTORED=0
+            # BUG FIX: also include "failure" runs — artifacts are uploaded with
+            # if: always() so they exist even on failed runs. Excluding failure
+            # runs caused cascading memory loss when model errors made runs fail.
+            RUN_IDS=$(gh run list \
+              --workflow hermes.yml \
+              --limit 20 \
+              --json databaseId,conclusion \
+              -q '.[] | select(.conclusion == "success" or .conclusion == "cancelled" or .conclusion == "timed_out" or .conclusion == "failure") | .databaseId' \
+              2>/dev/null || echo "")
+            for RUN_ID_PREV in $RUN_IDS; do
+              if gh run download "$RUN_ID_PREV" \
+                --name zypher-hermes-memory \
+                --dir /tmp/memory-restore \
+                2>/dev/null; then
+                echo "Restored artifact from run $RUN_ID_PREV"
+                RESTORED=1
+                break
+              fi
+            done
+            if [ "$RESTORED" -eq 0 ]; then
+              echo "No prior artifact found — fresh start"
             fi
-          done
-          if [ "$RESTORED" -eq 0 ]; then
-            echo "No prior artifact found — fresh start"
-          fi
-          echo "=== Restored files ==="
-          find /tmp/memory-restore -type f 2>/dev/null | sort || echo "(empty)"
+            echo "=== Restored files ==="
+            find /tmp/memory-restore -type f 2>/dev/null | sort || echo "(empty)"
 
-      - name: Cancel other in-progress runs
-        env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
-          THIS_RUN: ${{ github.run_id }}
-          REPO: ${{ github.repository }}
-        run: |
-          RUNS=$(curl -sf -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/$REPO/actions/runs?status=in_progress&per_page=20" \
-            | jq -r --arg T "$THIS_RUN" '.workflow_runs[]|select(.id|tostring!=$T)|.id' 2>/dev/null || true)
-          for RID in $RUNS; do
-            curl -sf -X POST -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github.v3+json" \
-              "https://api.github.com/repos/$REPO/actions/runs/$RID/cancel" && echo "Cancelled $RID" || true
-          done
-          echo "Cancel step done"
+        - name: Cancel other in-progress runs
+          env:
+            GH_TOKEN: ${{ secrets.GH_PAT }}
+            THIS_RUN: ${{ github.run_id }}
+            REPO: ${{ github.repository }}
+          run: |
+            RUNS=$(curl -sf -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/$REPO/actions/runs?status=in_progress&per_page=20" \
+              | jq -r --arg T "$THIS_RUN" '.workflow_runs[]|select(.id|tostring!=$T)|.id' 2>/dev/null || true)
+            for RID in $RUNS; do
+              curl -sf -X POST -H "Authorization: token $GH_TOKEN" -H "Accept: application/vnd.github.v3+json" \
+                "https://api.github.com/repos/$REPO/actions/runs/$RID/cancel" && echo "Cancelled $RID" || true
+            done
+            echo "Cancel step done"
 
-      - name: Setup Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+        - name: Setup Python 3.11
+          uses: actions/setup-python@v5
+          with:
+            python-version: '3.11'
 
-      - name: Install system tools
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            nmap nikto sqlmap gobuster hydra netcat-openbsd masscan curl wget git jq \
-            openssl net-tools whois dnsutils dirb wfuzz ripgrep ffmpeg python3-pip 2>/dev/null || true
-          wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -O /tmp/chrome.deb
-          sudo apt-get install -y /tmp/chrome.deb 2>/dev/null \
-            || (sudo dpkg -i /tmp/chrome.deb && sudo apt-get -f install -y) || true
-          pip install playwright -q && python -m playwright install chromium --with-deps 2>/dev/null || true
+        - name: Install system tools
+          run: |
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends \
+              nmap nikto sqlmap gobuster hydra netcat-openbsd masscan curl wget git jq \
+              openssl net-tools whois dnsutils dirb wfuzz ripgrep ffmpeg python3-pip 2>/dev/null || true
+            wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -O /tmp/chrome.deb
+            sudo apt-get install -y /tmp/chrome.deb 2>/dev/null \
+              || (sudo dpkg -i /tmp/chrome.deb && sudo apt-get -f install -y) || true
+            pip install playwright -q && python -m playwright install chromium --with-deps 2>/dev/null || true
 
-      - name: Validate secrets
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_KEY_1 }}
-        run: |
-          [ -z "$TELEGRAM_BOT_TOKEN" ] && echo 'ERROR: TELEGRAM_BOT_TOKEN not set' && exit 1 || true
-          [ -z "$CEREBRAS_API_KEY" ]   && echo 'ERROR: CEREBRAS_KEY_1 not set'     && exit 1 || true
-          echo 'Secrets OK'
+        - name: Validate secrets
+          env:
+            TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+            CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_KEY_1 }}
+          run: |
+            [ -z "$TELEGRAM_BOT_TOKEN" ] && echo 'ERROR: TELEGRAM_BOT_TOKEN not set' && exit 1 || true
+            [ -z "$CEREBRAS_API_KEY" ]   && echo 'ERROR: CEREBRAS_KEY_1 not set'     && exit 1 || true
+            echo 'Secrets OK'
 
-      - name: Validate Telegram token
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        run: |
-          RESP=$(curl -sf "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe")
-          echo "$RESP" | grep -q '"ok":true' && echo 'Telegram token OK' || { echo 'ERROR: invalid token'; exit 1; }
+        - name: Validate Telegram token
+          env:
+            TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          run: |
+            RESP=$(curl -sf "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe")
+            echo "$RESP" | grep -q '"ok":true' && echo 'Telegram token OK' || { echo 'ERROR: invalid token'; exit 1; }
 
-      - name: Clear Telegram webhook (ensure polling mode)
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        run: python3 scripts/telegram_webhook_fix.py
+        - name: Clear Telegram webhook (ensure polling mode)
+          env:
+            TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          run: python3 scripts/telegram_webhook_fix.py
 
-      - name: Install Hermes Agent
-        run: pip install hermes-agent --upgrade -q
+        - name: Install Hermes Agent
+          run: pip install hermes-agent --upgrade -q
 
-      - name: Configure Hermes directories
-        run: mkdir -p ~/.hermes/memories ~/.hermes/workspace ~/.hermes/skills
+        - name: Configure Hermes directories
+          run: mkdir -p ~/.hermes/memories ~/.hermes/workspace ~/.hermes/skills
 
-      - name: Write Hermes config.yaml
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
-          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_KEY_1 }}
-        run: |
-          python3 scripts/hermes_setup.py write-config
-          echo "=== ~/.hermes/config.yaml ===" && cat ~/.hermes/config.yaml
+        - name: Write Hermes config.yaml
+          env:
+            TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+            TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
+            CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_KEY_1 }}
+          run: |
+            python3 scripts/hermes_setup.py write-config
+            echo "=== ~/.hermes/config.yaml ===" && cat ~/.hermes/config.yaml
 
-      - name: Write Hermes .env
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_KEY_1 }}
-          TAVILY_API_KEY: ${{ secrets.TAVILY_KEY_1 }}
-          TAVILY_API_KEY_2: ${{ secrets.TAVILY_KEY_2 }}
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
-          TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
-        run: python3 scripts/hermes_setup.py write-env
+        - name: Write Hermes .env
+          env:
+            TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+            CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_KEY_1 }}
+            TAVILY_API_KEY: ${{ secrets.TAVILY_KEY_1 }}
+            TAVILY_API_KEY_2: ${{ secrets.TAVILY_KEY_2 }}
+            SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+            SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+            GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+            TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
+          run: python3 scripts/hermes_setup.py write-env
 
-      - name: Cerebras key rotation
-        continue-on-error: true
-        env:
-          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_KEY_1 }}
-          CEREBRAS_API_KEY_2: ${{ secrets.CEREBRAS_KEY_2 }}
-          CEREBRAS_API_KEY_3: ${{ secrets.CEREBRAS_KEY_3 }}
-          CEREBRAS_API_KEY_4: ${{ secrets.CEREBRAS_KEY_4 }}
-          CEREBRAS_API_KEY_5: ${{ secrets.CEREBRAS_KEY_5 }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-        run: python3 scripts/hermes_key_rotator.py
+        - name: Cerebras key rotation
+          continue-on-error: true
+          env:
+            CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_KEY_1 }}
+            CEREBRAS_API_KEY_2: ${{ secrets.CEREBRAS_KEY_2 }}
+            CEREBRAS_API_KEY_3: ${{ secrets.CEREBRAS_KEY_3 }}
+            CEREBRAS_API_KEY_4: ${{ secrets.CEREBRAS_KEY_4 }}
+            CEREBRAS_API_KEY_5: ${{ secrets.CEREBRAS_KEY_5 }}
+            GITHUB_RUN_ID: ${{ github.run_id }}
+          run: python3 scripts/hermes_key_rotator.py
 
-      - name: Cerebras preflight
-        continue-on-error: true
-        env:
-          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_KEY_1 }}
-        run: python3 scripts/hermes_provider_preflight.py
+        - name: Bootstrap memory and state
+          env:
+            SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+            SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+            GITHUB_RUN_ID: ${{ github.run_id }}
+          run: |
+            mkdir -p ~/.hermes/memories ~/.hermes/skills
+            R="/tmp/memory-restore"
 
-      - name: Bootstrap memory and state
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-        run: |
-          mkdir -p ~/.hermes/memories ~/.hermes/skills
-          R="/tmp/memory-restore"
+            # ── Shell-level restore: handles flat (new) AND nested (old) artifact layouts ──
+            for SRC in "$R/MEMORY.md" "$R/memories/MEMORY.md"; do
+              [ -f "$SRC" ] && cp "$SRC" ~/.hermes/memories/MEMORY.md \
+                && echo "restored: MEMORY.md from $SRC" && break || true
+            done
+            [ -f ~/.hermes/memories/MEMORY.md ] || \
+              find "$R" -name "MEMORY.md" 2>/dev/null | head -1 | \
+              xargs -I{} sh -c 'cp "{}" ~/.hermes/memories/MEMORY.md && echo "restored: MEMORY.md (search)"' 2>/dev/null || true
 
-          # ── Shell-level restore: handles flat (new) AND nested (old) artifact layouts ──
-          for SRC in "$R/MEMORY.md" "$R/memories/MEMORY.md"; do
-            [ -f "$SRC" ] && cp "$SRC" ~/.hermes/memories/MEMORY.md \
-              && echo "restored: MEMORY.md from $SRC" && break || true
-          done
-          [ -f ~/.hermes/memories/MEMORY.md ] || \
-            find "$R" -name "MEMORY.md" 2>/dev/null | head -1 | \
-            xargs -I{} sh -c 'cp "{}" ~/.hermes/memories/MEMORY.md && echo "restored: MEMORY.md (search)"' 2>/dev/null || true
+            for SRC in "$R/USER.md" "$R/memories/USER.md"; do
+              [ -f "$SRC" ] && cp "$SRC" ~/.hermes/memories/USER.md \
+                && echo "restored: USER.md from $SRC" && break || true
+            done
 
-          for SRC in "$R/USER.md" "$R/memories/USER.md"; do
-            [ -f "$SRC" ] && cp "$SRC" ~/.hermes/memories/USER.md \
-              && echo "restored: USER.md from $SRC" && break || true
-          done
+            [ -f "$R/state.db" ] && cp "$R/state.db" ~/.hermes/state.db \
+              && echo "restored: state.db" || echo "state.db: not in artifact"
 
-          [ -f "$R/state.db" ] && cp "$R/state.db" ~/.hermes/state.db \
-            && echo "restored: state.db" || echo "state.db: not in artifact"
+            [ -f "$R/skills.tar.gz" ] && \
+              tar xzf "$R/skills.tar.gz" -C ~/.hermes/skills/ 2>/dev/null \
+              && echo "restored: skills" || true
 
-          [ -f "$R/skills.tar.gz" ] && \
-            tar xzf "$R/skills.tar.gz" -C ~/.hermes/skills/ 2>/dev/null \
-            && echo "restored: skills" || true
+            # Python bootstrap — Supabase fallback enrichment
+            python3 scripts/hermes_bootstrap_memory.py || true
 
-          # Python bootstrap — Supabase fallback enrichment
-          python3 scripts/hermes_bootstrap_memory.py || true
+            # Always install SOUL.md from AGENTS.md (authoritative identity)
+            cp AGENTS.md ~/.hermes/SOUL.md && echo "SOUL.md installed from AGENTS.md"
 
-          # Always install SOUL.md from AGENTS.md (authoritative identity)
-          cp AGENTS.md ~/.hermes/SOUL.md && echo "SOUL.md installed from AGENTS.md"
+            echo "=== Memory layout after bootstrap ==="
+            find ~/.hermes -maxdepth 2 -type f 2>/dev/null | sort
 
-          echo "=== Memory layout after bootstrap ==="
-          find ~/.hermes -maxdepth 2 -type f 2>/dev/null | sort
+        - name: Reset memory
+          if: github.event.inputs.reset_memory == 'true'
+          env:
+            SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+            SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          run: |
+            rm -f ~/.hermes/memories/MEMORY.md ~/.hermes/memories/USER.md
+            python3 scripts/clear_memory.py || true
 
-      - name: Reset memory
-        if: github.event.inputs.reset_memory == 'true'
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-        run: |
-          rm -f ~/.hermes/memories/MEMORY.md ~/.hermes/memories/USER.md
-          python3 scripts/clear_memory.py || true
+        - name: Ensure Supabase schema
+          env:
+            SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+            SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+            GITHUB_RUN_ID: ${{ github.run_id }}
+          run: python3 scripts/setup_schema.py || true
 
-      - name: Ensure Supabase schema
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-        run: python3 scripts/setup_schema.py || true
+        - name: Pre-approve bot owner (bypass pairing)
+          env:
+            TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
+          run: python3 scripts/hermes_preapprove.py
 
-      - name: Pre-approve bot owner (bypass pairing)
-        env:
-          TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
-        run: python3 scripts/hermes_preapprove.py
-
-      # ─── Start key-rotation proxy BEFORE the gateway ───────────────────────
-      - name: Start Cerebras key-rotation proxy
-        env:
-          CEREBRAS_API_KEY:   ${{ secrets.CEREBRAS_KEY_1 }}
-          CEREBRAS_API_KEY_2: ${{ secrets.CEREBRAS_KEY_2 }}
-          CEREBRAS_API_KEY_3: ${{ secrets.CEREBRAS_KEY_3 }}
-          CEREBRAS_API_KEY_4: ${{ secrets.CEREBRAS_KEY_4 }}
-          CEREBRAS_API_KEY_5: ${{ secrets.CEREBRAS_KEY_5 }}
-          KEY_PROXY_PORT: "7860"
-        run: |
-          nohup python3 scripts/hermes_key_proxy.py > /tmp/hermes-proxy.log 2>&1 &
-          PROXY_PID=$!
-          echo "PROXY_PID=$PROXY_PID" >> $GITHUB_ENV
-          echo "Proxy PID=$PROXY_PID"
-          PROXY_READY=0
-          for i in $(seq 1 20); do
-            sleep 1
-            if curl -sf http://127.0.0.1:7860/v1/models \
-              -H "Authorization: Bearer test" -o /dev/null 2>/dev/null; then
-              echo "Proxy ready after ${i}s"
-              PROXY_READY=1
-              break
+        # ─── Start key-rotation proxy BEFORE the gateway ───────────────────────
+        - name: Start Cerebras key-rotation proxy
+          env:
+            CEREBRAS_API_KEY:   ${{ secrets.CEREBRAS_KEY_1 }}
+            CEREBRAS_API_KEY_2: ${{ secrets.CEREBRAS_KEY_2 }}
+            CEREBRAS_API_KEY_3: ${{ secrets.CEREBRAS_KEY_3 }}
+            CEREBRAS_API_KEY_4: ${{ secrets.CEREBRAS_KEY_4 }}
+            CEREBRAS_API_KEY_5: ${{ secrets.CEREBRAS_KEY_5 }}
+            KEY_PROXY_PORT: "7860"
+          run: |
+            nohup python3 scripts/hermes_key_proxy.py > /tmp/hermes-proxy.log 2>&1 &
+            PROXY_PID=$!
+            echo "PROXY_PID=$PROXY_PID" >> $GITHUB_ENV
+            echo "Proxy PID=$PROXY_PID"
+            PROXY_READY=0
+            for i in $(seq 1 20); do
+              sleep 1
+              if curl -sf http://127.0.0.1:7860/v1/models \
+                -H "Authorization: Bearer test" -o /dev/null 2>/dev/null; then
+                echo "Proxy ready after ${i}s"
+                PROXY_READY=1
+                break
+              fi
+            done
+            echo "=== proxy startup log ==="
+            cat /tmp/hermes-proxy.log || true
+            if [ "$PROXY_READY" -eq 0 ]; then
+              echo "FATAL: key-rotation proxy did not start within 20s. Check CEREBRAS_KEY_1."
+              exit 1
             fi
-          done
-          echo "=== proxy startup log ==="
-          cat /tmp/hermes-proxy.log || true
-          if [ "$PROXY_READY" -eq 0 ]; then
-            echo "FATAL: key-rotation proxy did not start within 20s. Check CEREBRAS_KEY_1."
-            exit 1
-          fi
-          echo "Proxy health check PASSED"
+            echo "Proxy health check PASSED"
 
-      # ─── Start Hermes gateway ───────────────────────────────────────────────
-      - name: Start Hermes gateway
-        env:
-          # OPENAI_API_KEY: referenced by key_env: OPENAI_API_KEY in config.yaml.
-          # The proxy ignores incoming auth and injects a real Cerebras key,
-          # but Hermes requires a non-empty value or it sends no Authorization header.
-          OPENAI_API_KEY: "proxy-placeholder"
-          OPENROUTER_API_KEY: "proxy-placeholder"
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
-          TELEGRAM_ALLOWED_USERS: ${{ secrets.TELEGRAM_USER_ID }}
-          TELEGRAM_HOME_CHANNEL: ${{ secrets.TELEGRAM_USER_ID }}
-          TELEGRAM_HOME_CHANNEL_NAME: "Zypher Home"
-          TAVILY_API_KEY: ${{ secrets.TAVILY_KEY_1 }}
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-        run: |
-          nohup hermes gateway run --accept-hooks > /tmp/hermes.log 2>&1 &
-          HERMES_PID=$!
-          echo "HERMES_PID=$HERMES_PID" >> $GITHUB_ENV
-          echo "Hermes gateway PID=$HERMES_PID"
-          sleep 35
-          echo "=== Hermes startup log (first 100 lines) ==="
-          head -100 /tmp/hermes.log || true
+        # ─── Cerebras preflight AFTER proxy starts ──────────────────────────────
+        # FIX: Previously this ran BEFORE the proxy started, so the proxy health
+        # check in phase [2/2] always silently failed (proxy not yet running).
+        # Now it runs after the proxy is confirmed up, validating the full path:
+        #   Direct API → find working model → patch config.yaml
+        #   Proxy path → end-to-end validation → confirm streaming:false works
+        # continue-on-error: true kept so a transient API failure doesn't block startup.
+        - name: Cerebras preflight (model validation + config auto-heal)
+          continue-on-error: true
+          env:
+            CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_KEY_1 }}
+            KEY_PROXY_PORT: "7860"
+          run: python3 scripts/hermes_provider_preflight.py
 
-      - name: Start pairing auto-approver
-        env:
-          TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
-        run: |
-          nohup python3 scripts/hermes_pairing_watcher.py > /tmp/hermes-pairing.log 2>&1 &
-          echo "PAIRING_PID=$!" >> $GITHUB_ENV
-          echo "Pairing watcher started"
+        # ─── Start Hermes gateway ───────────────────────────────────────────────
+        - name: Start Hermes gateway
+          env:
+            # OPENAI_API_KEY: referenced by key_env: OPENAI_API_KEY in config.yaml.
+            # The proxy ignores incoming auth and injects a real Cerebras key,
+            # but Hermes requires a non-empty value or it sends no Authorization header.
+            OPENAI_API_KEY: "proxy-placeholder"
+            OPENROUTER_API_KEY: "proxy-placeholder"
+            TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+            TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
+            TELEGRAM_ALLOWED_USERS: ${{ secrets.TELEGRAM_USER_ID }}
+            TELEGRAM_HOME_CHANNEL: ${{ secrets.TELEGRAM_USER_ID }}
+            TELEGRAM_HOME_CHANNEL_NAME: "Zypher Home"
+            TAVILY_API_KEY: ${{ secrets.TAVILY_KEY_1 }}
+            SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+            SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+            GITHUB_RUN_ID: ${{ github.run_id }}
+          run: |
+            nohup hermes gateway run --accept-hooks > /tmp/hermes.log 2>&1 &
+            HERMES_PID=$!
+            echo "HERMES_PID=$HERMES_PID" >> $GITHUB_ENV
+            echo "Hermes gateway PID=$HERMES_PID"
+            sleep 35
+            echo "=== Hermes startup log (first 100 lines) ==="
+            head -100 /tmp/hermes.log || true
 
-      - name: Send startup notification
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-        run: python3 scripts/hermes_startup_notify.py
+        - name: Start pairing auto-approver
+          env:
+            TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
+          run: |
+            nohup python3 scripts/hermes_pairing_watcher.py > /tmp/hermes-pairing.log 2>&1 &
+            echo "PAIRING_PID=$!" >> $GITHUB_ENV
+            echo "Pairing watcher started"
 
-      - name: Start Supabase sidecar
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-        run: |
-          nohup python3 scripts/hermes_sidecar.py > /tmp/hermes-sidecar.log 2>&1 &
-          echo "SIDECAR_PID=$!" >> $GITHUB_ENV
-          echo "Supabase sidecar started"
+        - name: Send startup notification
+          env:
+            TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+            TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
+            GITHUB_RUN_ID: ${{ github.run_id }}
+          run: python3 scripts/hermes_startup_notify.py
 
-      # ─── Keep-alive loop ────────────────────────────────────────────────────
-      - name: Keep agent alive
-        env:
-          CEREBRAS_API_KEY:   ${{ secrets.CEREBRAS_KEY_1 }}
-          CEREBRAS_API_KEY_2: ${{ secrets.CEREBRAS_KEY_2 }}
-          CEREBRAS_API_KEY_3: ${{ secrets.CEREBRAS_KEY_3 }}
-          CEREBRAS_API_KEY_4: ${{ secrets.CEREBRAS_KEY_4 }}
-          CEREBRAS_API_KEY_5: ${{ secrets.CEREBRAS_KEY_5 }}
-          OPENAI_API_KEY: "proxy-placeholder"
-          OPENROUTER_API_KEY: "proxy-placeholder"
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
-          TELEGRAM_ALLOWED_USERS: ${{ secrets.TELEGRAM_USER_ID }}
-          TELEGRAM_HOME_CHANNEL: ${{ secrets.TELEGRAM_USER_ID }}
-          TELEGRAM_HOME_CHANNEL_NAME: "Zypher Home"
-          TAVILY_API_KEY: ${{ secrets.TAVILY_KEY_1 }}
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          KEY_PROXY_PORT: "7860"
-        run: |
-          TIMEOUT=13500
-          ELAPSED=0
-          INTERVAL=30
-          echo "Keep-alive: ${TIMEOUT}s total"
+        - name: Start Supabase sidecar
+          env:
+            SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+            SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+            GITHUB_RUN_ID: ${{ github.run_id }}
+          run: |
+            nohup python3 scripts/hermes_sidecar.py > /tmp/hermes-sidecar.log 2>&1 &
+            echo "SIDECAR_PID=$!" >> $GITHUB_ENV
+            echo "Supabase sidecar started"
 
-          while [ $ELAPSED -lt $TIMEOUT ]; do
-            sleep $INTERVAL
-            ELAPSED=$((ELAPSED+INTERVAL))
+        # ─── Keep-alive loop ────────────────────────────────────────────────────
+        - name: Keep agent alive
+          env:
+            CEREBRAS_API_KEY:   ${{ secrets.CEREBRAS_KEY_1 }}
+            CEREBRAS_API_KEY_2: ${{ secrets.CEREBRAS_KEY_2 }}
+            CEREBRAS_API_KEY_3: ${{ secrets.CEREBRAS_KEY_3 }}
+            CEREBRAS_API_KEY_4: ${{ secrets.CEREBRAS_KEY_4 }}
+            CEREBRAS_API_KEY_5: ${{ secrets.CEREBRAS_KEY_5 }}
+            OPENAI_API_KEY: "proxy-placeholder"
+            OPENROUTER_API_KEY: "proxy-placeholder"
+            TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+            TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
+            TELEGRAM_ALLOWED_USERS: ${{ secrets.TELEGRAM_USER_ID }}
+            TELEGRAM_HOME_CHANNEL: ${{ secrets.TELEGRAM_USER_ID }}
+            TELEGRAM_HOME_CHANNEL_NAME: "Zypher Home"
+            TAVILY_API_KEY: ${{ secrets.TAVILY_KEY_1 }}
+            SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+            SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+            GITHUB_RUN_ID: ${{ github.run_id }}
+            KEY_PROXY_PORT: "7860"
+          run: |
+            TIMEOUT=13500
+            ELAPSED=0
+            INTERVAL=30
+            echo "Keep-alive: ${TIMEOUT}s total"
 
-            # Restart key proxy if it died
-            if ! kill -0 $PROXY_PID 2>/dev/null; then
-              echo "[${ELAPSED}s] Key proxy died — restarting..."
-              nohup python3 scripts/hermes_key_proxy.py >> /tmp/hermes-proxy.log 2>&1 &
-              PROXY_PID=$!
-              for i in $(seq 1 15); do
-                sleep 1
-                curl -sf http://127.0.0.1:7860/v1/models \
-                  -H "Authorization: Bearer test" -o /dev/null 2>/dev/null \
-                  && echo "[${ELAPSED}s] Proxy back after ${i}s" && break || true
-              done
+            while [ $ELAPSED -lt $TIMEOUT ]; do
+              sleep $INTERVAL
+              ELAPSED=$((ELAPSED+INTERVAL))
+
+              # Restart key proxy if it died
+              if ! kill -0 $PROXY_PID 2>/dev/null; then
+                echo "[${ELAPSED}s] Key proxy died — restarting..."
+                nohup python3 scripts/hermes_key_proxy.py >> /tmp/hermes-proxy.log 2>&1 &
+                PROXY_PID=$!
+                for i in $(seq 1 15); do
+                  sleep 1
+                  curl -sf http://127.0.0.1:7860/v1/models \
+                    -H "Authorization: Bearer test" -o /dev/null 2>/dev/null \
+                    && echo "[${ELAPSED}s] Proxy back after ${i}s" && break || true
+                done
+              fi
+
+              # Restart hermes gateway if it died
+              if ! kill -0 $HERMES_PID 2>/dev/null; then
+                echo "[${ELAPSED}s] Hermes died — restarting..."
+                python3 scripts/hermes_preapprove.py 2>/dev/null || true
+                nohup hermes gateway run --accept-hooks >> /tmp/hermes.log 2>&1 &
+                HERMES_PID=$!
+                echo "[${ELAPSED}s] Hermes restarted PID=$HERMES_PID"
+                sleep 10
+              fi
+
+              # Restart pairing watcher if it died
+              if ! kill -0 $PAIRING_PID 2>/dev/null; then
+                nohup python3 scripts/hermes_pairing_watcher.py >> /tmp/hermes-pairing.log 2>&1 &
+                PAIRING_PID=$!
+              fi
+
+              # Restart Supabase sidecar if it died (memory backups stop if sidecar exits)
+              if ! kill -0 $SIDECAR_PID 2>/dev/null; then
+                echo "[${ELAPSED}s] Sidecar died -- restarting..."
+                nohup python3 scripts/hermes_sidecar.py >> /tmp/hermes-sidecar.log 2>&1 &
+                SIDECAR_PID=$!
+                echo "[${ELAPSED}s] Sidecar restarted PID=$SIDECAR_PID"
+              fi
+
+              # Flush memory + state.db every 5 minutes (WAL-safe backup)
+              [ $((ELAPSED % 300)) -eq 0 ] && {
+                python3 scripts/hermes_sidecar.py --flush-memory 2>/dev/null || true
+                echo "[${ELAPSED}s] Memory + state.db flushed (WAL-safe)"
+              } || true
+
+              # Log tail every 10 minutes
+              [ $((ELAPSED % 600)) -eq 0 ] && {
+                echo "=== hermes.log tail ===" && tail -5 /tmp/hermes.log 2>/dev/null || true
+                echo "=== proxy.log tail ===" && tail -3 /tmp/hermes-proxy.log 2>/dev/null || true
+              } || true
+            done
+            echo "Session rotation complete"
+
+        - name: Save memory and state (final WAL-safe flush)
+          if: always()
+          env:
+            SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+            SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+            GITHUB_RUN_ID: ${{ github.run_id }}
+          run: python3 scripts/hermes_sidecar.py --flush-memory 2>/dev/null || true
+
+        - name: Stop all processes
+          if: always()
+          run: |
+            kill -TERM $HERMES_PID  2>/dev/null || true
+            kill -TERM $PROXY_PID   2>/dev/null || true
+            kill -TERM $PAIRING_PID 2>/dev/null || true
+            kill -TERM $SIDECAR_PID 2>/dev/null || true
+            for i in $(seq 1 20); do
+              sleep 1
+              kill -0 $HERMES_PID 2>/dev/null || { echo "Hermes exited after ${i}s"; break; }
+            done
+            kill -KILL $HERMES_PID 2>/dev/null || true
+            echo "Process cleanup complete"
+
+        - name: Send rotation notification
+          if: always()
+          env:
+            TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+            TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
+            GITHUB_RUN_ID: ${{ github.run_id }}
+          run: |
+            curl -sf -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d "chat_id=${TELEGRAM_USER_ID}" \
+              -d "text=Zypher rotating (Run #${GITHUB_RUN_ID}). Back in seconds..." || true
+
+        # ── PERSISTENCE: stage then upload artifact ──────────────────────────────
+        - name: Stage memory for artifact upload
+          if: always()
+          run: |
+            python3 scripts/hermes_stage_artifact.py && STAGED=1 || STAGED=0
+            if [ "$STAGED" -eq 0 ]; then
+              mkdir -p /tmp/hermes-artifact
+              cp ~/.hermes/memories/MEMORY.md /tmp/hermes-artifact/MEMORY.md 2>/dev/null || true
+              cp ~/.hermes/memories/USER.md   /tmp/hermes-artifact/USER.md   2>/dev/null || true
+              cp ~/.hermes/SOUL.md            /tmp/hermes-artifact/SOUL.md   2>/dev/null || true
+              [ -f ~/.hermes/state.db ] && cp ~/.hermes/state.db /tmp/hermes-artifact/state.db || true
+              echo 'Shell fallback staging used'
             fi
+            echo '=== Staged files ==='
+            ls -lh /tmp/hermes-artifact/ 2>/dev/null || echo '(nothing staged)'
 
-            # Restart hermes gateway if it died
-            if ! kill -0 $HERMES_PID 2>/dev/null; then
-              echo "[${ELAPSED}s] Hermes died — restarting..."
-              python3 scripts/hermes_preapprove.py 2>/dev/null || true
-              nohup hermes gateway run --accept-hooks >> /tmp/hermes.log 2>&1 &
-              HERMES_PID=$!
-              echo "[${ELAPSED}s] Hermes restarted PID=$HERMES_PID"
-              sleep 10
-            fi
+        - name: Upload memory artifact
+          if: always()
+          uses: actions/upload-artifact@v4
+          with:
+            name: zypher-hermes-memory
+            path: /tmp/hermes-artifact/
+            retention-days: 90
+            if-no-files-found: warn
+            overwrite: true
 
-            # Restart pairing watcher if it died
-            if ! kill -0 $PAIRING_PID 2>/dev/null; then
-              nohup python3 scripts/hermes_pairing_watcher.py >> /tmp/hermes-pairing.log 2>&1 &
-              PAIRING_PID=$!
-            fi
-
-            # Restart Supabase sidecar if it died (memory backups stop if sidecar exits)
-            if ! kill -0 $SIDECAR_PID 2>/dev/null; then
-              echo "[${ELAPSED}s] Sidecar died -- restarting..."
-              nohup python3 scripts/hermes_sidecar.py >> /tmp/hermes-sidecar.log 2>&1 &
-              SIDECAR_PID=$!
-              echo "[${ELAPSED}s] Sidecar restarted PID=$SIDECAR_PID"
-            fi
-
-            # Flush memory + state.db every 5 minutes (WAL-safe backup)
-            [ $((ELAPSED % 300)) -eq 0 ] && {
-              python3 scripts/hermes_sidecar.py --flush-memory 2>/dev/null || true
-              echo "[${ELAPSED}s] Memory + state.db flushed (WAL-safe)"
-            } || true
-
-            # Log tail every 10 minutes
-            [ $((ELAPSED % 600)) -eq 0 ] && {
-              echo "=== hermes.log tail ===" && tail -5 /tmp/hermes.log 2>/dev/null || true
-              echo "=== proxy.log tail ===" && tail -3 /tmp/hermes-proxy.log 2>/dev/null || true
-            } || true
-          done
-          echo "Session rotation complete"
-
-      - name: Save memory and state (final WAL-safe flush)
-        if: always()
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-        run: python3 scripts/hermes_sidecar.py --flush-memory 2>/dev/null || true
-
-      - name: Stop all processes
-        if: always()
-        run: |
-          # Send SIGTERM to all processes
-          kill -TERM $HERMES_PID  2>/dev/null || true
-          kill -TERM $PROXY_PID   2>/dev/null || true
-          kill -TERM $PAIRING_PID 2>/dev/null || true
-          kill -TERM $SIDECAR_PID 2>/dev/null || true
-          # Wait for Hermes to fully exit before WAL staging.
-          # Stage script uses sqlite3.backup() (safe while DB open),
-          # but waiting ensures the cleanest possible snapshot.
-          for i in $(seq 1 20); do
-            sleep 1
-            kill -0 $HERMES_PID 2>/dev/null || { echo "Hermes exited after ${i}s"; break; }
-          done
-          # Force-kill if still alive after 20s
-          kill -KILL $HERMES_PID 2>/dev/null || true
-          echo "Process cleanup complete"
-
-      - name: Send rotation notification
-        if: always()
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-        run: |
-          curl -sf -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -d "chat_id=${TELEGRAM_USER_ID}" \
-            -d "text=Zypher rotating (Run #${GITHUB_RUN_ID}). Back in seconds..." || true
-
-      # ── PERSISTENCE: stage then upload artifact ──────────────────────────────
-      # ROOT CAUSE FIX (primary persistence bug):
-      #   upload-artifact@v4 preserves the full directory structure of absolute paths.
-      #   When we uploaded ~/.hermes/memories/MEMORY.md (absolute path), it was stored
-      #   inside the ZIP as home/runner/.hermes/memories/MEMORY.md.
-      #   After "gh run download --dir /tmp/memory-restore", the file landed at:
-      #     /tmp/memory-restore/home/runner/.hermes/memories/MEMORY.md
-      #   But hermes_bootstrap_memory.py looked for the flat path:
-      #     /tmp/memory-restore/MEMORY.md  <- NEVER FOUND -> always a fresh start
-      #
-      #   Fix: hermes_stage_artifact.py copies all files to /tmp/hermes-artifact/
-      #   with flat names (MEMORY.md, USER.md, state.db, SOUL.md, skills.tar.gz),
-      #   and does a WAL checkpoint on state.db after Hermes is stopped.
-      #   We upload from the flat staging dir so "gh run download" produces the flat
-      #   paths that hermes_bootstrap_memory.py already expects.
-      - name: Stage memory for artifact upload
-        if: always()
-        run: |
-          # Python script handles WAL checkpoint + flat copy (indentation fixed)
-          python3 scripts/hermes_stage_artifact.py && STAGED=1 || STAGED=0
-          # Shell fallback if Python script fails
-          if [ "$STAGED" -eq 0 ]; then
-            mkdir -p /tmp/hermes-artifact
-            cp ~/.hermes/memories/MEMORY.md /tmp/hermes-artifact/MEMORY.md 2>/dev/null || true
-            cp ~/.hermes/memories/USER.md   /tmp/hermes-artifact/USER.md   2>/dev/null || true
-            cp ~/.hermes/SOUL.md            /tmp/hermes-artifact/SOUL.md   2>/dev/null || true
-            [ -f ~/.hermes/state.db ] && cp ~/.hermes/state.db /tmp/hermes-artifact/state.db || true
-            echo 'Shell fallback staging used'
-          fi
-          echo '=== Staged files ==='
-          ls -lh /tmp/hermes-artifact/ 2>/dev/null || echo '(nothing staged)'
-
-      - name: Upload memory artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: zypher-hermes-memory
-          path: /tmp/hermes-artifact/
-          retention-days: 90
-          if-no-files-found: warn
-          overwrite: true
-
-      - name: Trigger next run (zero-gap rotation)
-        if: always()
-        env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
-          REPO: ${{ github.repository }}
-        run: |
-          curl -sf -X POST \
-            -H "Authorization: token $GH_TOKEN" \
-            -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/$REPO/actions/workflows/hermes.yml/dispatches" \
-            -d '{"ref":"main"}' && echo 'Next run triggered' || echo 'WARN: trigger failed'
+        - name: Trigger next run (zero-gap rotation)
+          if: always()
+          env:
+            GH_TOKEN: ${{ secrets.GH_PAT }}
+            REPO: ${{ github.repository }}
+          run: |
+            curl -sf -X POST \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/$REPO/actions/workflows/hermes.yml/dispatches" \
+              -d '{"ref":"main"}' && echo 'Next run triggered' || echo 'WARN: trigger failed'
+  
