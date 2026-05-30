@@ -181,13 +181,6 @@ jobs:
             echo "PARAMETER num_ctx ${LOCAL_CTX_SIZE}"
             echo 'PARAMETER temperature 0.3'
             echo 'PARAMETER top_p 0.9'
-            echo 'TEMPLATE """{{- if .System }}{{ .System }}{{ end }}'
-            echo '{{- range .Messages }}'
-            echo '<|im_start|>{{ .Role }}'
-            echo '{{ .Content }}<|im_end|>'
-            echo '{{ end }}<|im_start|>assistant'
-            echo '"""'
-            echo 'SYSTEM "You are Zypher, a helpful Hermes AI agent."'
           } > /opt/models/qwen/Modelfile
           ollama create "$HERMES_MODEL_NAME" -f /opt/models/qwen/Modelfile
           ollama list
