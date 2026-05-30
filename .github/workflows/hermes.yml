@@ -346,11 +346,11 @@ jobs:
           INTERVAL=20
           # WATCHDOG THRESHOLD: if /tmp/hermes.log not modified for this many seconds,
           # Hermes is considered frozen (alive but stuck) and force-restarted.
-          # = bash_tool_max(300s) + provider_timeout(90s) + buffer(30s) = 420s (7 min).
+          # = 2 * provider_timeout(90s) + buffer(60s) = 240s (Jul 2026, api_max_retries 7->2).
           # A frozen agent still passes kill -0 (PID alive) but stops writing to the log.
           # This catches: tool-call deadlocks, async hangs, provider retry storms,
           # rate-limit cascades, browser automation freezes.
-          STALE_THRESHOLD=420
+          STALE_THRESHOLD=240
           WATCHDOG_RESTARTS=0
           echo "Keep-alive: ${TIMEOUT}s total | interval=${INTERVAL}s | stale_threshold=${STALE_THRESHOLD}s"
 
@@ -411,7 +411,21 @@ jobs:
                   # Force-kill the frozen instance
                   kill -KILL $HERMES_PID 2>/dev/null || true
                   pkill -KILL -f "hermes gateway run" 2>/dev/null || true
-                  sleep 3
+                  sleep 2
+                  # FIX Jul 2026: also restart proxy to clear stale cooldown/CB state.
+                  # The proxy holds in-memory key cooldowns. Without restarting it,
+                  # the 10s cooldowns expire during the freeze, so the new Hermes
+                  # hits rate limits immediately and the watchdog loop repeats.
+                  kill -KILL $PROXY_PID 2>/dev/null || true
+                  pkill -KILL -f "hermes_key_proxy.py" 2>/dev/null || true
+                  sleep 2
+                  nohup python3 scripts/hermes_key_proxy.py >> /tmp/hermes-proxy.log 2>&1 &
+                  PROXY_PID=$!
+                  echo "PROXY_PID=$PROXY_PID" >> $GITHUB_ENV
+                  for _pi in $(seq 1 15); do
+                    sleep 1
+                    curl -sf http://127.0.0.1:7860/health -o /dev/null 2>/dev/null                       && echo "[${ELAPSED}s] WATCHDOG: proxy ready after ${_pi}s" && break || true
+                  done
                   python3 scripts/hermes_preapprove.py 2>/dev/null || true
                   nohup hermes gateway run --accept-hooks >> /tmp/hermes.log 2>&1 &
                   HERMES_PID=$!
