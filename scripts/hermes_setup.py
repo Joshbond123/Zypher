@@ -37,16 +37,16 @@ PROVIDER_NAME = "local-qwen-gguf"
 LOCAL_BASE_URL = "http://127.0.0.1:7860/v1"
 PRIMARY_MODEL = "Qwen3.5-9B-Uncensored-Q4_K_M"
 
-# Hermes internal context — must be >= 64,000 to pass MINIMUM_CONTEXT_LENGTH check.
-# Controls Hermes context budgeting. Does NOT control Ollama KV cache (see OLLAMA_CTX).
+# Both context_length AND ollama_num_ctx must be >= 64,000.
+# Hermes checks agent._ollama_num_ctx at every conversation turn and blocks
+# tool use if it is below MINIMUM_CONTEXT_LENGTH (64,000). There is no bypass.
+# Setting both to 65536 satisfies both the startup validation and the per-turn check.
 PRIMARY_CONTEXT = 65536
 
-# Actual num_ctx sent to Ollama in every API request (overrides Modelfile default).
-# 8192 tokens = ~900MB KV cache (vs ~7GB for 65536). Inference: 30-120s vs 15-35min.
-OLLAMA_CTX = int(os.environ.get("LOCAL_CTX_SIZE", "8192"))
-
-# 600s provider timeout; with ollama_num_ctx=8192 responses finish in 30-120 seconds.
-PROVIDER_TIMEOUT = 600
+# Increase provider timeout to 1800s to handle slower CPU inference at 65536 context.
+# At 65536 context, Qwen3.5-9B generates ~0.5-2 tok/s on CPU.
+# A 200-token response can take 100-400 seconds — well within 1800s.
+PROVIDER_TIMEOUT = 1800
 LOCAL_API_KEY = "local-qwen"
 
 
@@ -85,7 +85,7 @@ model:
   provider: {provider}
   default: {primary}
   context_length: {context}
-  ollama_num_ctx: {ollama_ctx}
+  ollama_num_ctx: {context}
   temperature: 0.3
   streaming: true
 
@@ -150,7 +150,6 @@ tools:
 """.format(
         primary=PRIMARY_MODEL,
         context=PRIMARY_CONTEXT,
-        ollama_ctx=OLLAMA_CTX,
         provider=PROVIDER_NAME,
         base_url=LOCAL_BASE_URL,
         timeout=PROVIDER_TIMEOUT,
@@ -165,8 +164,8 @@ tools:
     print("  base_url           : {}".format(LOCAL_BASE_URL))
     print("  primary model      : {}".format(PRIMARY_MODEL))
     print("  fallback model     : {} (same local model)".format(PRIMARY_MODEL))
-    print("  context_length     : {:,} (Hermes validation)".format(PRIMARY_CONTEXT))
-    print("  ollama_num_ctx     : {:,} (actual Ollama KV cache)".format(OLLAMA_CTX))
+    print("  context_length     : {:,}".format(PRIMARY_CONTEXT))
+    print("  ollama_num_ctx     : {:,} (same — Hermes requires >= 64K on both)".format(PRIMARY_CONTEXT))
     print("  streaming          : true")
     print("  request_timeout    : {}s".format(PROVIDER_TIMEOUT))
     print("  api_max_retries    : 2")
