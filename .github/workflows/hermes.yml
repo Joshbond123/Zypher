@@ -36,9 +36,20 @@ jobs:
       QWEN_MODEL_FILE: Qwen3.5-9B-Uncensored-Q4_K_M.gguf
       HERMES_MODEL_NAME: Qwen3.5-9B-Uncensored-Q4_K_M
       LOCAL_MODEL_PORT: "7860"
-      LOCAL_CTX_SIZE: "65536"
+      # ROOT CAUSE FIX: Reduced from 65536 to 4096.
+      # 65536-token context pre-allocates ~7GB KV cache on a 9B model,
+      # consuming nearly all of the 16GB GitHub Actions runner RAM.
+      # Result: 43s for 8 tokens, 15-35 min for a full response, 600s
+      # provider timeout fires, "primary model failed", fallback also
+      # times out (same model), watchdog kills at 360s of log silence.
+      # 4096 context = ~450MB KV cache, 30-120s responses -- fully within
+      # the 600s provider timeout and 1800s watchdog threshold.
+      LOCAL_CTX_SIZE: "4096"
       OPENAI_API_KEY: local-qwen
       OPENROUTER_API_KEY: local-qwen
+      # Prevent Ollama from serving concurrent requests that would exhaust RAM.
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_MAX_LOADED_MODELS: "1"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -152,6 +163,9 @@ jobs:
           set -euo pipefail
           export OLLAMA_HOST="127.0.0.1:${LOCAL_MODEL_PORT}"
           export OLLAMA_MODELS="/opt/ollama-models"
+          # Persist these for the keep-alive step's restart_ollama() function
+          echo "OLLAMA_HOST=127.0.0.1:${LOCAL_MODEL_PORT}" >> $GITHUB_ENV
+          echo "OLLAMA_MODELS=/opt/ollama-models" >> $GITHUB_ENV
           mkdir -p "$OLLAMA_MODELS"
           nohup ollama serve > /tmp/ollama.log 2>&1 &
           OLLAMA_PID=$!
@@ -176,9 +190,12 @@ jobs:
             cat /tmp/ollama.log || true
             exit 1
           fi
+          # Build Modelfile — 4096 context uses ~450MB KV cache vs ~7GB for 65536.
+          # num_thread 4 uses all vCPUs on the GitHub Actions runner.
           {
             echo 'FROM /opt/models/qwen/model.gguf'
             echo "PARAMETER num_ctx ${LOCAL_CTX_SIZE}"
+            echo 'PARAMETER num_thread 4'
             echo 'PARAMETER temperature 0.3'
             echo 'PARAMETER top_p 0.9'
           } > /opt/models/qwen/Modelfile
@@ -195,6 +212,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
+          LOCAL_CTX_SIZE: ${{ env.LOCAL_CTX_SIZE }}
         run: |
           python3 scripts/hermes_setup.py write-config
           echo "=== ~/.hermes/config.yaml ===" && cat ~/.hermes/config.yaml
@@ -299,10 +317,15 @@ jobs:
           echo "Pairing watcher started"
 
       - name: Send startup notification
+        # continue-on-error: Telegram API errors (400, 429, network) must never
+        # kill the workflow. The agent runs fine without the notification.
+        continue-on-error: true
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
           GITHUB_RUN_ID: ${{ github.run_id }}
+          HERMES_MODEL_NAME: ${{ env.HERMES_MODEL_NAME }}
+          LOCAL_CTX_SIZE: ${{ env.LOCAL_CTX_SIZE }}
         run: python3 scripts/hermes_startup_notify.py
 
       - name: Start Supabase sidecar
@@ -332,7 +355,25 @@ jobs:
           TIMEOUT=12000
           ELAPSED=0
           INTERVAL=20
-          STALE_THRESHOLD=360
+          # ROOT CAUSE FIX: Raised from 360s to 1800s (30 minutes).
+          #
+          # The watchdog fires when /tmp/hermes.log is not written for
+          # STALE_THRESHOLD seconds. This is valid for detecting truly frozen
+          # processes, but 360s was far too short:
+          #
+          #   With LOCAL_CTX_SIZE=65536:
+          #     - Preflight (8 tokens):  43 seconds
+          #     - Full response (300 tokens): ~1600 seconds = 26 minutes
+          #     - Watchdog fires at 360s, killing mid-inference every time
+          #
+          #   With LOCAL_CTX_SIZE=4096 (fixed):
+          #     - Preflight (8 tokens):  ~12 seconds
+          #     - Full response (300 tokens): ~75-150 seconds
+          #     - 1800s watchdog gives 12x headroom -- no false triggers
+          #
+          # 1800s (30 min) is a genuine "frozen process" signal for any
+          # reasonable task, even multi-step bash/browser work.
+          STALE_THRESHOLD=1800
           WATCHDOG_RESTARTS=0
           echo "Keep-alive: ${TIMEOUT}s total | interval=${INTERVAL}s | stale_threshold=${STALE_THRESHOLD}s"
 
@@ -341,8 +382,8 @@ jobs:
             kill -KILL ${OLLAMA_PID:-0} 2>/dev/null || true
             pkill -KILL -f "[o]llama serve" 2>/dev/null || true
             sleep 2
-            export OLLAMA_HOST="127.0.0.1:${LOCAL_MODEL_PORT}"
-            export OLLAMA_MODELS="/opt/ollama-models"
+            export OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:${LOCAL_MODEL_PORT}}"
+            export OLLAMA_MODELS="${OLLAMA_MODELS:-/opt/ollama-models}"
             nohup ollama serve >> /tmp/ollama.log 2>&1 &
             OLLAMA_PID=$!
             echo "OLLAMA_PID=$OLLAMA_PID" >> $GITHUB_ENV
@@ -360,12 +401,12 @@ jobs:
             sleep $INTERVAL
             ELAPSED=$((ELAPSED+INTERVAL))
 
-            if ! kill -0 $OLLAMA_PID 2>/dev/null; then
+            if ! kill -0 ${OLLAMA_PID:-0} 2>/dev/null; then
               echo "[${ELAPSED}s] Ollama died — restarting..."
               restart_ollama || true
             fi
 
-            if ! kill -0 $HERMES_PID 2>/dev/null; then
+            if ! kill -0 ${HERMES_PID:-0} 2>/dev/null; then
               echo "[${ELAPSED}s] Hermes crashed — restarting..."
               python3 scripts/hermes_preapprove.py 2>/dev/null || true
               nohup hermes gateway run --accept-hooks >> /tmp/hermes.log 2>&1 &
@@ -375,7 +416,7 @@ jobs:
               sleep 10
             fi
 
-            if kill -0 "$HERMES_PID" 2>/dev/null; then
+            if kill -0 "${HERMES_PID:-0}" 2>/dev/null; then
               LOG_MTIME=$(date -r /tmp/hermes.log +%s 2>/dev/null || echo 0)
               if [ "$LOG_MTIME" -gt 0 ]; then
                 LOG_AGE=$(( $(date +%s) - LOG_MTIME ))
@@ -385,7 +426,7 @@ jobs:
                   curl -sf -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
                     -d "chat_id=${TELEGRAM_USER_ID}" \
                     -d "text=Watchdog #${WATCHDOG_RESTARTS}: Zypher frozen (${LOG_AGE}s silence). Auto-restarting with local Qwen." 2>/dev/null || true
-                  kill -KILL $HERMES_PID 2>/dev/null || true
+                  kill -KILL ${HERMES_PID:-0} 2>/dev/null || true
                   pkill -KILL -f "hermes gateway run" 2>/dev/null || true
                   restart_ollama || true
                   python3 scripts/hermes_preapprove.py 2>/dev/null || true
@@ -398,13 +439,13 @@ jobs:
               fi
             fi
 
-            if ! kill -0 $PAIRING_PID 2>/dev/null; then
+            if ! kill -0 ${PAIRING_PID:-0} 2>/dev/null; then
               nohup python3 scripts/hermes_pairing_watcher.py >> /tmp/hermes-pairing.log 2>&1 &
               PAIRING_PID=$!
               echo "PAIRING_PID=$PAIRING_PID" >> $GITHUB_ENV
             fi
 
-            if ! kill -0 $SIDECAR_PID 2>/dev/null; then
+            if ! kill -0 ${SIDECAR_PID:-0} 2>/dev/null; then
               echo "[${ELAPSED}s] Sidecar died — restarting..."
               nohup python3 scripts/hermes_sidecar.py >> /tmp/hermes-sidecar.log 2>&1 &
               SIDECAR_PID=$!
@@ -456,6 +497,7 @@ jobs:
 
       - name: Send rotation notification
         if: always()
+        continue-on-error: true
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
