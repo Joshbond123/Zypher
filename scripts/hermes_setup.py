@@ -13,47 +13,62 @@ MODEL HISTORY:
 STREAMING FIX (May 2026):
   ROOT CAUSE: streaming:true -> Hermes opens SSE connections -> Cerebras stalls -> 120s wait
   FIX 1: streaming:false under model: (requests full JSON, no SSE)
-  FIX 2: providers.cerebras-proxy.request_timeout_seconds:90 - kills stalled requests.
-         INCREASED from 60s to 90s (Jun 2026): large gpt-oss-120b responses for
-         complex tasks occasionally exceeded 60s under Cerebras load, causing
-         premature timeout + retry cascades that burned quota unnecessarily.
+  FIX 2: providers.cerebras-proxy.request_timeout_seconds:90
   FIX 3: pollingStallThresholdMs REMOVED from Telegram config
-  FIX 4: fallback changed from zai-glm-4.7 (355B, 502s under load) to llama3.3-70b
+  FIX 4: fallback changed from zai-glm-4.7 to llama3.3-70b
 
 RUNTIME FREEZE FIX (Jun 2026):
-  ROOT CAUSE 1: No liveness watchdog -- keep-alive only checked kill -0 (PID alive).
-    A frozen Hermes (alive but stuck in tool-call deadlock, retry storm, or
-    browser hang) passes the kill -0 check and is never restarted.
+  ROOT CAUSE 1: No liveness watchdog.
     FIX: Log-activity watchdog added to keep-alive loop in hermes.yml.
-    If /tmp/hermes.log not modified for STALE_THRESHOLD=420s (7 min), Hermes
-    is force-killed and restarted. 420s = bash_max(300s) + timeout(90s) + buffer(30s).
 
   ROOT CAUSE 2: Proxy rate-limit blocking = 310s per LLM call (worst case).
-    5 keys x 30s Retry-After x 2 cycles = 310s serial blocking.
-    With api_max_retries=7: 7 x 310s = 36 minutes of zombie behavior.
     FIX: Per-key cooldown tracking in hermes_key_proxy.py + RETRY_AFTER_MAX 30->10s.
-    New worst case: 100s total (was 310s).
 
   ROOT CAUSE 3: No browser tool timeout.
-    Playwright can hang indefinitely on complex/JS-heavy pages.
     FIX: browser.timeoutMs:30000 and browser.navigationTimeoutMs:30000.
+
+INFINITE WATCHDOG RESTART LOOP FIX (Jul 2026):
+  ROOT CAUSE 1: test_key() in hermes_key_rotator.py only tested GET /v1/models.
+    /v1/models has a separate (generous) quota from /v1/chat/completions.
+    A rate-limited key for chat still returns 200 from /v1/models. So key
+    rotator declared all keys "healthy" while all were rate-limited for chat.
+    FIX: hermes_key_rotator.py now tests with a real 1-token llama3.1-8b
+    chat completion. Rate-limited keys (429) are quarantined, not selected.
+
+  ROOT CAUSE 2: api_max_retries=7 caused 455s freeze when all keys failed.
+    Math: proxy worst-case per call when all keys rate-limited:
+      cycle 0: 5 keys * ~1s (fast 429) = ~5s
+      inter-cycle sleep: 5s
+      cycle 1: 5 keys * (~10s cooldown wait + ~1s HTTP) = ~55s
+      total per proxy call: ~65s
+    7 retries * 65s = 455s. Watchdog fires at 420s (mid-retry 6), kills
+    Hermes. The 10s cooldowns expire during the 420s freeze, so on restart
+    Hermes immediately hits rate limits again -> infinite watchdog loop.
+    FIX: api_max_retries reduced from 7 to 2.
+    New worst-case freeze: 2 * 65s = 130s -- well under the 240s watchdog threshold.
+
+  ROOT CAUSE 3: No circuit breaker in proxy -- same 10s cooldown for any count of failures.
+    FIX: hermes_key_proxy.py circuit breaker. After 3 consecutive failures,
+    key quarantined for 300s. If ALL keys circuit-broken, proxy returns 503
+    immediately -- Hermes fails fast (<1s) instead of blocking for 65s.
+
+  ROOT CAUSE 4: Watchdog restarted Hermes but NOT the proxy.
+    The proxy kept stale cooldown/circuit-breaker state across Hermes restarts.
+    FIX: hermes.yml watchdog now restarts the proxy alongside Hermes, clearing
+    all in-memory cooldown state.
 
 WORKFLOW YAML FIX (May 2026):
   BUG: on:/concurrency:/jobs: had 2-space leading indentation - invalid YAML.
   FIX: All top-level YAML keys moved to column 0.
 
 AUTONOMOUS EXECUTION FIX (May 2026):
-  ROOT CAUSE 1: approvals.mode defaults to "manual" -- agent blocks on approval prompts.
-  ROOT CAUSE 2: HERMES_YOLO_MODE env var not set -- frozen at module import.
+  ROOT CAUSE 1: approvals.mode defaults to "manual".
+  ROOT CAUSE 2: HERMES_YOLO_MODE env var not set.
   ROOT CAUSE 3: tools.bash.timeoutSec: 60 -- too short for security tools.
-  ROOT CAUSE 4: clarify_timeout: 600 -- agent waits 10 minutes asking user questions.
-  ROOT CAUSE 5: max_turns: 200 -- too low for complex multi-step tasks.
-  FIX 1: approvals.mode: "off"
-  FIX 2: approvals.cron_mode: approve
-  FIX 3: HERMES_YOLO_MODE=1 in .env
-  FIX 4: tools.bash.timeoutSec: 300
-  FIX 5: agent.max_turns: 500
-  FIX 6: agent.clarify_timeout: 30
+  ROOT CAUSE 4: clarify_timeout: 600 -- agent waits 10 minutes.
+  ROOT CAUSE 5: max_turns: 200 -- too low for complex tasks.
+  FIX: approvals.mode: "off", HERMES_YOLO_MODE=1, bash.timeoutSec: 300,
+       max_turns: 500, clarify_timeout: 30.
 """
 import os
 import sys
@@ -70,10 +85,7 @@ PRIMARY_CONTEXT = 131072
 PROVIDER_NAME = "cerebras-proxy"
 FALLBACK_MODEL = "llama3.3-70b"
 # Provider-level request timeout (seconds).
-# INCREASED from 60s to 90s (Jun 2026): gpt-oss-120b generates large context-heavy
-# responses for complex tasks. Under Cerebras load, legitimate responses occasionally
-# exceeded 60s, causing premature timeout -> Hermes retry -> quota cascade.
-# 90s gives adequate headroom while still killing genuine stalls promptly.
+# 90s: handles large gpt-oss-120b responses under Cerebras load.
 PROVIDER_TIMEOUT = 90
 
 
@@ -97,9 +109,6 @@ def write_config():
 name: Zypher
 
 # -- PROVIDER (with per-provider timeout) ------------------------------------
-# providers.<id>.request_timeout_seconds is read by hermes_cli/timeouts.py
-# get_provider_request_timeout() and applied to ALL requests.
-# INCREASED from 60s to 90s: handles large gpt-oss-120b responses under load.
 providers:
   {provider}:
     base_url: {base_url}
@@ -126,18 +135,20 @@ fallback_model:
 agent:
   max_turns: 500
   # clarify_timeout: 30s - don't block waiting for user clarification.
-  # Agent proceeds autonomously if the user doesn't respond within 30s.
   clarify_timeout: 30
   gateway_notify_interval: 30
   gateway_timeout: 13200
   gateway_timeout_warning: 3600
-  api_max_retries: 7
+  # api_max_retries: 2 (REDUCED from 7, Jul 2026 freeze fix).
+  # With all keys rate-limited, each proxy call takes up to ~65s.
+  # Old: 7 * 65s = 455s freeze -> watchdog fires at 420s -> infinite loop.
+  # New: 2 * 65s = 130s freeze -> well under 240s watchdog threshold.
+  # Combined with proxy circuit breaker (fast 503 when all keys broken),
+  # actual freeze time is typically <2s when quota is exhausted.
+  api_max_retries: 2
   tool_use_enforcement: true
 
 # -- APPROVAL / YOLO ---------------------------------------------------------
-# mode: "off" disables ALL dangerous-command approval prompts.
-# HERMES_YOLO_MODE=1 in .env is the process-level freeze (read at import time).
-# Both are needed: env var for process-wide freeze, config for runtime bypass.
 approvals:
   mode: "off"
   cron_mode: approve
@@ -164,7 +175,6 @@ gateway:
       botToken: "{tok}"
       dmPolicy: open
       streamMode: block
-      # pollingStallThresholdMs REMOVED (was 120000 - source of 120s stall msg)
       gateway_restart_notification: true
 
 # -- TOOLS -------------------------------------------------------------------
@@ -183,11 +193,8 @@ tools:
     enabled: true
     headless: true
     executablePath: /usr/bin/google-chrome-stable
-    # FREEZE FIX (Jun 2026): Playwright can hang indefinitely on complex pages.
-    # 30s timeout prevents browser tool from blocking the agent forever.
-    # timeoutMs applies to each browser action (click, navigate, evaluate, etc.)
+    # 30s: prevents Playwright hangs on complex/JS-heavy pages.
     timeoutMs: 30000
-    # navigationTimeoutMs: maximum time for page.goto() and page.waitForNavigation()
     navigationTimeoutMs: 30000
 """.format(
         primary=PRIMARY_MODEL,
@@ -207,20 +214,19 @@ tools:
     print("  fallback model     : {}".format(FALLBACK_MODEL))
     print("  context_length     : {:,}".format(PRIMARY_CONTEXT))
     print("  streaming          : false (eliminates SSE stalls)")
-    print("  request_timeout    : {}s (increased from 60s for large responses)".format(PROVIDER_TIMEOUT))
+    print("  request_timeout    : {}s".format(PROVIDER_TIMEOUT))
     print("  stale_timeout      : {}s".format(PROVIDER_TIMEOUT))
     print("  temperature        : 0.3")
     print("  max_turns          : 500")
-    print("  clarify_timeout    : 30s (don't stall waiting for user)")
+    print("  clarify_timeout    : 30s")
     print("  gateway_timeout    : 13200s")
     print("  gateway_notify     : 30s")
-    print("  api_max_retries    : 7")
-    print("  approvals.mode     : off (autonomous - no /approve prompts)")
+    print("  api_max_retries    : 2 (REDUCED from 7 -- prevents 455s freeze)")
+    print("  approvals.mode     : off (autonomous)")
     print("  approvals.cron_mode: approve")
     print("  bash.timeoutSec    : 300s")
-    print("  browser.timeoutMs  : 30000ms (prevents Playwright hangs)")
-    print("  browser.navTimeout : 30000ms (prevents navigation hangs)")
-    print("  pollingStallThresh : REMOVED")
+    print("  browser.timeoutMs  : 30000ms")
+    print("  browser.navTimeout : 30000ms")
 
 
 def write_env():
@@ -244,11 +250,7 @@ def write_env():
         "SUPABASE_URL={sb_url}\n"
         "SUPABASE_SERVICE_KEY={sb_key}\n"
         "GITHUB_TOKEN={gh}\n"
-        "# AUTONOMOUS EXECUTION: bypass all dangerous-command approval prompts.\n"
-        "# tools/approval.py reads this at MODULE IMPORT TIME and freezes the value.\n"
-        "# Must be set before any Hermes Python module is imported.\n"
         "HERMES_YOLO_MODE=1\n"
-        "# Flag this as a gateway session (used by _is_gateway_approval_context()).\n"
         "HERMES_GATEWAY_SESSION=1\n"
     ).format(
         k1=k1, uid=uid, tok=tok, tav=tav,
