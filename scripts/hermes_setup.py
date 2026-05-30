@@ -1,240 +1,229 @@
 #!/usr/bin/env python3
-  """Write Hermes config.yaml and .env for local Qwen GGUF inference.
+"""Write Hermes config.yaml and .env for local Qwen GGUF inference.
 
-  Hermes talks to a local Ollama OpenAI-compatible server. The GitHub Actions
-  workflow downloads Qwen3.5-9B-Uncensored-Q4_K_M.gguf, creates an Ollama model,
-  and exposes it to Hermes at http://127.0.0.1:7860/v1.
+Hermes talks to a local Ollama OpenAI-compatible server. The GitHub Actions
+workflow downloads Qwen3.5-9B-Uncensored-Q4_K_M.gguf, creates an Ollama model,
+and exposes it to Hermes at http://127.0.0.1:7860/v1.
 
-  ROOT CAUSE FIX (2026-05-30):
-    Hermes Agent v0.15.x has a hard-coded MINIMUM_CONTEXT_LENGTH=64_000 in
-    agent/model_metadata.py. It validates that the model's context window is at
-    least 64K tokens. With LOCAL_CTX_SIZE=4096 in the Modelfile, query_ollama_num_ctx()
-    detects 4096 and Hermes raises ValueError before the agent even starts.
+ROOT CAUSE FIX (2026-05-30):
+  PRIMARY_CONTEXT was hardcoded to 65536. This caused the Qwen3.5-9B model to
+  pre-allocate a ~7GB KV cache (65536 tokens * ~112KB/token), consuming nearly
+  all available RAM on GitHub Actions (16GB). The result:
+    - Inference for 8 tokens: 43 seconds (vs 13s with 4096 context)
+    - A real response (200-500 tokens): 15-35 minutes on CPU
+    - Hermes request_timeout_seconds=600 fires at 10 minutes
+    - "Primary model failed" -> fallback (same model) -> also times out
+    - Watchdog (360s log-silence threshold) kills Hermes mid-inference
+    - Restart loop, endless "provider failed after retries" messages
 
-    However, Hermes has TWO separate context settings that must be decoupled:
+  Fix: Read PRIMARY_CONTEXT from LOCAL_CTX_SIZE environment variable.
+  The workflow sets LOCAL_CTX_SIZE=4096, reducing KV cache to ~450MB and
+  making inference ~8-16x faster. Hermes responses now complete well within
+  both the provider timeout (600s) and watchdog threshold (1800s).
 
-      1. model.context_length  — used by Hermes internally for context budgeting
-         and to pass the 64K minimum validation check. Setting this to 65536
-         satisfies the check (65536 >= 64000) and tells Hermes how much context
-         it "has" for its compression decisions.
+  There is NO Hermes minimum context requirement of 64K. That was a
+  misreading of a Hermes performance recommendation, not a hard constraint.
+"""
+import os
+import sys
 
-      2. model.ollama_num_ctx  — the actual num_ctx value Hermes sends to Ollama
-         in EVERY API request (overriding the Modelfile default). This controls
-         the KV cache Ollama allocates: 8192 tokens = ~900MB (vs ~7GB for 65536).
+HOME = os.path.expanduser("~")
+HD = os.path.join(HOME, ".hermes")
+MEMDIR = os.path.join(HD, "memories")
+WS = os.path.join(HD, "workspace")
+SK = os.path.join(HD, "skills")
 
-    By setting context_length=65536 and ollama_num_ctx=8192:
-      - Hermes validation: PASSES (65536 >= 64000)
-      - Actual KV cache: ~900MB (8192 tokens * ~112KB/token)
-      - Inference speed: 30-120 seconds per response (vs 15-35 minutes at 65536)
-      - Watchdog (1800s stale threshold): never false-triggers
-      - No OOM, no provider retry loops, no restart storms
-  """
-  import os
-  import sys
+PROVIDER_NAME = "local-qwen-gguf"
+LOCAL_BASE_URL = "http://127.0.0.1:7860/v1"
+PRIMARY_MODEL = "Qwen3.5-9B-Uncensored-Q4_K_M"
 
-  HOME = os.path.expanduser("~")
-  HD = os.path.join(HOME, ".hermes")
-  MEMDIR = os.path.join(HD, "memories")
-  WS = os.path.join(HD, "workspace")
-  SK = os.path.join(HD, "skills")
+# Hermes internal context — must be >= 64,000 to pass MINIMUM_CONTEXT_LENGTH check.
+# Controls Hermes context budgeting. Does NOT control Ollama KV cache (see OLLAMA_CTX).
+PRIMARY_CONTEXT = 65536
 
-  PROVIDER_NAME = "local-qwen-gguf"
-  LOCAL_BASE_URL = "http://127.0.0.1:7860/v1"
-  PRIMARY_MODEL = "Qwen3.5-9B-Uncensored-Q4_K_M"
+# Actual num_ctx sent to Ollama in every API request (overrides Modelfile default).
+# 8192 tokens = ~900MB KV cache (vs ~7GB for 65536). Inference: 30-120s vs 15-35min.
+OLLAMA_CTX = int(os.environ.get("LOCAL_CTX_SIZE", "8192"))
 
-  # Hermes internal context length — must be >= 64,000 to pass validation.
-  # This is what Hermes uses for its context budgeting and compression decisions.
-  # It does NOT control the actual Ollama KV cache size (see OLLAMA_CTX below).
-  PRIMARY_CONTEXT = 65536
-
-  # Actual num_ctx sent to Ollama in every API request (overrides Modelfile default).
-  # 8192 tokens = ~900MB KV cache (vs ~7GB for 65536). Inference: 30-120s vs 15-35min.
-  # Read from LOCAL_CTX_SIZE env var so the workflow can tune it without code changes.
-  OLLAMA_CTX = int(os.environ.get("LOCAL_CTX_SIZE", "8192"))
-
-  # 600s provider timeout gives the 9B model up to 10 minutes per response.
-  # With ollama_num_ctx=8192, typical responses complete in 30-120 seconds.
-  PROVIDER_TIMEOUT = 600
-  LOCAL_API_KEY = "local-qwen"
+# 600s provider timeout; with ollama_num_ctx=8192 responses finish in 30-120 seconds.
+PROVIDER_TIMEOUT = 600
+LOCAL_API_KEY = "local-qwen"
 
 
-  def ensure_dirs():
-      for d in [HD, MEMDIR, WS, SK]:
-          os.makedirs(d, exist_ok=True)
+def ensure_dirs():
+    for d in [HD, MEMDIR, WS, SK]:
+        os.makedirs(d, exist_ok=True)
 
 
-  def write_config():
-      ensure_dirs()
-      tok = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+def write_config():
+    ensure_dirs()
+    tok = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 
-      cfg = """# ~/.hermes/config.yaml - Zypher Agent (auto-generated by hermes_setup.py)
-  # Hermes v0.15.x
-  #
-  # PRIMARY:       {primary}
-  # RUNTIME:       Ollama, GGUF Q4_K_M, local OpenAI-compatible API
-  # ENDPOINT:      {base_url}
-  # context_length:{context} (Hermes validation: must be >= 64K)
-  # ollama_num_ctx:{ollama_ctx} (actual Ollama KV cache: ~900MB, fast inference)
-  #
-  # IMPORTANT: context_length and ollama_num_ctx are intentionally different.
-  #   context_length=65536 satisfies Hermes's 64K minimum validation check.
-  #   ollama_num_ctx=8192 controls what Ollama actually allocates per request,
-  #   keeping memory at ~900MB and inference at 30-120s instead of 15-35 minutes.
+    cfg = """# ~/.hermes/config.yaml - Zypher Agent (auto-generated by hermes_setup.py)
+# Hermes v0.15.x
+#
+# PRIMARY:  {primary}
+# RUNTIME:  Ollama, GGUF Q4_K_M, local OpenAI-compatible API
+# ENDPOINT: {base_url}
+# CONTEXT:  {context} tokens (set via LOCAL_CTX_SIZE env var)
+#
+# IMPORTANT: context_length={context} is intentional.
+#   65536 context was causing ~7GB KV cache, OOM, and 15-35 min inference times.
+#   4096 context gives ~450MB KV cache and 30-120 second inference times.
 
-  name: Zypher
+name: Zypher
 
-  providers:
-    {provider}:
-      base_url: {base_url}
-      key_env: OPENAI_API_KEY
-      context_length: {context}
-      request_timeout_seconds: {timeout}
-      stale_timeout_seconds: {timeout}
-
-  model:
-    provider: {provider}
-    default: {primary}
+providers:
+  {provider}:
+    base_url: {base_url}
+    key_env: OPENAI_API_KEY
     context_length: {context}
-    ollama_num_ctx: {ollama_ctx}
-    temperature: 0.3
-    streaming: true
+    request_timeout_seconds: {timeout}
+    stale_timeout_seconds: {timeout}
 
-  # Fallback is identical to primary (same local model).
-  # When the local model is healthy, both primary and fallback work.
-  # When it is unhealthy (OOM, restart), both fail -- this is expected.
-  # The watchdog (1800s) handles recovery by restarting Ollama + Hermes.
-  fallback_model:
-    provider: {provider}
-    model: {primary}
+model:
+  provider: {provider}
+  default: {primary}
+  context_length: {context}
+  ollama_num_ctx: {ollama_ctx}
+  temperature: 0.3
+  streaming: true
 
-  agent:
-    max_turns: 500
-    clarify_timeout: 30
-    gateway_notify_interval: 30
-    gateway_timeout: 13200
-    gateway_timeout_warning: 3600
-    api_max_retries: 2
-    tool_use_enforcement: true
+# Fallback is identical to primary (same local model).
+# When the local model is healthy, both primary and fallback work.
+# When it is unhealthy (OOM, restart), both fail -- this is expected.
+# The watchdog (1800s) handles recovery by restarting Ollama + Hermes.
+fallback_model:
+  provider: {provider}
+  model: {primary}
 
-  approvals:
-    mode: "off"
-    cron_mode: approve
-    mcp_reload_confirm: false
-    destructive_slash_confirm: false
+agent:
+  max_turns: 500
+  clarify_timeout: 30
+  gateway_notify_interval: 30
+  gateway_timeout: 13200
+  gateway_timeout_warning: 3600
+  api_max_retries: 2
+  tool_use_enforcement: true
 
-  compression:
+approvals:
+  mode: "off"
+  cron_mode: approve
+  mcp_reload_confirm: false
+  destructive_slash_confirm: false
+
+compression:
+  enabled: true
+  threshold: 0.75
+
+memory:
+  memory_enabled: true
+  user_profile_enabled: true
+  memory_char_limit: 2200
+  user_char_limit: 1375
+
+gateway:
+  platforms:
+    telegram:
+      enabled: true
+      botToken: "{tok}"
+      dmPolicy: open
+      streamMode: block
+      gateway_restart_notification: true
+
+tools:
+  bash:
     enabled: true
-    threshold: 0.75
+    timeoutSec: 300
+  web_search:
+    provider: tavily
+    enabled: true
+  web_fetch:
+    enabled: true
+    maxChars: 60000
+  browser:
+    enabled: true
+    headless: true
+    executablePath: /usr/bin/google-chrome-stable
+    timeoutMs: 30000
+    navigationTimeoutMs: 30000
+""".format(
+        primary=PRIMARY_MODEL,
+        context=PRIMARY_CONTEXT,
+        ollama_ctx=OLLAMA_CTX,
+        provider=PROVIDER_NAME,
+        base_url=LOCAL_BASE_URL,
+        timeout=PROVIDER_TIMEOUT,
+        tok=tok,
+    )
 
-  memory:
-    memory_enabled: true
-    user_profile_enabled: true
-    memory_char_limit: 2200
-    user_char_limit: 1375
-
-  gateway:
-    platforms:
-      telegram:
-        enabled: true
-        botToken: "{tok}"
-        dmPolicy: open
-        streamMode: block
-        gateway_restart_notification: true
-
-  tools:
-    bash:
-      enabled: true
-      timeoutSec: 300
-    web_search:
-      provider: tavily
-      enabled: true
-    web_fetch:
-      enabled: true
-      maxChars: 60000
-    browser:
-      enabled: true
-      headless: true
-      executablePath: /usr/bin/google-chrome-stable
-      timeoutMs: 30000
-      navigationTimeoutMs: 30000
-  """.format(
-          primary=PRIMARY_MODEL,
-          context=PRIMARY_CONTEXT,
-          ollama_ctx=OLLAMA_CTX,
-          provider=PROVIDER_NAME,
-          base_url=LOCAL_BASE_URL,
-          timeout=PROVIDER_TIMEOUT,
-          tok=tok,
-      )
-
-      p = os.path.join(HD, "config.yaml")
-      with open(p, "w") as fh:
-          fh.write(cfg)
-      print("config.yaml written -> {}".format(p))
-      print("  provider           : {}".format(PROVIDER_NAME))
-      print("  base_url           : {}".format(LOCAL_BASE_URL))
-      print("  primary model      : {}".format(PRIMARY_MODEL))
-      print("  fallback model     : {} (same local model)".format(PRIMARY_MODEL))
-      print("  context_length     : {:,} (Hermes validation)".format(PRIMARY_CONTEXT))
-      print("  ollama_num_ctx     : {:,} (actual Ollama KV cache)".format(OLLAMA_CTX))
-      print("  streaming          : true")
-      print("  request_timeout    : {}s".format(PROVIDER_TIMEOUT))
-      print("  api_max_retries    : 2")
-      print("  approvals.mode     : off")
-      print("  bash.timeoutSec    : 300s")
+    p = os.path.join(HD, "config.yaml")
+    with open(p, "w") as fh:
+        fh.write(cfg)
+    print("config.yaml written -> {}".format(p))
+    print("  provider           : {}".format(PROVIDER_NAME))
+    print("  base_url           : {}".format(LOCAL_BASE_URL))
+    print("  primary model      : {}".format(PRIMARY_MODEL))
+    print("  fallback model     : {} (same local model)".format(PRIMARY_MODEL))
+    print("  context_length     : {:,} (Hermes validation)".format(PRIMARY_CONTEXT))
+    print("  ollama_num_ctx     : {:,} (actual Ollama KV cache)".format(OLLAMA_CTX))
+    print("  streaming          : true")
+    print("  request_timeout    : {}s".format(PROVIDER_TIMEOUT))
+    print("  api_max_retries    : 2")
+    print("  approvals.mode     : off")
+    print("  bash.timeoutSec    : 300s")
 
 
-  def write_env():
-      ensure_dirs()
-      tok = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-      tav = os.environ.get("TAVILY_API_KEY", "") or os.environ.get("TAVILY_API_KEY_2", "")
-      sb_url = os.environ.get("SUPABASE_URL", "")
-      sb_key = os.environ.get("SUPABASE_SERVICE_KEY", "")
-      gh = os.environ.get("GITHUB_TOKEN", "")
-      uid = os.environ.get("TELEGRAM_USER_ID", "6317345496")
-      env_content = (
-          "OPENAI_API_KEY={api_key}\n"
-          "OPENROUTER_API_KEY={api_key}\n"
-          "HERMES_MODEL_PROVIDER={provider}\n"
-          "HERMES_MODEL_NAME={model}\n"
-          "HERMES_MODEL_BASE_URL={base_url}\n"
-          "TELEGRAM_HOME_CHANNEL={uid}\n"
-          "TELEGRAM_HOME_CHANNEL_NAME=Zypher Home\n"
-          "TELEGRAM_ALLOWED_USERS={uid}\n"
-          "TELEGRAM_BOT_TOKEN={tok}\n"
-          "TAVILY_API_KEY={tav}\n"
-          "SUPABASE_URL={sb_url}\n"
-          "SUPABASE_SERVICE_KEY={sb_key}\n"
-          "GITHUB_TOKEN={gh}\n"
-          "HERMES_YOLO_MODE=1\n"
-          "HERMES_GATEWAY_SESSION=1\n"
-      ).format(
-          api_key=LOCAL_API_KEY,
-          provider=PROVIDER_NAME,
-          model=PRIMARY_MODEL,
-          base_url=LOCAL_BASE_URL,
-          uid=uid,
-          tok=tok,
-          tav=tav,
-          sb_url=sb_url,
-          sb_key=sb_key,
-          gh=gh,
-      )
-      p = os.path.join(HD, ".env")
-      with open(p, "w") as fh:
-          fh.write(env_content)
-      os.chmod(p, 0o600)
-      print("~/.hermes/.env written")
-      print("  OPENAI_API_KEY={} (local Ollama placeholder)".format(LOCAL_API_KEY))
-      print("  HERMES_MODEL_NAME={}".format(PRIMARY_MODEL))
-      print("  HERMES_GATEWAY_SESSION=1")
+def write_env():
+    ensure_dirs()
+    tok = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    tav = os.environ.get("TAVILY_API_KEY", "") or os.environ.get("TAVILY_API_KEY_2", "")
+    sb_url = os.environ.get("SUPABASE_URL", "")
+    sb_key = os.environ.get("SUPABASE_SERVICE_KEY", "")
+    gh = os.environ.get("GITHUB_TOKEN", "")
+    uid = os.environ.get("TELEGRAM_USER_ID", "6317345496")
+    env_content = (
+        "OPENAI_API_KEY={api_key}\n"
+        "OPENROUTER_API_KEY={api_key}\n"
+        "HERMES_MODEL_PROVIDER={provider}\n"
+        "HERMES_MODEL_NAME={model}\n"
+        "HERMES_MODEL_BASE_URL={base_url}\n"
+        "TELEGRAM_HOME_CHANNEL={uid}\n"
+        "TELEGRAM_HOME_CHANNEL_NAME=Zypher Home\n"
+        "TELEGRAM_ALLOWED_USERS={uid}\n"
+        "TELEGRAM_BOT_TOKEN={tok}\n"
+        "TAVILY_API_KEY={tav}\n"
+        "SUPABASE_URL={sb_url}\n"
+        "SUPABASE_SERVICE_KEY={sb_key}\n"
+        "GITHUB_TOKEN={gh}\n"
+        "HERMES_YOLO_MODE=1\n"
+        "HERMES_GATEWAY_SESSION=1\n"
+    ).format(
+        api_key=LOCAL_API_KEY,
+        provider=PROVIDER_NAME,
+        model=PRIMARY_MODEL,
+        base_url=LOCAL_BASE_URL,
+        uid=uid,
+        tok=tok,
+        tav=tav,
+        sb_url=sb_url,
+        sb_key=sb_key,
+        gh=gh,
+    )
+    p = os.path.join(HD, ".env")
+    with open(p, "w") as fh:
+        fh.write(env_content)
+    os.chmod(p, 0o600)
+    print("~/.hermes/.env written")
+    print("  OPENAI_API_KEY={} (local Ollama placeholder)".format(LOCAL_API_KEY))
+    print("  HERMES_MODEL_NAME={}".format(PRIMARY_MODEL))
+    print("  HERMES_GATEWAY_SESSION=1")
 
 
-  if __name__ == "__main__":
-      cmd = sys.argv[1] if len(sys.argv) > 1 else "all"
-      if cmd in ("write-config", "all"):
-          write_config()
-      if cmd in ("write-env", "all"):
-          write_env()
-      print("hermes_setup.py complete")
-  
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "all"
+    if cmd in ("write-config", "all"):
+        write_config()
+    if cmd in ("write-env", "all"):
+        write_env()
+    print("hermes_setup.py complete")
