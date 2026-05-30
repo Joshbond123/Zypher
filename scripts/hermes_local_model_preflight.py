@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the local llama.cpp OpenAI-compatible API used by Hermes."""
+"""Validate the local Ollama OpenAI-compatible API used by Hermes."""
 import json
 import sys
 from urllib.error import HTTPError
@@ -25,12 +25,13 @@ def request_json(path, payload=None, timeout=180):
 
 
 def main():
-    print("Testing local llama.cpp OpenAI-compatible API...")
+    print("Testing local Ollama OpenAI-compatible API...")
     try:
         models = request_json("/models", timeout=30).get("data", [])
         ids = [m.get("id") for m in models]
         print("Models: {}".format(", ".join(ids) or "(none)"))
-        if MODEL not in ids:
+        advertised = any(mid == MODEL or mid == f"{MODEL}:latest" or str(mid).split(":", 1)[0] == MODEL for mid in ids)
+        if not advertised:
             print("ERROR: expected model {!r} not advertised".format(MODEL))
             sys.exit(1)
 

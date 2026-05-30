@@ -35,9 +35,8 @@ jobs:
       QWEN_MODEL_REPO: LEONW24/Qwen3.5-9B-Uncensored
       QWEN_MODEL_FILE: Qwen3.5-9B-Uncensored-Q4_K_M.gguf
       HERMES_MODEL_NAME: Qwen3.5-9B-Uncensored-Q4_K_M
-      LLAMA_SERVER_PORT: "7860"
-      LLAMA_CTX_SIZE: "8192"
-      LLAMA_THREADS: "4"
+      LOCAL_MODEL_PORT: "7860"
+      LOCAL_CTX_SIZE: "8192"
       OPENAI_API_KEY: local-qwen
       OPENROUTER_API_KEY: local-qwen
     steps:
@@ -131,33 +130,11 @@ jobs:
       - name: Install Hermes Agent
         run: pip install hermes-agent --upgrade -q
 
-      - name: Install llama.cpp server
+      - name: Install Ollama runtime
         run: |
           set -euo pipefail
-          mkdir -p /opt/llama.cpp
-          ASSET_URL=$(curl -sf https://api.github.com/repos/ggml-org/llama.cpp/releases/latest \
-            | jq -r '.assets[] | select(.name | test("bin-ubuntu-x64\\.tar\\.gz$")) | .browser_download_url' \
-            | head -1)
-          if [ -z "$ASSET_URL" ]; then
-            echo "FATAL: no ubuntu x64 llama.cpp binary asset found"
-            exit 1
-          fi
-          echo "Downloading llama.cpp from $ASSET_URL"
-          curl -L --retry 5 --retry-delay 5 "$ASSET_URL" -o /tmp/llama.cpp.tar.gz
-          tar -xzf /tmp/llama.cpp.tar.gz -C /opt/llama.cpp --strip-components=1
-          LLAMA_SERVER_BIN=$(find /opt/llama.cpp -maxdepth 2 -type f -name llama-server -perm -111 | head -1)
-          if [ -z "$LLAMA_SERVER_BIN" ]; then
-            echo "FATAL: llama-server binary not found after extracting llama.cpp"
-            find /opt/llama.cpp -maxdepth 2 -type f | sort | sed -n '1,120p'
-            exit 1
-          fi
-          {
-            echo '#!/bin/sh'
-            echo 'export LD_LIBRARY_PATH=/opt/llama.cpp:${LD_LIBRARY_PATH:-}'
-            echo 'exec /opt/llama.cpp/llama-server "$@"'
-          } | sudo tee /usr/local/bin/llama-server >/dev/null
-          sudo chmod +x /usr/local/bin/llama-server
-          llama-server --version
+          curl -fsSL https://ollama.com/install.sh | sh
+          ollama --version
 
       - name: Download Qwen3.5 GGUF model
         run: |
@@ -170,45 +147,53 @@ jobs:
           du -h /opt/models/qwen/model.gguf
           df -h
 
-      - name: Start local Qwen llama-server
+      - name: Start local Qwen Ollama OpenAI-compatible server
         run: |
           set -euo pipefail
-          nohup llama-server \
-            --model /opt/models/qwen/model.gguf \
-            --alias "$HERMES_MODEL_NAME" \
-            --host 127.0.0.1 \
-            --port "$LLAMA_SERVER_PORT" \
-            --ctx-size "$LLAMA_CTX_SIZE" \
-            --threads "$LLAMA_THREADS" \
-            --parallel 1 \
-            --batch-size 512 \
-            --ubatch-size 128 \
-            --no-webui \
-            > /tmp/llama-server.log 2>&1 &
-          LLAMA_PID=$!
-          echo "LLAMA_PID=$LLAMA_PID" >> $GITHUB_ENV
-          echo "llama-server PID=$LLAMA_PID"
+          export OLLAMA_HOST="127.0.0.1:${LOCAL_MODEL_PORT}"
+          export OLLAMA_MODELS="/opt/ollama-models"
+          mkdir -p "$OLLAMA_MODELS"
+          nohup ollama serve > /tmp/ollama.log 2>&1 &
+          OLLAMA_PID=$!
+          echo "OLLAMA_PID=$OLLAMA_PID" >> $GITHUB_ENV
+          echo "Ollama PID=$OLLAMA_PID"
           SERVER_READY=0
-          for i in $(seq 1 180); do
+          for i in $(seq 1 90); do
             sleep 2
-            if curl -sf "http://127.0.0.1:${LLAMA_SERVER_PORT}/v1/models" \
-              -H "Authorization: Bearer local-qwen" -o /dev/null 2>/dev/null; then
-              echo "llama-server ready after $((i*2))s"
+            if curl -sf "http://${OLLAMA_HOST}/api/version" -o /dev/null 2>/dev/null; then
+              echo "Ollama ready after $((i*2))s"
               SERVER_READY=1
               break
             fi
-            if ! kill -0 "$LLAMA_PID" 2>/dev/null; then
-              echo "FATAL: llama-server exited"
-              cat /tmp/llama-server.log || true
+            if ! kill -0 "$OLLAMA_PID" 2>/dev/null; then
+              echo "FATAL: Ollama exited"
+              cat /tmp/ollama.log || true
               exit 1
             fi
           done
-          echo "=== llama-server startup log ==="
-          tail -120 /tmp/llama-server.log || true
           if [ "$SERVER_READY" -eq 0 ]; then
-            echo "FATAL: llama-server did not become ready"
+            echo "FATAL: Ollama did not become ready"
+            cat /tmp/ollama.log || true
             exit 1
           fi
+          {
+            echo 'FROM /opt/models/qwen/model.gguf'
+            echo "PARAMETER num_ctx ${LOCAL_CTX_SIZE}"
+            echo 'PARAMETER temperature 0.3'
+            echo 'PARAMETER top_p 0.9'
+            echo 'TEMPLATE """{{- if .System }}{{ .System }}{{ end }}'
+            echo '{{- range .Messages }}'
+            echo '<|im_start|>{{ .Role }}'
+            echo '{{ .Content }}<|im_end|>'
+            echo '{{ end }}<|im_start|>assistant'
+            echo '"""'
+            echo 'SYSTEM "You are Zypher, a helpful Hermes AI agent."'
+          } > /opt/models/qwen/Modelfile
+          ollama create "$HERMES_MODEL_NAME" -f /opt/models/qwen/Modelfile
+          ollama list
+          curl -sf "http://${OLLAMA_HOST}/v1/models" -H "Authorization: Bearer local-qwen" | jq .
+          echo "=== Ollama startup log ==="
+          tail -120 /tmp/ollama.log || true
 
       - name: Configure Hermes directories
         run: mkdir -p ~/.hermes/memories ~/.hermes/workspace ~/.hermes/skills
@@ -358,32 +343,23 @@ jobs:
           WATCHDOG_RESTARTS=0
           echo "Keep-alive: ${TIMEOUT}s total | interval=${INTERVAL}s | stale_threshold=${STALE_THRESHOLD}s"
 
-          restart_llama() {
-            echo "Restarting local Qwen llama-server..."
-            kill -KILL ${LLAMA_PID:-0} 2>/dev/null || true
-            pkill -KILL -f "llama-server.*model.gguf" 2>/dev/null || true
+          restart_ollama() {
+            echo "Restarting local Qwen Ollama server..."
+            kill -KILL ${OLLAMA_PID:-0} 2>/dev/null || true
+            pkill -KILL -f "ollama serve" 2>/dev/null || true
             sleep 2
-            nohup llama-server \
-              --model /opt/models/qwen/model.gguf \
-              --alias "$HERMES_MODEL_NAME" \
-              --host 127.0.0.1 \
-              --port "$LLAMA_SERVER_PORT" \
-              --ctx-size "$LLAMA_CTX_SIZE" \
-              --threads "$LLAMA_THREADS" \
-              --parallel 1 \
-              --batch-size 512 \
-              --ubatch-size 128 \
-              --no-webui \
-              >> /tmp/llama-server.log 2>&1 &
-            LLAMA_PID=$!
-            echo "LLAMA_PID=$LLAMA_PID" >> $GITHUB_ENV
+            export OLLAMA_HOST="127.0.0.1:${LOCAL_MODEL_PORT}"
+            export OLLAMA_MODELS="/opt/ollama-models"
+            nohup ollama serve >> /tmp/ollama.log 2>&1 &
+            OLLAMA_PID=$!
+            echo "OLLAMA_PID=$OLLAMA_PID" >> $GITHUB_ENV
             for i in $(seq 1 90); do
               sleep 2
-              curl -sf "http://127.0.0.1:${LLAMA_SERVER_PORT}/v1/models" \
+              curl -sf "http://${OLLAMA_HOST}/v1/models" \
                 -H "Authorization: Bearer local-qwen" -o /dev/null 2>/dev/null \
-                && echo "llama-server back after $((i*2))s" && return 0
+                && echo "Ollama back after $((i*2))s" && return 0
             done
-            echo "FATAL: llama-server failed to restart"
+            echo "FATAL: Ollama failed to restart"
             return 1
           }
 
@@ -391,9 +367,9 @@ jobs:
             sleep $INTERVAL
             ELAPSED=$((ELAPSED+INTERVAL))
 
-            if ! kill -0 $LLAMA_PID 2>/dev/null; then
-              echo "[${ELAPSED}s] llama-server died — restarting..."
-              restart_llama || true
+            if ! kill -0 $OLLAMA_PID 2>/dev/null; then
+              echo "[${ELAPSED}s] Ollama died — restarting..."
+              restart_ollama || true
             fi
 
             if ! kill -0 $HERMES_PID 2>/dev/null; then
@@ -418,7 +394,7 @@ jobs:
                     -d "text=Watchdog #${WATCHDOG_RESTARTS}: Zypher frozen (${LOG_AGE}s silence). Auto-restarting with local Qwen." 2>/dev/null || true
                   kill -KILL $HERMES_PID 2>/dev/null || true
                   pkill -KILL -f "hermes gateway run" 2>/dev/null || true
-                  restart_llama || true
+                  restart_ollama || true
                   python3 scripts/hermes_preapprove.py 2>/dev/null || true
                   nohup hermes gateway run --accept-hooks >> /tmp/hermes.log 2>&1 &
                   HERMES_PID=$!
@@ -449,7 +425,7 @@ jobs:
 
             [ $((ELAPSED % 600)) -eq 0 ] && {
               echo "=== hermes.log tail ===" && tail -5 /tmp/hermes.log 2>/dev/null || true
-              echo "=== llama-server.log tail ===" && tail -8 /tmp/llama-server.log 2>/dev/null || true
+              echo "=== ollama.log tail ===" && tail -8 /tmp/ollama.log 2>/dev/null || true
               echo "[${ELAPSED}s] Watchdog restarts this session: ${WATCHDOG_RESTARTS}"
             } || true
           done
@@ -459,11 +435,11 @@ jobs:
         if: always()
         run: |
           kill -TERM ${HERMES_PID:-0}  2>/dev/null || true
-          kill -TERM ${LLAMA_PID:-0}   2>/dev/null || true
+          kill -TERM ${OLLAMA_PID:-0}   2>/dev/null || true
           kill -TERM ${PAIRING_PID:-0} 2>/dev/null || true
           kill -TERM ${SIDECAR_PID:-0} 2>/dev/null || true
           pkill -TERM -f "hermes gateway run"        2>/dev/null || true
-          pkill -TERM -f "llama-server.*model.gguf"  2>/dev/null || true
+          pkill -TERM -f "ollama serve"  2>/dev/null || true
           pkill -TERM -f "hermes_pairing_watcher.py" 2>/dev/null || true
           pkill -TERM -f "hermes_sidecar.py"         2>/dev/null || true
           for i in $(seq 1 20); do
@@ -472,9 +448,9 @@ jobs:
               || { echo "Hermes exited after ${i}s"; break; }
           done
           kill -KILL ${HERMES_PID:-0} 2>/dev/null || true
-          kill -KILL ${LLAMA_PID:-0} 2>/dev/null || true
+          kill -KILL ${OLLAMA_PID:-0} 2>/dev/null || true
           pkill -KILL -f "hermes gateway run"       2>/dev/null || true
-          pkill -KILL -f "llama-server.*model.gguf" 2>/dev/null || true
+          pkill -KILL -f "ollama serve" 2>/dev/null || true
           echo "Process cleanup complete"
 
       - name: Save memory and state (final WAL-safe flush to Supabase)

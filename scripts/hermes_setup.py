@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Write Hermes config.yaml and .env for local Qwen GGUF inference.
 
-Hermes talks to a local llama.cpp OpenAI-compatible server. The GitHub Actions
-workflow downloads Qwen3.5-9B-Uncensored-Q4_K_M.gguf, starts llama-server on
-127.0.0.1:7860, and exposes it to Hermes at http://127.0.0.1:7860/v1.
+Hermes talks to a local Ollama OpenAI-compatible server. The GitHub Actions
+workflow downloads Qwen3.5-9B-Uncensored-Q4_K_M.gguf, creates an Ollama model,
+and exposes it to Hermes at http://127.0.0.1:7860/v1.
 """
 import os
 import sys
@@ -35,7 +35,7 @@ def write_config():
 # Hermes v0.15.x
 #
 # PRIMARY:  {primary}
-# RUNTIME:  llama.cpp llama-server, GGUF Q4_K_M, local OpenAI-compatible API
+# RUNTIME:  Ollama, GGUF Q4_K_M, local OpenAI-compatible API
 # ENDPOINT: {base_url}
 # CONTEXT:  {context} tokens (stable on GitHub-hosted 4 vCPU / 16 GB runners)
 
@@ -177,7 +177,7 @@ def write_env():
         fh.write(env_content)
     os.chmod(p, 0o600)
     print("~/.hermes/.env written")
-    print("  OPENAI_API_KEY={} (local llama-server placeholder)".format(LOCAL_API_KEY))
+    print("  OPENAI_API_KEY={} (local Ollama placeholder)".format(LOCAL_API_KEY))
     print("  HERMES_MODEL_NAME={}".format(PRIMARY_MODEL))
     print("  HERMES_GATEWAY_SESSION=1")
 

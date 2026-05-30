@@ -19,7 +19,7 @@ def send(msg):
 send(
     f"*Zypher is online* (Run #{RUN})\n\n"
     "Framework: Hermes Agent\n"
-    f"Provider: local llama.cpp OpenAI-compatible server\n"
+    f"Provider: local Ollama OpenAI-compatible server\n"
     f"Model: `{MODEL}`\n"
     "Auth: local placeholder key ✓\n"
     "Tools: bash, web_search, browser\n\n"

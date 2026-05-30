@@ -11,4 +11,4 @@ def send(text):
         with urlopen(req,timeout=15) as r:d=json.loads(r.read());print("Sent" if d.get("ok") else f"WARN: {d}")
     except Exception as e:print(f"WARN: {e}")
 if __name__=="__main__":
-    send(f"*Zypher is online* (Run #{RUN})\n\nFramework: Hermes Agent\nProvider: local llama.cpp / Qwen3.5-9B Q4_K_M\nTools: bash, web_search, browser\n\nReady. Send me anything.")
+    send(f"*Zypher is online* (Run #{RUN})\n\nFramework: Hermes Agent\nProvider: local Ollama / Qwen3.5-9B Q4_K_M\nTools: bash, web_search, browser\n\nReady. Send me anything.")
