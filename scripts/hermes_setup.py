@@ -8,7 +8,11 @@ MODEL HISTORY:
   REMOVED: zai-glm-4.7 as FALLBACK        - also unreliable under fallback load
 
   PRIMARY:  gpt-oss-120b  (120B, ~3000 TPM, pure OpenAI-compatible, no thinking mode)
-  FALLBACK: llama3.3-70b  (70B, reliable, no thinking mode, well-tested)
+  FALLBACK: llama3.1-8b   (8B, ~60k TPM, always available — changed from llama3.3-70b
+            because llama3.3-70b shares the same depleted org quota as the 120B primary,
+            causing both primary AND fallback to fail simultaneously when org quota
+            is exhausted. llama3.1-8b has a separate, much larger quota and is the
+            reliable safety net when larger models are rate-limited.)
 
 STREAMING FIX (May 2026):
   ROOT CAUSE: streaming:true -> Hermes opens SSE connections -> Cerebras stalls -> 120s wait
@@ -83,7 +87,7 @@ PROXY_BASE_URL = "http://127.0.0.1:7860/v1"
 PRIMARY_MODEL = "gpt-oss-120b"
 PRIMARY_CONTEXT = 131072
 PROVIDER_NAME = "cerebras-proxy"
-FALLBACK_MODEL = "llama3.3-70b"
+FALLBACK_MODEL = "llama3.1-8b"
 # Provider-level request timeout (seconds).
 # 90s: handles large gpt-oss-120b responses under Cerebras load.
 PROVIDER_TIMEOUT = 90
