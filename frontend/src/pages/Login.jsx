@@ -109,7 +109,7 @@ export default function Login() {
         </div>
 
         <div className="text-center mt-4 text-xs text-gray-700">
-          Powered by OpenClaw · Kali Linux · Cerebras AI
+          Powered by OpenClaw · Kali Linux · Local Qwen GGUF
         </div>
       </div>
     </div>

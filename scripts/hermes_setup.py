@@ -1,78 +1,9 @@
 #!/usr/bin/env python3
-"""hermes_setup.py - Write Hermes config.yaml and .env from environment variables.
+"""Write Hermes config.yaml and .env for local Qwen GGUF inference.
 
-MODEL HISTORY:
-  REMOVED: qwen-3-235b-a22b-instruct-2507 - deprecated May 27 2026 (HTTP 404)
-  REMOVED: qwen-3-235b-a22b              - also HTTP 404
-  REMOVED: zai-glm-4.7 as PRIMARY         - 355B thinking model, HTTP 502 under load
-  REMOVED: zai-glm-4.7 as FALLBACK        - also unreliable under fallback load
-
-  PRIMARY:  gpt-oss-120b  (120B, ~3000 TPM, pure OpenAI-compatible, no thinking mode)
-  FALLBACK: llama3.1-8b   (8B, ~60k TPM, always available — changed from llama3.3-70b
-            because llama3.3-70b shares the same depleted org quota as the 120B primary,
-            causing both primary AND fallback to fail simultaneously when org quota
-            is exhausted. llama3.1-8b has a separate, much larger quota and is the
-            reliable safety net when larger models are rate-limited.)
-
-STREAMING FIX (May 2026):
-  ROOT CAUSE: streaming:true -> Hermes opens SSE connections -> Cerebras stalls -> 120s wait
-  FIX 1: streaming:false under model: (requests full JSON, no SSE)
-  FIX 2: providers.cerebras-proxy.request_timeout_seconds:90
-  FIX 3: pollingStallThresholdMs REMOVED from Telegram config
-  FIX 4: fallback changed from zai-glm-4.7 to llama3.3-70b
-
-RUNTIME FREEZE FIX (Jun 2026):
-  ROOT CAUSE 1: No liveness watchdog.
-    FIX: Log-activity watchdog added to keep-alive loop in hermes.yml.
-
-  ROOT CAUSE 2: Proxy rate-limit blocking = 310s per LLM call (worst case).
-    FIX: Per-key cooldown tracking in hermes_key_proxy.py + RETRY_AFTER_MAX 30->10s.
-
-  ROOT CAUSE 3: No browser tool timeout.
-    FIX: browser.timeoutMs:30000 and browser.navigationTimeoutMs:30000.
-
-INFINITE WATCHDOG RESTART LOOP FIX (Jul 2026):
-  ROOT CAUSE 1: test_key() in hermes_key_rotator.py only tested GET /v1/models.
-    /v1/models has a separate (generous) quota from /v1/chat/completions.
-    A rate-limited key for chat still returns 200 from /v1/models. So key
-    rotator declared all keys "healthy" while all were rate-limited for chat.
-    FIX: hermes_key_rotator.py now tests with a real 1-token llama3.1-8b
-    chat completion. Rate-limited keys (429) are quarantined, not selected.
-
-  ROOT CAUSE 2: api_max_retries=7 caused 455s freeze when all keys failed.
-    Math: proxy worst-case per call when all keys rate-limited:
-      cycle 0: 5 keys * ~1s (fast 429) = ~5s
-      inter-cycle sleep: 5s
-      cycle 1: 5 keys * (~10s cooldown wait + ~1s HTTP) = ~55s
-      total per proxy call: ~65s
-    7 retries * 65s = 455s. Watchdog fires at 420s (mid-retry 6), kills
-    Hermes. The 10s cooldowns expire during the 420s freeze, so on restart
-    Hermes immediately hits rate limits again -> infinite watchdog loop.
-    FIX: api_max_retries reduced from 7 to 2.
-    New worst-case freeze: 2 * 65s = 130s -- well under the 240s watchdog threshold.
-
-  ROOT CAUSE 3: No circuit breaker in proxy -- same 10s cooldown for any count of failures.
-    FIX: hermes_key_proxy.py circuit breaker. After 3 consecutive failures,
-    key quarantined for 300s. If ALL keys circuit-broken, proxy returns 503
-    immediately -- Hermes fails fast (<1s) instead of blocking for 65s.
-
-  ROOT CAUSE 4: Watchdog restarted Hermes but NOT the proxy.
-    The proxy kept stale cooldown/circuit-breaker state across Hermes restarts.
-    FIX: hermes.yml watchdog now restarts the proxy alongside Hermes, clearing
-    all in-memory cooldown state.
-
-WORKFLOW YAML FIX (May 2026):
-  BUG: on:/concurrency:/jobs: had 2-space leading indentation - invalid YAML.
-  FIX: All top-level YAML keys moved to column 0.
-
-AUTONOMOUS EXECUTION FIX (May 2026):
-  ROOT CAUSE 1: approvals.mode defaults to "manual".
-  ROOT CAUSE 2: HERMES_YOLO_MODE env var not set.
-  ROOT CAUSE 3: tools.bash.timeoutSec: 60 -- too short for security tools.
-  ROOT CAUSE 4: clarify_timeout: 600 -- agent waits 10 minutes.
-  ROOT CAUSE 5: max_turns: 200 -- too low for complex tasks.
-  FIX: approvals.mode: "off", HERMES_YOLO_MODE=1, bash.timeoutSec: 300,
-       max_turns: 500, clarify_timeout: 30.
+Hermes talks to a local llama.cpp OpenAI-compatible server. The GitHub Actions
+workflow downloads Qwen3.5-9B-Uncensored-Q4_K_M.gguf, starts llama-server on
+127.0.0.1:7860, and exposes it to Hermes at http://127.0.0.1:7860/v1.
 """
 import os
 import sys
@@ -83,14 +14,12 @@ MEMDIR = os.path.join(HD, "memories")
 WS = os.path.join(HD, "workspace")
 SK = os.path.join(HD, "skills")
 
-PROXY_BASE_URL = "http://127.0.0.1:7860/v1"
-PRIMARY_MODEL = "gpt-oss-120b"
-PRIMARY_CONTEXT = 131072
-PROVIDER_NAME = "cerebras-proxy"
-FALLBACK_MODEL = "llama3.1-8b"
-# Provider-level request timeout (seconds).
-# 90s: handles large gpt-oss-120b responses under Cerebras load.
-PROVIDER_TIMEOUT = 90
+PROVIDER_NAME = "local-qwen-gguf"
+LOCAL_BASE_URL = "http://127.0.0.1:7860/v1"
+PRIMARY_MODEL = "Qwen3.5-9B-Uncensored-Q4_K_M"
+PRIMARY_CONTEXT = 8192
+PROVIDER_TIMEOUT = 180
+LOCAL_API_KEY = "local-qwen"
 
 
 def ensure_dirs():
@@ -105,14 +34,13 @@ def write_config():
     cfg = """# ~/.hermes/config.yaml - Zypher Agent (auto-generated by hermes_setup.py)
 # Hermes v0.15.x
 #
-# PRIMARY:  {primary}  (120B, 3000 TPM, pure OpenAI-compatible)
-# FALLBACK: {fallback}  (70B, reliable, replaces zai-glm-4.7)
-# TIMEOUT:  {timeout}s per request (provider-level, kills SSE stalls)
+# PRIMARY:  {primary}
+# RUNTIME:  llama.cpp llama-server, GGUF Q4_K_M, local OpenAI-compatible API
+# ENDPOINT: {base_url}
+# CONTEXT:  {context} tokens (stable on GitHub-hosted 4 vCPU / 16 GB runners)
 
-# -- AGENT IDENTITY ----------------------------------------------------------
 name: Zypher
 
-# -- PROVIDER (with per-provider timeout) ------------------------------------
 providers:
   {provider}:
     base_url: {base_url}
@@ -121,57 +49,43 @@ providers:
     request_timeout_seconds: {timeout}
     stale_timeout_seconds: {timeout}
 
-# -- PRIMARY MODEL -----------------------------------------------------------
 model:
   provider: {provider}
   default: {primary}
   context_length: {context}
   temperature: 0.3
-  # streaming:false requests full JSON instead of SSE (eliminates 120s stalls)
   streaming: false
 
-# -- FALLBACK MODEL ----------------------------------------------------------
+# Keep fallback local and identical so Hermes never falls back to an external API.
 fallback_model:
   provider: {provider}
-  model: {fallback}
+  model: {primary}
 
-# -- AGENT BEHAVIOUR ---------------------------------------------------------
 agent:
   max_turns: 500
-  # clarify_timeout: 30s - don't block waiting for user clarification.
   clarify_timeout: 30
   gateway_notify_interval: 30
   gateway_timeout: 13200
   gateway_timeout_warning: 3600
-  # api_max_retries: 2 (REDUCED from 7, Jul 2026 freeze fix).
-  # With all keys rate-limited, each proxy call takes up to ~65s.
-  # Old: 7 * 65s = 455s freeze -> watchdog fires at 420s -> infinite loop.
-  # New: 2 * 65s = 130s freeze -> well under 240s watchdog threshold.
-  # Combined with proxy circuit breaker (fast 503 when all keys broken),
-  # actual freeze time is typically <2s when quota is exhausted.
-  api_max_retries: 2
+  api_max_retries: 1
   tool_use_enforcement: true
 
-# -- APPROVAL / YOLO ---------------------------------------------------------
 approvals:
   mode: "off"
   cron_mode: approve
   mcp_reload_confirm: false
   destructive_slash_confirm: false
 
-# -- COMPRESSION -------------------------------------------------------------
 compression:
   enabled: true
   threshold: 0.75
 
-# -- MEMORY ------------------------------------------------------------------
 memory:
   memory_enabled: true
   user_profile_enabled: true
   memory_char_limit: 2200
   user_char_limit: 1375
 
-# -- GATEWAY -----------------------------------------------------------------
 gateway:
   platforms:
     telegram:
@@ -181,11 +95,9 @@ gateway:
       streamMode: block
       gateway_restart_notification: true
 
-# -- TOOLS -------------------------------------------------------------------
 tools:
   bash:
     enabled: true
-    # 300s (5 minutes) for long-running security scans: nmap, gobuster, sqlmap.
     timeoutSec: 300
   web_search:
     provider: tavily
@@ -197,15 +109,13 @@ tools:
     enabled: true
     headless: true
     executablePath: /usr/bin/google-chrome-stable
-    # 30s: prevents Playwright hangs on complex/JS-heavy pages.
     timeoutMs: 30000
     navigationTimeoutMs: 30000
 """.format(
         primary=PRIMARY_MODEL,
-        fallback=FALLBACK_MODEL,
         context=PRIMARY_CONTEXT,
         provider=PROVIDER_NAME,
-        base_url=PROXY_BASE_URL,
+        base_url=LOCAL_BASE_URL,
         timeout=PROVIDER_TIMEOUT,
         tok=tok,
     )
@@ -214,38 +124,32 @@ tools:
     with open(p, "w") as fh:
         fh.write(cfg)
     print("config.yaml written -> {}".format(p))
+    print("  provider           : {}".format(PROVIDER_NAME))
+    print("  base_url           : {}".format(LOCAL_BASE_URL))
     print("  primary model      : {}".format(PRIMARY_MODEL))
-    print("  fallback model     : {}".format(FALLBACK_MODEL))
+    print("  fallback model     : {} (same local model)".format(PRIMARY_MODEL))
     print("  context_length     : {:,}".format(PRIMARY_CONTEXT))
-    print("  streaming          : false (eliminates SSE stalls)")
+    print("  streaming          : false")
     print("  request_timeout    : {}s".format(PROVIDER_TIMEOUT))
-    print("  stale_timeout      : {}s".format(PROVIDER_TIMEOUT))
-    print("  temperature        : 0.3")
-    print("  max_turns          : 500")
-    print("  clarify_timeout    : 30s")
-    print("  gateway_timeout    : 13200s")
-    print("  gateway_notify     : 30s")
-    print("  api_max_retries    : 2 (REDUCED from 7 -- prevents 455s freeze)")
-    print("  approvals.mode     : off (autonomous)")
-    print("  approvals.cron_mode: approve")
+    print("  api_max_retries    : 1")
+    print("  approvals.mode     : off")
     print("  bash.timeoutSec    : 300s")
-    print("  browser.timeoutMs  : 30000ms")
-    print("  browser.navTimeout : 30000ms")
 
 
 def write_env():
     ensure_dirs()
     tok = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-    k1 = os.environ.get("CEREBRAS_API_KEY", "")
     tav = os.environ.get("TAVILY_API_KEY", "") or os.environ.get("TAVILY_API_KEY_2", "")
     sb_url = os.environ.get("SUPABASE_URL", "")
     sb_key = os.environ.get("SUPABASE_SERVICE_KEY", "")
     gh = os.environ.get("GITHUB_TOKEN", "")
     uid = os.environ.get("TELEGRAM_USER_ID", "6317345496")
     env_content = (
-        "CEREBRAS_API_KEY={k1}\n"
-        "OPENAI_API_KEY=proxy-placeholder\n"
-        "OPENROUTER_API_KEY=proxy-placeholder\n"
+        "OPENAI_API_KEY={api_key}\n"
+        "OPENROUTER_API_KEY={api_key}\n"
+        "HERMES_MODEL_PROVIDER={provider}\n"
+        "HERMES_MODEL_NAME={model}\n"
+        "HERMES_MODEL_BASE_URL={base_url}\n"
         "TELEGRAM_HOME_CHANNEL={uid}\n"
         "TELEGRAM_HOME_CHANNEL_NAME=Zypher Home\n"
         "TELEGRAM_ALLOWED_USERS={uid}\n"
@@ -257,16 +161,25 @@ def write_env():
         "HERMES_YOLO_MODE=1\n"
         "HERMES_GATEWAY_SESSION=1\n"
     ).format(
-        k1=k1, uid=uid, tok=tok, tav=tav,
-        sb_url=sb_url, sb_key=sb_key, gh=gh,
+        api_key=LOCAL_API_KEY,
+        provider=PROVIDER_NAME,
+        model=PRIMARY_MODEL,
+        base_url=LOCAL_BASE_URL,
+        uid=uid,
+        tok=tok,
+        tav=tav,
+        sb_url=sb_url,
+        sb_key=sb_key,
+        gh=gh,
     )
     p = os.path.join(HD, ".env")
     with open(p, "w") as fh:
         fh.write(env_content)
     os.chmod(p, 0o600)
     print("~/.hermes/.env written")
-    print("  HERMES_YOLO_MODE=1       (process-wide approval bypass)")
-    print("  HERMES_GATEWAY_SESSION=1 (flags gateway approval context)")
+    print("  OPENAI_API_KEY={} (local llama-server placeholder)".format(LOCAL_API_KEY))
+    print("  HERMES_MODEL_NAME={}".format(PRIMARY_MODEL))
+    print("  HERMES_GATEWAY_SESSION=1")
 
 
 if __name__ == "__main__":

@@ -1,14 +1,27 @@
 #!/usr/bin/env python3
-"""hermes_startup_notify.py — Send Telegram startup notification."""
-import os,json
-from urllib.request import urlopen,Request
-BOT=os.environ.get("TELEGRAM_BOT_TOKEN","");UID=os.environ.get("TELEGRAM_USER_ID","6317345496");RUN=os.environ.get("GITHUB_RUN_ID","?")
-def send(text):
-    if not BOT or not UID:print("WARN: creds missing");return
-    payload=json.dumps({"chat_id":UID,"text":text,"parse_mode":"Markdown"}).encode()
-    req=Request(f"https://api.telegram.org/bot{BOT}/sendMessage",data=payload,headers={"Content-Type":"application/json"})
-    try:
-        with urlopen(req,timeout=15) as r:d=json.loads(r.read());print("Sent" if d.get("ok") else f"WARN: {d}")
-    except Exception as e:print(f"WARN: {e}")
-if __name__=="__main__":
-    send(f"*Zypher is online* (Run #{RUN})\n\nFramework: Hermes Agent\nProvider: Cerebras via key\-rotation proxy\nAuth: key\_env: OPENAI\_API\_KEY ✓\nTools: bash, web\_search, browser\n\nReady. Send me anything.")
+import os
+import urllib.parse
+import urllib.request
+
+BOT = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+CHAT = os.environ.get("TELEGRAM_USER_ID", "")
+RUN = os.environ.get("GITHUB_RUN_ID", "")
+MODEL = "Qwen3.5-9B-Uncensored-Q4_K_M"
+
+
+def send(msg):
+    if not BOT or not CHAT:
+        return
+    data = urllib.parse.urlencode({"chat_id": CHAT, "text": msg, "parse_mode": "Markdown"}).encode()
+    urllib.request.urlopen(f"https://api.telegram.org/bot{BOT}/sendMessage", data=data, timeout=15)
+
+
+send(
+    f"*Zypher is online* (Run #{RUN})\n\n"
+    "Framework: Hermes Agent\n"
+    f"Provider: local llama.cpp OpenAI-compatible server\n"
+    f"Model: `{MODEL}`\n"
+    "Auth: local placeholder key ✓\n"
+    "Tools: bash, web_search, browser\n\n"
+    "Ready. Send me anything."
+)

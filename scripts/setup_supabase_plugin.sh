@@ -19,7 +19,7 @@ cat > ~/.openclaw/plugins/supabase/config.json << CONFIG
     "messages": "chat_messages",
     "users": "profiles",
     "telegram": "telegram_connections",
-    "api_keys": "cerebras_keys"
+    "model_status": "agent_status"
   },
   "realtime": false
 }

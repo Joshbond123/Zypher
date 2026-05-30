@@ -30,13 +30,16 @@ concurrency:
 jobs:
   run-agent:
     runs-on: ubuntu-latest
-    # FIX-1: Increased from 235 to 240 minutes.
-    # ROOT CAUSE: TIMEOUT=13500 (225 min) + startup overhead (~15 min) totals ~240 min
-    # which hit or exceeded the old 235-min job limit. Cleanup steps (upload-artifact
-    # etc.) were never guaranteed to run in the remaining post-cancellation grace
-    # window. Increasing to 240 and reducing TIMEOUT to 12000 (200 min) guarantees
-    # ~25 min of startup+cleanup headroom every run.
     timeout-minutes: 240
+    env:
+      QWEN_MODEL_REPO: LEONW24/Qwen3.5-9B-Uncensored
+      QWEN_MODEL_FILE: Qwen3.5-9B-Uncensored-Q4_K_M.gguf
+      HERMES_MODEL_NAME: Qwen3.5-9B-Uncensored-Q4_K_M
+      LLAMA_SERVER_PORT: "7860"
+      LLAMA_CTX_SIZE: "8192"
+      LLAMA_THREADS: "4"
+      OPENAI_API_KEY: local-qwen
+      OPENROUTER_API_KEY: local-qwen
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -95,19 +98,22 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             nmap nikto sqlmap gobuster hydra netcat-openbsd masscan curl wget git jq \
-            openssl net-tools whois dnsutils dirb wfuzz ripgrep ffmpeg python3-pip 2>/dev/null || true
+            openssl net-tools whois dnsutils dirb wfuzz ripgrep ffmpeg python3-pip ca-certificates \
+            2>/dev/null || true
           wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -O /tmp/chrome.deb
           sudo apt-get install -y /tmp/chrome.deb 2>/dev/null \
             || (sudo dpkg -i /tmp/chrome.deb && sudo apt-get -f install -y) || true
-          pip install playwright -q && python -m playwright install chromium --with-deps 2>/dev/null || true
+          pip install playwright huggingface_hub -q
+          python -m playwright install chromium --with-deps 2>/dev/null || true
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/* /tmp/chrome.deb
+          df -h
 
       - name: Validate secrets
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_KEY_1 }}
         run: |
           [ -z "$TELEGRAM_BOT_TOKEN" ] && echo 'ERROR: TELEGRAM_BOT_TOKEN not set' && exit 1 || true
-          [ -z "$CEREBRAS_API_KEY" ]   && echo 'ERROR: CEREBRAS_KEY_1 not set'     && exit 1 || true
           echo 'Secrets OK'
 
       - name: Validate Telegram token
@@ -125,6 +131,74 @@ jobs:
       - name: Install Hermes Agent
         run: pip install hermes-agent --upgrade -q
 
+      - name: Install llama.cpp server
+        run: |
+          set -euo pipefail
+          mkdir -p /opt/llama.cpp
+          ASSET_URL=$(curl -sf https://api.github.com/repos/ggml-org/llama.cpp/releases/latest \
+            | jq -r '.assets[] | select(.name | test("bin-ubuntu-x64\\.tar\\.gz$")) | .browser_download_url' \
+            | head -1)
+          if [ -z "$ASSET_URL" ]; then
+            echo "FATAL: no ubuntu x64 llama.cpp binary asset found"
+            exit 1
+          fi
+          echo "Downloading llama.cpp from $ASSET_URL"
+          curl -L --retry 5 --retry-delay 5 "$ASSET_URL" -o /tmp/llama.cpp.tar.gz
+          tar -xzf /tmp/llama.cpp.tar.gz -C /opt/llama.cpp --strip-components=1
+          sudo ln -sf /opt/llama.cpp/bin/llama-server /usr/local/bin/llama-server
+          llama-server --version
+
+      - name: Download Qwen3.5 GGUF model
+        run: |
+          set -euo pipefail
+          mkdir -p /opt/models/qwen
+          hf download "$QWEN_MODEL_REPO" "$QWEN_MODEL_FILE" \
+            --local-dir /opt/models/qwen
+          mv "/opt/models/qwen/$QWEN_MODEL_FILE" /opt/models/qwen/model.gguf
+          test -s /opt/models/qwen/model.gguf
+          du -h /opt/models/qwen/model.gguf
+          df -h
+
+      - name: Start local Qwen llama-server
+        run: |
+          set -euo pipefail
+          nohup llama-server \
+            --model /opt/models/qwen/model.gguf \
+            --alias "$HERMES_MODEL_NAME" \
+            --host 127.0.0.1 \
+            --port "$LLAMA_SERVER_PORT" \
+            --ctx-size "$LLAMA_CTX_SIZE" \
+            --threads "$LLAMA_THREADS" \
+            --parallel 1 \
+            --batch-size 512 \
+            --ubatch-size 128 \
+            --no-webui \
+            > /tmp/llama-server.log 2>&1 &
+          LLAMA_PID=$!
+          echo "LLAMA_PID=$LLAMA_PID" >> $GITHUB_ENV
+          echo "llama-server PID=$LLAMA_PID"
+          SERVER_READY=0
+          for i in $(seq 1 180); do
+            sleep 2
+            if curl -sf "http://127.0.0.1:${LLAMA_SERVER_PORT}/v1/models" \
+              -H "Authorization: Bearer local-qwen" -o /dev/null 2>/dev/null; then
+              echo "llama-server ready after $((i*2))s"
+              SERVER_READY=1
+              break
+            fi
+            if ! kill -0 "$LLAMA_PID" 2>/dev/null; then
+              echo "FATAL: llama-server exited"
+              cat /tmp/llama-server.log || true
+              exit 1
+            fi
+          done
+          echo "=== llama-server startup log ==="
+          tail -120 /tmp/llama-server.log || true
+          if [ "$SERVER_READY" -eq 0 ]; then
+            echo "FATAL: llama-server did not become ready"
+            exit 1
+          fi
+
       - name: Configure Hermes directories
         run: mkdir -p ~/.hermes/memories ~/.hermes/workspace ~/.hermes/skills
 
@@ -132,7 +206,6 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
-          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_KEY_1 }}
         run: |
           python3 scripts/hermes_setup.py write-config
           echo "=== ~/.hermes/config.yaml ===" && cat ~/.hermes/config.yaml
@@ -140,7 +213,6 @@ jobs:
       - name: Write Hermes .env
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_KEY_1 }}
           TAVILY_API_KEY: ${{ secrets.TAVILY_KEY_1 }}
           TAVILY_API_KEY_2: ${{ secrets.TAVILY_KEY_2 }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -149,16 +221,8 @@ jobs:
           TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
         run: python3 scripts/hermes_setup.py write-env
 
-      - name: Cerebras key rotation
-        continue-on-error: true
-        env:
-          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_KEY_1 }}
-          CEREBRAS_API_KEY_2: ${{ secrets.CEREBRAS_KEY_2 }}
-          CEREBRAS_API_KEY_3: ${{ secrets.CEREBRAS_KEY_3 }}
-          CEREBRAS_API_KEY_4: ${{ secrets.CEREBRAS_KEY_4 }}
-          CEREBRAS_API_KEY_5: ${{ secrets.CEREBRAS_KEY_5 }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-        run: python3 scripts/hermes_key_rotator.py
+      - name: Local Qwen preflight (model validation)
+        run: python3 scripts/hermes_local_model_preflight.py
 
       - name: Bootstrap memory and state
         env:
@@ -168,7 +232,6 @@ jobs:
         run: |
           mkdir -p ~/.hermes/memories ~/.hermes/skills
           R="/tmp/memory-restore"
-          # Restore MEMORY.md (flat path first, then nested for old-format artifacts)
           for SRC in "$R/MEMORY.md" "$R/memories/MEMORY.md"; do
             [ -f "$SRC" ] && cp "$SRC" ~/.hermes/memories/MEMORY.md \
               && echo "restored: MEMORY.md from $SRC" && break || true
@@ -176,23 +239,16 @@ jobs:
           [ -f ~/.hermes/memories/MEMORY.md ] || \
             find "$R" -name "MEMORY.md" 2>/dev/null | head -1 | \
             xargs -I{} sh -c 'cp "{}" ~/.hermes/memories/MEMORY.md && echo "restored: MEMORY.md (search)"' 2>/dev/null || true
-          # Restore USER.md
           for SRC in "$R/USER.md" "$R/memories/USER.md"; do
             [ -f "$SRC" ] && cp "$SRC" ~/.hermes/memories/USER.md \
               && echo "restored: USER.md from $SRC" && break || true
           done
-          # Restore state.db (artifact already WAL-safe via sqlite3.backup)
           [ -f "$R/state.db" ] && cp "$R/state.db" ~/.hermes/state.db \
             && echo "restored: state.db" || echo "state.db: not in artifact"
-          # Restore skills
           [ -f "$R/skills.tar.gz" ] && \
             tar xzf "$R/skills.tar.gz" -C ~/.hermes/skills/ 2>/dev/null \
             && echo "restored: skills" || true
-          # Run Python bootstrap (WAL-safe state.db restore + Supabase fallback + SOUL.md restore)
           python3 scripts/hermes_bootstrap_memory.py || true
-          # FIX-4: SOUL.md conditional — only fall back to AGENTS.md if no prior SOUL.md
-          # was restored. hermes_bootstrap_memory.py writes ~/.hermes/SOUL.md when it finds
-          # one in the artifact or Supabase; we only overwrite when nothing was found.
           if [ ! -s ~/.hermes/SOUL.md ]; then
             cp AGENTS.md ~/.hermes/SOUL.md
             echo "SOUL.md: initialized from AGENTS.md (no prior SOUL.md in artifact)"
@@ -200,7 +256,7 @@ jobs:
             echo "SOUL.md: retained from artifact/Supabase ($(wc -c < ~/.hermes/SOUL.md)b)"
           fi
           echo "=== Memory layout after bootstrap ==="
-          find ~/.hermes -maxdepth 2 -type f 2>/dev/null | sort
+          find ~/.hermes -maxdepth 2 -type f | sort
 
       - name: Reset memory
         if: github.event.inputs.reset_memory == 'true'
@@ -223,51 +279,8 @@ jobs:
           TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
         run: python3 scripts/hermes_preapprove.py
 
-      # ─── Start key-rotation proxy BEFORE the gateway ────────────────────────
-      - name: Start Cerebras key-rotation proxy
-        env:
-          CEREBRAS_API_KEY:   ${{ secrets.CEREBRAS_KEY_1 }}
-          CEREBRAS_API_KEY_2: ${{ secrets.CEREBRAS_KEY_2 }}
-          CEREBRAS_API_KEY_3: ${{ secrets.CEREBRAS_KEY_3 }}
-          CEREBRAS_API_KEY_4: ${{ secrets.CEREBRAS_KEY_4 }}
-          CEREBRAS_API_KEY_5: ${{ secrets.CEREBRAS_KEY_5 }}
-          KEY_PROXY_PORT: "7860"
-        run: |
-          nohup python3 scripts/hermes_key_proxy.py > /tmp/hermes-proxy.log 2>&1 &
-          PROXY_PID=$!
-          echo "PROXY_PID=$PROXY_PID" >> $GITHUB_ENV
-          echo "Proxy PID=$PROXY_PID"
-          PROXY_READY=0
-          for i in $(seq 1 20); do
-            sleep 1
-            if curl -sf http://127.0.0.1:7860/v1/models \
-              -H "Authorization: Bearer test" -o /dev/null 2>/dev/null; then
-              echo "Proxy ready after ${i}s"
-              PROXY_READY=1
-              break
-            fi
-          done
-          echo "=== proxy startup log ==="
-          cat /tmp/hermes-proxy.log || true
-          if [ "$PROXY_READY" -eq 0 ]; then
-            echo "FATAL: key-rotation proxy did not start within 20s. Check CEREBRAS_KEY_1."
-            exit 1
-          fi
-          echo "Proxy health check PASSED"
-
-      # ─── Cerebras preflight AFTER proxy starts ───────────────────────────────
-      - name: Cerebras preflight (model validation + config auto-heal)
-        continue-on-error: true
-        env:
-          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_KEY_1 }}
-          KEY_PROXY_PORT: "7860"
-        run: python3 scripts/hermes_provider_preflight.py
-
-      # ─── Start Hermes gateway ────────────────────────────────────────────────
       - name: Start Hermes gateway
         env:
-          OPENAI_API_KEY: "proxy-placeholder"
-          OPENROUTER_API_KEY: "proxy-placeholder"
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
           TELEGRAM_ALLOWED_USERS: ${{ secrets.TELEGRAM_USER_ID }}
@@ -313,16 +326,8 @@ jobs:
           echo "SIDECAR_PID=$!" >> $GITHUB_ENV
           echo "Supabase sidecar started"
 
-      # ─── Keep-alive loop ──────────────────────────────────────────────────────
       - name: Keep agent alive
         env:
-          CEREBRAS_API_KEY:   ${{ secrets.CEREBRAS_KEY_1 }}
-          CEREBRAS_API_KEY_2: ${{ secrets.CEREBRAS_KEY_2 }}
-          CEREBRAS_API_KEY_3: ${{ secrets.CEREBRAS_KEY_3 }}
-          CEREBRAS_API_KEY_4: ${{ secrets.CEREBRAS_KEY_4 }}
-          CEREBRAS_API_KEY_5: ${{ secrets.CEREBRAS_KEY_5 }}
-          OPENAI_API_KEY: "proxy-placeholder"
-          OPENROUTER_API_KEY: "proxy-placeholder"
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
           TELEGRAM_ALLOWED_USERS: ${{ secrets.TELEGRAM_USER_ID }}
@@ -332,72 +337,64 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           GITHUB_RUN_ID: ${{ github.run_id }}
-          KEY_PROXY_PORT: "7860"
           HERMES_YOLO_MODE: "1"
           HERMES_GATEWAY_SESSION: "1"
         run: |
-          # FIX-1: Reduced from 13500 (225 min) to 12000 (200 min).
-          # Old value + startup overhead hit the 235-min job limit, leaving cleanup
-          # (upload-artifact) unable to run reliably. 12000 leaves ~25 min for
-          # startup + cleanup inside the new 240-min job timeout.
           TIMEOUT=12000
           ELAPSED=0
-          # FREEZE FIX (Jun 2026): Reduced from 30s to 20s for faster crash detection.
           INTERVAL=20
-          # WATCHDOG THRESHOLD: if /tmp/hermes.log not modified for this many seconds,
-          # Hermes is considered frozen (alive but stuck) and force-restarted.
-          # = 2 * provider_timeout(90s) + buffer(60s) = 240s (Jul 2026, api_max_retries 7->2).
-          # A frozen agent still passes kill -0 (PID alive) but stops writing to the log.
-          # This catches: tool-call deadlocks, async hangs, provider retry storms,
-          # rate-limit cascades, browser automation freezes.
-          STALE_THRESHOLD=240
+          STALE_THRESHOLD=360
           WATCHDOG_RESTARTS=0
           echo "Keep-alive: ${TIMEOUT}s total | interval=${INTERVAL}s | stale_threshold=${STALE_THRESHOLD}s"
+
+          restart_llama() {
+            echo "Restarting local Qwen llama-server..."
+            kill -KILL ${LLAMA_PID:-0} 2>/dev/null || true
+            pkill -KILL -f "llama-server.*model.gguf" 2>/dev/null || true
+            sleep 2
+            nohup llama-server \
+              --model /opt/models/qwen/model.gguf \
+              --alias "$HERMES_MODEL_NAME" \
+              --host 127.0.0.1 \
+              --port "$LLAMA_SERVER_PORT" \
+              --ctx-size "$LLAMA_CTX_SIZE" \
+              --threads "$LLAMA_THREADS" \
+              --parallel 1 \
+              --batch-size 512 \
+              --ubatch-size 128 \
+              --no-webui \
+              >> /tmp/llama-server.log 2>&1 &
+            LLAMA_PID=$!
+            echo "LLAMA_PID=$LLAMA_PID" >> $GITHUB_ENV
+            for i in $(seq 1 90); do
+              sleep 2
+              curl -sf "http://127.0.0.1:${LLAMA_SERVER_PORT}/v1/models" \
+                -H "Authorization: Bearer local-qwen" -o /dev/null 2>/dev/null \
+                && echo "llama-server back after $((i*2))s" && return 0
+            done
+            echo "FATAL: llama-server failed to restart"
+            return 1
+          }
 
           while [ $ELAPSED -lt $TIMEOUT ]; do
             sleep $INTERVAL
             ELAPSED=$((ELAPSED+INTERVAL))
 
-            # ── Proxy health check + restart ─────────────────────────────────
-            if ! kill -0 $PROXY_PID 2>/dev/null; then
-              echo "[${ELAPSED}s] Key proxy died — restarting..."
-              nohup python3 scripts/hermes_key_proxy.py >> /tmp/hermes-proxy.log 2>&1 &
-              PROXY_PID=$!
-              # FIX-2: Write updated PID to GITHUB_ENV so "Stop all processes"
-              # kills the correct instance even after an in-session restart.
-              echo "PROXY_PID=$PROXY_PID" >> $GITHUB_ENV
-              for i in $(seq 1 15); do
-                sleep 1
-                curl -sf http://127.0.0.1:7860/v1/models \
-                  -H "Authorization: Bearer test" -o /dev/null 2>/dev/null \
-                  && echo "[${ELAPSED}s] Proxy back after ${i}s" && break || true
-              done
+            if ! kill -0 $LLAMA_PID 2>/dev/null; then
+              echo "[${ELAPSED}s] llama-server died — restarting..."
+              restart_llama || true
             fi
 
-            # ── Hermes crash detection + restart ─────────────────────────────
             if ! kill -0 $HERMES_PID 2>/dev/null; then
               echo "[${ELAPSED}s] Hermes crashed — restarting..."
               python3 scripts/hermes_preapprove.py 2>/dev/null || true
               nohup hermes gateway run --accept-hooks >> /tmp/hermes.log 2>&1 &
               HERMES_PID=$!
-              # FIX-2: Write updated PID to GITHUB_ENV so "Stop all processes"
-              # kills the correct Hermes instance after an in-session restart.
               echo "HERMES_PID=$HERMES_PID" >> $GITHUB_ENV
               echo "[${ELAPSED}s] Hermes restarted PID=$HERMES_PID"
               sleep 10
             fi
 
-            # ── LIVENESS WATCHDOG (Jun 2026) ──────────────────────────────────
-            # Detects frozen Hermes: process is alive (kill -0 passes) but has
-            # produced no log output for STALE_THRESHOLD seconds.
-            #
-            # ROOT CAUSE: kill -0 only checks if the process exists. A frozen
-            # Hermes (stuck in tool-call deadlock, provider retry storm, browser
-            # hang, or async deadlock) still passes kill -0 but makes no progress.
-            # This watchdog catches the "alive but silent" state.
-            #
-            # Threshold = 420s: bash tool max (300s) + provider timeout (90s) +
-            # buffer (30s). Any legitimate silence longer than this indicates a freeze.
             if kill -0 "$HERMES_PID" 2>/dev/null; then
               LOG_MTIME=$(date -r /tmp/hermes.log +%s 2>/dev/null || echo 0)
               if [ "$LOG_MTIME" -gt 0 ]; then
@@ -407,46 +404,26 @@ jobs:
                   echo "[${ELAPSED}s] WATCHDOG #${WATCHDOG_RESTARTS}: Hermes frozen — log silent ${LOG_AGE}s > ${STALE_THRESHOLD}s"
                   curl -sf -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
                     -d "chat_id=${TELEGRAM_USER_ID}" \
-                    -d "text=Watchdog #${WATCHDOG_RESTARTS}: Zypher frozen (${LOG_AGE}s silence). Auto-restarting..." 2>/dev/null || true
-                  # Force-kill the frozen instance
+                    -d "text=Watchdog #${WATCHDOG_RESTARTS}: Zypher frozen (${LOG_AGE}s silence). Auto-restarting with local Qwen." 2>/dev/null || true
                   kill -KILL $HERMES_PID 2>/dev/null || true
                   pkill -KILL -f "hermes gateway run" 2>/dev/null || true
-                  sleep 2
-                  # FIX Jul 2026: also restart proxy to clear stale cooldown/CB state.
-                  # The proxy holds in-memory key cooldowns. Without restarting it,
-                  # the 10s cooldowns expire during the freeze, so the new Hermes
-                  # hits rate limits immediately and the watchdog loop repeats.
-                  kill -KILL $PROXY_PID 2>/dev/null || true
-                  pkill -KILL -f "hermes_key_proxy.py" 2>/dev/null || true
-                  sleep 2
-                  nohup python3 scripts/hermes_key_proxy.py >> /tmp/hermes-proxy.log 2>&1 &
-                  PROXY_PID=$!
-                  echo "PROXY_PID=$PROXY_PID" >> $GITHUB_ENV
-                  for _pi in $(seq 1 15); do
-                    sleep 1
-                    curl -sf http://127.0.0.1:7860/health -o /dev/null 2>/dev/null                       && echo "[${ELAPSED}s] WATCHDOG: proxy ready after ${_pi}s" && break || true
-                  done
+                  restart_llama || true
                   python3 scripts/hermes_preapprove.py 2>/dev/null || true
                   nohup hermes gateway run --accept-hooks >> /tmp/hermes.log 2>&1 &
                   HERMES_PID=$!
                   echo "HERMES_PID=$HERMES_PID" >> $GITHUB_ENV
                   echo "[${ELAPSED}s] WATCHDOG: Hermes restarted PID=$HERMES_PID"
-                  curl -sf -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-                    -d "chat_id=${TELEGRAM_USER_ID}" \
-                    -d "text=Watchdog: Zypher restarted successfully (was frozen ${LOG_AGE}s). Run #${GITHUB_RUN_ID}." 2>/dev/null || true
                   sleep 20
                 fi
               fi
             fi
 
-            # ── Pairing watcher restart ──────────────────────────────────────
             if ! kill -0 $PAIRING_PID 2>/dev/null; then
               nohup python3 scripts/hermes_pairing_watcher.py >> /tmp/hermes-pairing.log 2>&1 &
               PAIRING_PID=$!
               echo "PAIRING_PID=$PAIRING_PID" >> $GITHUB_ENV
             fi
 
-            # ── Sidecar restart ──────────────────────────────────────────────
             if ! kill -0 $SIDECAR_PID 2>/dev/null; then
               echo "[${ELAPSED}s] Sidecar died — restarting..."
               nohup python3 scripts/hermes_sidecar.py >> /tmp/hermes-sidecar.log 2>&1 &
@@ -454,53 +431,41 @@ jobs:
               echo "SIDECAR_PID=$SIDECAR_PID" >> $GITHUB_ENV
             fi
 
-            # ── Periodic memory flush (every 300s) ──────────────────────────
             [ $((ELAPSED % 300)) -eq 0 ] && {
               python3 scripts/hermes_sidecar.py --flush-memory 2>/dev/null || true
               echo "[${ELAPSED}s] Memory + state.db flushed to Supabase"
             } || true
 
-            # ── Periodic log tail (every 600s) ───────────────────────────────
             [ $((ELAPSED % 600)) -eq 0 ] && {
               echo "=== hermes.log tail ===" && tail -5 /tmp/hermes.log 2>/dev/null || true
-              echo "=== proxy.log tail ===" && tail -3 /tmp/hermes-proxy.log 2>/dev/null || true
+              echo "=== llama-server.log tail ===" && tail -8 /tmp/llama-server.log 2>/dev/null || true
               echo "[${ELAPSED}s] Watchdog restarts this session: ${WATCHDOG_RESTARTS}"
             } || true
           done
           echo "Session rotation complete (watchdog_restarts=${WATCHDOG_RESTARTS})"
 
-      # FIX-3: "Stop all processes" now runs BEFORE "Save memory and state".
-      # Previously the Supabase flush ran while Hermes was still active. Any
-      # writes between the flush and the eventual kill were lost from Supabase.
-      # Killing first ensures the flush captures the fully-settled post-kill state.
       - name: Stop all processes
         if: always()
         run: |
-          # Primary kill by PID (GITHUB_ENV — updated on restart by FIX-2)
-          kill -TERM $HERMES_PID  2>/dev/null || true
-          kill -TERM $PROXY_PID   2>/dev/null || true
-          kill -TERM $PAIRING_PID 2>/dev/null || true
-          kill -TERM $SIDECAR_PID 2>/dev/null || true
-          # FIX-2: Belt-and-suspenders kill by process name — catches any instances
-          # whose updated PID was not yet persisted to GITHUB_ENV before the job
-          # was cancelled or timed out.
+          kill -TERM ${HERMES_PID:-0}  2>/dev/null || true
+          kill -TERM ${LLAMA_PID:-0}   2>/dev/null || true
+          kill -TERM ${PAIRING_PID:-0} 2>/dev/null || true
+          kill -TERM ${SIDECAR_PID:-0} 2>/dev/null || true
           pkill -TERM -f "hermes gateway run"        2>/dev/null || true
-          pkill -TERM -f "hermes_key_proxy.py"       2>/dev/null || true
+          pkill -TERM -f "llama-server.*model.gguf"  2>/dev/null || true
           pkill -TERM -f "hermes_pairing_watcher.py" 2>/dev/null || true
           pkill -TERM -f "hermes_sidecar.py"         2>/dev/null || true
-          # Wait up to 20s for Hermes to exit cleanly (allows SQLite to flush WAL)
           for i in $(seq 1 20); do
             sleep 1
-            { kill -0 $HERMES_PID 2>/dev/null || pgrep -f "hermes gateway run" > /dev/null 2>&1; } \
+            { kill -0 ${HERMES_PID:-0} 2>/dev/null || pgrep -f "hermes gateway run" > /dev/null 2>&1; } \
               || { echo "Hermes exited after ${i}s"; break; }
           done
-          # Force-kill anything still running
-          kill -KILL $HERMES_PID 2>/dev/null || true
-          pkill -KILL -f "hermes gateway run" 2>/dev/null || true
+          kill -KILL ${HERMES_PID:-0} 2>/dev/null || true
+          kill -KILL ${LLAMA_PID:-0} 2>/dev/null || true
+          pkill -KILL -f "hermes gateway run"       2>/dev/null || true
+          pkill -KILL -f "llama-server.*model.gguf" 2>/dev/null || true
           echo "Process cleanup complete"
 
-      # FIX-3 (continued): Flush AFTER kill — Supabase now gets the fully-settled
-      # post-kill state of all memory files and state.db.
       - name: Save memory and state (final WAL-safe flush to Supabase)
         if: always()
         env:
@@ -518,41 +483,16 @@ jobs:
         run: |
           curl -sf -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d "chat_id=${TELEGRAM_USER_ID}" \
-            -d "text=Zypher rotating (Run #${GITHUB_RUN_ID}). Back in seconds..." || true
+            -d "text=Zypher session rotating. Run #${GITHUB_RUN_ID} ended. Next scheduled run will start automatically with local Qwen3.5-9B GGUF." || true
 
-      - name: Stage memory for artifact upload
+      - name: Stage memory artifact
         if: always()
-        run: |
-          python3 scripts/hermes_stage_artifact.py && STAGED=1 || STAGED=0
-          if [ "$STAGED" -eq 0 ]; then
-            mkdir -p /tmp/hermes-artifact
-            cp ~/.hermes/memories/MEMORY.md /tmp/hermes-artifact/MEMORY.md 2>/dev/null || true
-            cp ~/.hermes/memories/USER.md   /tmp/hermes-artifact/USER.md   2>/dev/null || true
-            cp ~/.hermes/SOUL.md            /tmp/hermes-artifact/SOUL.md   2>/dev/null || true
-            [ -f ~/.hermes/state.db ] && cp ~/.hermes/state.db /tmp/hermes-artifact/state.db || true
-            echo 'Shell fallback staging used'
-          fi
-          echo '=== Staged files ==='
-          ls -lh /tmp/hermes-artifact/ 2>/dev/null || echo '(nothing staged)'
+        run: python3 scripts/hermes_stage_artifact.py
 
       - name: Upload memory artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: zypher-hermes-memory
-          path: /tmp/hermes-artifact/
-          retention-days: 90
-          if-no-files-found: warn
-          overwrite: true
-
-      - name: Trigger next run (zero-gap rotation)
-        if: always()
-        env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
-          REPO: ${{ github.repository }}
-        run: |
-          curl -sf -X POST \
-            -H "Authorization: token $GH_TOKEN" \
-            -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/$REPO/actions/workflows/hermes.yml/dispatches" \
-            -d '{"ref":"main"}' && echo 'Next run triggered' || echo 'WARN: trigger failed'
+          path: /tmp/hermes-artifact/*
+          retention-days: 7

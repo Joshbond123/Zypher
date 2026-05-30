@@ -1,11 +1,10 @@
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { supabase } from '../lib/supabase'
-import { Terminal, MessageSquare, Key, Activity, Zap, Clock, Shield, AlertCircle } from 'lucide-react'
+import { Terminal, MessageSquare, Cpu, Activity, Zap, Clock, Shield, AlertCircle } from 'lucide-react'
 
 export default function Dashboard({ session }) {
   const [telegramConn, setTelegramConn] = useState(null)
-  const [keyCount, setKeyCount] = useState(0)
   const [msgCount, setMsgCount] = useState(0)
   const [activeSession, setActiveSession] = useState(null)
   const [loading, setLoading] = useState(true)
@@ -19,14 +18,12 @@ export default function Dashboard({ session }) {
 
   const loadData = async () => {
     const uid = session.user.id
-    const [tg, keys, msgs, sess] = await Promise.all([
+    const [tg, msgs, sess] = await Promise.all([
       supabase.from('telegram_connections').select('*').eq('user_id', uid).single(),
-      supabase.from('cerebras_keys').select('id', { count: 'exact' }).eq('user_id', uid).eq('is_active', true),
       supabase.from('chat_messages').select('id', { count: 'exact' }).eq('user_id', uid),
       supabase.from('active_sessions').select('*').eq('is_active', true).order('started_at', { ascending: false }).limit(1),
     ])
     setTelegramConn(tg.data)
-    setKeyCount(keys.count || 0)
     setMsgCount(msgs.count || 0)
     setActiveSession(sess.data?.[0] || null)
     setLoading(false)
@@ -56,13 +53,12 @@ export default function Dashboard({ session }) {
       actionLabel: 'Connect Now',
     },
     {
-      label: 'Cerebras Keys',
-      value: String(keyCount),
-      sub: keyCount === 0 ? 'No keys — add some' : `${keyCount} active key${keyCount !== 1 ? 's' : ''} rotating`,
-      icon: Key,
+      label: 'Local Model',
+      value: 'QWEN3.5',
+      sub: '9B Uncensored Q4_K_M via llama.cpp',
+      icon: Cpu,
       color: 'text-cyber-cyan',
-      action: () => nav('/keys'),
-      actionLabel: 'Manage Keys',
+      action: null,
     },
     {
       label: 'Messages',
@@ -164,7 +160,7 @@ export default function Dashboard({ session }) {
             </div>
             <div className="flex gap-2">
               <span className="text-cyber-green flex-shrink-0">02</span>
-              <span>Add your Cerebras API keys for AI inference</span>
+              <span>The workflow runs Qwen3.5-9B Q4_K_M locally through llama.cpp</span>
             </div>
             <div className="flex gap-2">
               <span className="text-cyber-green flex-shrink-0">03</span>

@@ -87,17 +87,6 @@ CREATE TABLE IF NOT EXISTS active_sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_active_sessions_active ON active_sessions(is_active);
 
-CREATE TABLE IF NOT EXISTS cerebras_keys (
-  id          BIGSERIAL PRIMARY KEY,
-  key_id      TEXT UNIQUE NOT NULL,
-  masked_key  TEXT,
-  requests    INTEGER DEFAULT 0,
-  rate_limits INTEGER DEFAULT 0,
-  failures    INTEGER DEFAULT 0,
-  last_used   TIMESTAMPTZ,
-  last_error  TEXT,
-  updated_at  TIMESTAMPTZ DEFAULT now()
-);
 
 CREATE TABLE IF NOT EXISTS telegram_connections (
   id           BIGSERIAL PRIMARY KEY,
@@ -112,7 +101,7 @@ CREATE TABLE IF NOT EXISTS telegram_connections (
 REQUIRED_TABLES = [
     "chat_messages", "longterm_memory", "memory_entries",
     "task_log", "agent_status", "active_sessions",
-    "cerebras_keys", "telegram_connections",
+    "telegram_connections",
 ]
 
 

@@ -4,7 +4,6 @@ import { supabase } from './lib/supabase'
 import Login from './pages/Login'
 import Dashboard from './pages/Dashboard'
 import TelegramConnect from './pages/TelegramConnect'
-import CerebrasKeys from './pages/CerebrasKeys'
 import NavBar from './components/NavBar'
 
 export default function App() {
@@ -36,7 +35,6 @@ export default function App() {
         <Route path="/" element={!session ? <Login /> : <Navigate to="/dashboard" />} />
         <Route path="/dashboard" element={session ? <Dashboard session={session} /> : <Navigate to="/" />} />
         <Route path="/telegram" element={session ? <TelegramConnect session={session} /> : <Navigate to="/" />} />
-        <Route path="/keys" element={session ? <CerebrasKeys session={session} /> : <Navigate to="/" />} />
         <Route path="*" element={<Navigate to="/" />} />
       </Routes>
     </div>

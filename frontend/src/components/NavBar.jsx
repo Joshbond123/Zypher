@@ -1,6 +1,6 @@
 import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { supabase } from '../lib/supabase'
-import { Terminal, MessageSquare, Key, LogOut, Zap } from 'lucide-react'
+import { Terminal, MessageSquare, LogOut, Zap } from 'lucide-react'
 
 export default function NavBar({ session }) {
   const loc = useLocation()
@@ -14,7 +14,6 @@ export default function NavBar({ session }) {
   const links = [
     { to: '/dashboard', label: 'Dashboard', icon: Terminal },
     { to: '/telegram', label: 'Telegram', icon: MessageSquare },
-    { to: '/keys', label: 'API Keys', icon: Key },
   ]
 
   return (
