@@ -145,7 +145,18 @@ jobs:
           echo "Downloading llama.cpp from $ASSET_URL"
           curl -L --retry 5 --retry-delay 5 "$ASSET_URL" -o /tmp/llama.cpp.tar.gz
           tar -xzf /tmp/llama.cpp.tar.gz -C /opt/llama.cpp --strip-components=1
-          sudo ln -sf /opt/llama.cpp/bin/llama-server /usr/local/bin/llama-server
+          LLAMA_SERVER_BIN=$(find /opt/llama.cpp -maxdepth 2 -type f -name llama-server -perm -111 | head -1)
+          if [ -z "$LLAMA_SERVER_BIN" ]; then
+            echo "FATAL: llama-server binary not found after extracting llama.cpp"
+            find /opt/llama.cpp -maxdepth 2 -type f | sort | sed -n '1,120p'
+            exit 1
+          fi
+          {
+            echo '#!/bin/sh'
+            echo 'export LD_LIBRARY_PATH=/opt/llama.cpp:${LD_LIBRARY_PATH:-}'
+            echo 'exec /opt/llama.cpp/llama-server "$@"'
+          } | sudo tee /usr/local/bin/llama-server >/dev/null
+          sudo chmod +x /usr/local/bin/llama-server
           llama-server --version
 
       - name: Download Qwen3.5 GGUF model
