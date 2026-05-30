@@ -18,7 +18,7 @@ PROVIDER_NAME = "local-qwen-gguf"
 LOCAL_BASE_URL = "http://127.0.0.1:7860/v1"
 PRIMARY_MODEL = "Qwen3.5-9B-Uncensored-Q4_K_M"
 PRIMARY_CONTEXT = 65536
-PROVIDER_TIMEOUT = 180
+PROVIDER_TIMEOUT = 600
 LOCAL_API_KEY = "local-qwen"
 
 
@@ -53,8 +53,9 @@ model:
   provider: {provider}
   default: {primary}
   context_length: {context}
+  ollama_num_ctx: {context}
   temperature: 0.3
-  streaming: false
+  streaming: true
 
 # Keep fallback local and identical so Hermes never falls back to an external API.
 fallback_model:
@@ -67,7 +68,7 @@ agent:
   gateway_notify_interval: 30
   gateway_timeout: 13200
   gateway_timeout_warning: 3600
-  api_max_retries: 1
+  api_max_retries: 3
   tool_use_enforcement: true
 
 approvals:
@@ -129,9 +130,10 @@ tools:
     print("  primary model      : {}".format(PRIMARY_MODEL))
     print("  fallback model     : {} (same local model)".format(PRIMARY_MODEL))
     print("  context_length     : {:,}".format(PRIMARY_CONTEXT))
-    print("  streaming          : false")
+    print("  ollama_num_ctx     : {:,}".format(PRIMARY_CONTEXT))
+    print("  streaming          : true")
     print("  request_timeout    : {}s".format(PROVIDER_TIMEOUT))
-    print("  api_max_retries    : 1")
+    print("  api_max_retries    : 3")
     print("  approvals.mode     : off")
     print("  bash.timeoutSec    : 300s")
 
