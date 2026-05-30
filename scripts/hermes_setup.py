@@ -13,32 +13,47 @@ MODEL HISTORY:
 STREAMING FIX (May 2026):
   ROOT CAUSE: streaming:true -> Hermes opens SSE connections -> Cerebras stalls -> 120s wait
   FIX 1: streaming:false under model: (requests full JSON, no SSE)
-  FIX 2: providers.cerebras-proxy.request_timeout_seconds:60 - Hermes kills stalled
-         requests at the provider level after 60s. This is the definitive fix using
-         the official Hermes hermes_cli/timeouts.py per-provider timeout API.
+  FIX 2: providers.cerebras-proxy.request_timeout_seconds:90 - kills stalled requests.
+         INCREASED from 60s to 90s (Jun 2026): large gpt-oss-120b responses for
+         complex tasks occasionally exceeded 60s under Cerebras load, causing
+         premature timeout + retry cascades that burned quota unnecessarily.
   FIX 3: pollingStallThresholdMs REMOVED from Telegram config
   FIX 4: fallback changed from zai-glm-4.7 (355B, 502s under load) to llama3.3-70b
 
+RUNTIME FREEZE FIX (Jun 2026):
+  ROOT CAUSE 1: No liveness watchdog -- keep-alive only checked kill -0 (PID alive).
+    A frozen Hermes (alive but stuck in tool-call deadlock, retry storm, or
+    browser hang) passes the kill -0 check and is never restarted.
+    FIX: Log-activity watchdog added to keep-alive loop in hermes.yml.
+    If /tmp/hermes.log not modified for STALE_THRESHOLD=420s (7 min), Hermes
+    is force-killed and restarted. 420s = bash_max(300s) + timeout(90s) + buffer(30s).
+
+  ROOT CAUSE 2: Proxy rate-limit blocking = 310s per LLM call (worst case).
+    5 keys x 30s Retry-After x 2 cycles = 310s serial blocking.
+    With api_max_retries=7: 7 x 310s = 36 minutes of zombie behavior.
+    FIX: Per-key cooldown tracking in hermes_key_proxy.py + RETRY_AFTER_MAX 30->10s.
+    New worst case: 100s total (was 310s).
+
+  ROOT CAUSE 3: No browser tool timeout.
+    Playwright can hang indefinitely on complex/JS-heavy pages.
+    FIX: browser.timeoutMs:30000 and browser.navigationTimeoutMs:30000.
+
 WORKFLOW YAML FIX (May 2026):
-  BUG: on:/concurrency:/jobs: had 2-space leading indentation - invalid GitHub Actions YAML.
-  This caused every push-triggered run to fail instantly with no jobs.
+  BUG: on:/concurrency:/jobs: had 2-space leading indentation - invalid YAML.
   FIX: All top-level YAML keys moved to column 0.
 
 AUTONOMOUS EXECUTION FIX (May 2026):
-  ROOT CAUSE 1: approvals.mode defaults to "manual" — agent blocks waiting for the user
-    to send /approve on Telegram for every dangerous command (nmap, sqlmap, curl, gobuster).
-    This causes task stalling indefinitely when the user is not actively monitoring.
-  ROOT CAUSE 2: HERMES_YOLO_MODE env var not set — this is frozen at module import in
-    tools/approval.py and is the definitive process-wide bypass for all approval gates.
-  ROOT CAUSE 3: tools.bash.timeoutSec: 60 — too short for security tools (nmap takes minutes).
-  ROOT CAUSE 4: clarify_timeout: 600 — agent waits 10 minutes asking the user questions.
-  ROOT CAUSE 5: max_turns: 200 — too low for complex multi-step hacking tasks.
-  FIX 1: approvals.mode: "off"  — config-level bypass (checked every call)
-  FIX 2: approvals.cron_mode: approve — allow dangerous commands in background context
-  FIX 3: HERMES_YOLO_MODE=1 in .env — process-level bypass (frozen at import time)
-  FIX 4: tools.bash.timeoutSec: 300 — 5 minutes for long-running security scans
-  FIX 5: agent.max_turns: 500 — allow complex multi-step tasks
-  FIX 6: agent.clarify_timeout: 30 — don't wait long for user clarification
+  ROOT CAUSE 1: approvals.mode defaults to "manual" -- agent blocks on approval prompts.
+  ROOT CAUSE 2: HERMES_YOLO_MODE env var not set -- frozen at module import.
+  ROOT CAUSE 3: tools.bash.timeoutSec: 60 -- too short for security tools.
+  ROOT CAUSE 4: clarify_timeout: 600 -- agent waits 10 minutes asking user questions.
+  ROOT CAUSE 5: max_turns: 200 -- too low for complex multi-step tasks.
+  FIX 1: approvals.mode: "off"
+  FIX 2: approvals.cron_mode: approve
+  FIX 3: HERMES_YOLO_MODE=1 in .env
+  FIX 4: tools.bash.timeoutSec: 300
+  FIX 5: agent.max_turns: 500
+  FIX 6: agent.clarify_timeout: 30
 """
 import os
 import sys
@@ -54,11 +69,12 @@ PRIMARY_MODEL = "gpt-oss-120b"
 PRIMARY_CONTEXT = 131072
 PROVIDER_NAME = "cerebras-proxy"
 FALLBACK_MODEL = "llama3.3-70b"
-# Provider-level request timeout (seconds). Hermes reads this via
-# hermes_cli/timeouts.py get_provider_request_timeout(). Kills stalled
-# requests (streaming or non-streaming) after 60s - definitive fix for
-# the "waiting for stream response (120s, no chunks yet)" error.
-PROVIDER_TIMEOUT = 60
+# Provider-level request timeout (seconds).
+# INCREASED from 60s to 90s (Jun 2026): gpt-oss-120b generates large context-heavy
+# responses for complex tasks. Under Cerebras load, legitimate responses occasionally
+# exceeded 60s, causing premature timeout -> Hermes retry -> quota cascade.
+# 90s gives adequate headroom while still killing genuine stalls promptly.
+PROVIDER_TIMEOUT = 90
 
 
 def ensure_dirs():
@@ -70,49 +86,46 @@ def write_config():
     ensure_dirs()
     tok = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 
-    cfg = f"""# ~/.hermes/config.yaml - Zypher Agent (auto-generated by hermes_setup.py)
+    cfg = """# ~/.hermes/config.yaml - Zypher Agent (auto-generated by hermes_setup.py)
 # Hermes v0.15.x
 #
-# PRIMARY:  {PRIMARY_MODEL}  (120B, 3000 TPM, pure OpenAI-compatible)
-# FALLBACK: {FALLBACK_MODEL}  (70B, reliable, replaces zai-glm-4.7)
-# TIMEOUT:  {PROVIDER_TIMEOUT}s per request (provider-level, kills SSE stalls)
+# PRIMARY:  {primary}  (120B, 3000 TPM, pure OpenAI-compatible)
+# FALLBACK: {fallback}  (70B, reliable, replaces zai-glm-4.7)
+# TIMEOUT:  {timeout}s per request (provider-level, kills SSE stalls)
 
 # -- AGENT IDENTITY ----------------------------------------------------------
 name: Zypher
 
 # -- PROVIDER (with per-provider timeout) ------------------------------------
 # providers.<id>.request_timeout_seconds is read by hermes_cli/timeouts.py
-# get_provider_request_timeout() and applied to ALL requests (streaming +
-# non-streaming). This kills Cerebras SSE stalls after 60s regardless of
-# whether model.streaming:false is respected by this Hermes version.
+# get_provider_request_timeout() and applied to ALL requests.
+# INCREASED from 60s to 90s: handles large gpt-oss-120b responses under load.
 providers:
-  {PROVIDER_NAME}:
-    base_url: {PROXY_BASE_URL}
+  {provider}:
+    base_url: {base_url}
     key_env: OPENAI_API_KEY
-    context_length: {PRIMARY_CONTEXT}
-    request_timeout_seconds: {PROVIDER_TIMEOUT}
-    stale_timeout_seconds: {PROVIDER_TIMEOUT}
+    context_length: {context}
+    request_timeout_seconds: {timeout}
+    stale_timeout_seconds: {timeout}
 
 # -- PRIMARY MODEL -----------------------------------------------------------
 model:
-  provider: {PROVIDER_NAME}
-  default: {PRIMARY_MODEL}
-  context_length: {PRIMARY_CONTEXT}
+  provider: {provider}
+  default: {primary}
+  context_length: {context}
   temperature: 0.3
   # streaming:false requests full JSON instead of SSE (eliminates 120s stalls)
   streaming: false
 
 # -- FALLBACK MODEL ----------------------------------------------------------
-# llama3.3-70b: 70B, no thinking mode, proven reliable on Cerebras.
-# Replaced zai-glm-4.7 (355B thinking model that 502d under fallback load).
 fallback_model:
-  provider: {PROVIDER_NAME}
-  model: {FALLBACK_MODEL}
+  provider: {provider}
+  model: {fallback}
 
 # -- AGENT BEHAVIOUR ---------------------------------------------------------
 agent:
   max_turns: 500
-  # Short clarify_timeout: don't block waiting for user clarification for long.
+  # clarify_timeout: 30s - don't block waiting for user clarification.
   # Agent proceeds autonomously if the user doesn't respond within 30s.
   clarify_timeout: 30
   gateway_notify_interval: 30
@@ -123,10 +136,7 @@ agent:
 
 # -- APPROVAL / YOLO ---------------------------------------------------------
 # mode: "off" disables ALL dangerous-command approval prompts.
-# Without this, the agent blocks every nmap/sqlmap/curl/gobuster call waiting
-# for the user to send /approve on Telegram — causing indefinite task stalls.
 # HERMES_YOLO_MODE=1 in .env is the process-level freeze (read at import time).
-# This config entry is the runtime check (checked on every tool call).
 # Both are needed: env var for process-wide freeze, config for runtime bypass.
 approvals:
   mode: "off"
@@ -154,7 +164,7 @@ gateway:
       botToken: "{tok}"
       dmPolicy: open
       streamMode: block
-      # pollingStallThresholdMs REMOVED (was 120000 - source of the 120s msg)
+      # pollingStallThresholdMs REMOVED (was 120000 - source of 120s stall msg)
       gateway_restart_notification: true
 
 # -- TOOLS -------------------------------------------------------------------
@@ -162,7 +172,6 @@ tools:
   bash:
     enabled: true
     # 300s (5 minutes) for long-running security scans: nmap, gobuster, sqlmap.
-    # The previous 60s timeout caused tool failures on any scan taking > 1 min.
     timeoutSec: 300
   web_search:
     provider: tavily
@@ -174,26 +183,43 @@ tools:
     enabled: true
     headless: true
     executablePath: /usr/bin/google-chrome-stable
-"""
+    # FREEZE FIX (Jun 2026): Playwright can hang indefinitely on complex pages.
+    # 30s timeout prevents browser tool from blocking the agent forever.
+    # timeoutMs applies to each browser action (click, navigate, evaluate, etc.)
+    timeoutMs: 30000
+    # navigationTimeoutMs: maximum time for page.goto() and page.waitForNavigation()
+    navigationTimeoutMs: 30000
+""".format(
+        primary=PRIMARY_MODEL,
+        fallback=FALLBACK_MODEL,
+        context=PRIMARY_CONTEXT,
+        provider=PROVIDER_NAME,
+        base_url=PROXY_BASE_URL,
+        timeout=PROVIDER_TIMEOUT,
+        tok=tok,
+    )
+
     p = os.path.join(HD, "config.yaml")
     with open(p, "w") as fh:
         fh.write(cfg)
-    print(f"config.yaml written -> {p}")
-    print(f"  primary model      : {PRIMARY_MODEL}")
-    print(f"  fallback model     : {FALLBACK_MODEL}")
-    print(f"  context_length     : {PRIMARY_CONTEXT:,}")
-    print(f"  streaming          : false (eliminates SSE stalls)")
-    print(f"  request_timeout    : {PROVIDER_TIMEOUT}s (provider-level - kills SSE stalls)")
-    print(f"  stale_timeout      : {PROVIDER_TIMEOUT}s (non-streaming stale detection)")
-    print(f"  temperature        : 0.3")
-    print(f"  max_turns          : 500 (was 200)")
-    print(f"  clarify_timeout    : 30s (was 600s - don't stall waiting for user)")
-    print(f"  gateway_timeout    : 13200s (matches 220-min workflow)")
-    print(f"  gateway_notify     : 30s")
-    print(f"  api_max_retries    : 7")
-    print(f"  approvals.mode     : off (autonomous - no /approve prompts)")
-    print(f"  approvals.cron_mode: approve (allow dangerous cmds in background)")
-    print(f"  bash.timeoutSec    : 300s (was 60s - enough for nmap/gobuster/sqlmap)")
+    print("config.yaml written -> {}".format(p))
+    print("  primary model      : {}".format(PRIMARY_MODEL))
+    print("  fallback model     : {}".format(FALLBACK_MODEL))
+    print("  context_length     : {:,}".format(PRIMARY_CONTEXT))
+    print("  streaming          : false (eliminates SSE stalls)")
+    print("  request_timeout    : {}s (increased from 60s for large responses)".format(PROVIDER_TIMEOUT))
+    print("  stale_timeout      : {}s".format(PROVIDER_TIMEOUT))
+    print("  temperature        : 0.3")
+    print("  max_turns          : 500")
+    print("  clarify_timeout    : 30s (don't stall waiting for user)")
+    print("  gateway_timeout    : 13200s")
+    print("  gateway_notify     : 30s")
+    print("  api_max_retries    : 7")
+    print("  approvals.mode     : off (autonomous - no /approve prompts)")
+    print("  approvals.cron_mode: approve")
+    print("  bash.timeoutSec    : 300s")
+    print("  browser.timeoutMs  : 30000ms (prevents Playwright hangs)")
+    print("  browser.navTimeout : 30000ms (prevents navigation hangs)")
     print("  pollingStallThresh : REMOVED")
 
 
@@ -206,32 +232,34 @@ def write_env():
     sb_key = os.environ.get("SUPABASE_SERVICE_KEY", "")
     gh = os.environ.get("GITHUB_TOKEN", "")
     uid = os.environ.get("TELEGRAM_USER_ID", "6317345496")
-    env_content = f"""CEREBRAS_API_KEY={k1}
-OPENAI_API_KEY=proxy-placeholder
-OPENROUTER_API_KEY=proxy-placeholder
-TELEGRAM_HOME_CHANNEL={uid}
-TELEGRAM_HOME_CHANNEL_NAME=Zypher Home
-TELEGRAM_ALLOWED_USERS={uid}
-TELEGRAM_BOT_TOKEN={tok}
-TAVILY_API_KEY={tav}
-SUPABASE_URL={sb_url}
-SUPABASE_SERVICE_KEY={sb_key}
-GITHUB_TOKEN={gh}
-# AUTONOMOUS EXECUTION: bypass all dangerous-command approval prompts.
-# tools/approval.py reads this at MODULE IMPORT TIME and freezes the value.
-# Must be set before any Hermes Python module is imported — i.e. in .env
-# and in the process environment before `hermes gateway run` is called.
-# This is the definitive process-wide yolo bypass for all tool approval gates.
-HERMES_YOLO_MODE=1
-# Flag this as a gateway session (used by _is_gateway_approval_context()).
-HERMES_GATEWAY_SESSION=1
-"""
+    env_content = (
+        "CEREBRAS_API_KEY={k1}\n"
+        "OPENAI_API_KEY=proxy-placeholder\n"
+        "OPENROUTER_API_KEY=proxy-placeholder\n"
+        "TELEGRAM_HOME_CHANNEL={uid}\n"
+        "TELEGRAM_HOME_CHANNEL_NAME=Zypher Home\n"
+        "TELEGRAM_ALLOWED_USERS={uid}\n"
+        "TELEGRAM_BOT_TOKEN={tok}\n"
+        "TAVILY_API_KEY={tav}\n"
+        "SUPABASE_URL={sb_url}\n"
+        "SUPABASE_SERVICE_KEY={sb_key}\n"
+        "GITHUB_TOKEN={gh}\n"
+        "# AUTONOMOUS EXECUTION: bypass all dangerous-command approval prompts.\n"
+        "# tools/approval.py reads this at MODULE IMPORT TIME and freezes the value.\n"
+        "# Must be set before any Hermes Python module is imported.\n"
+        "HERMES_YOLO_MODE=1\n"
+        "# Flag this as a gateway session (used by _is_gateway_approval_context()).\n"
+        "HERMES_GATEWAY_SESSION=1\n"
+    ).format(
+        k1=k1, uid=uid, tok=tok, tav=tav,
+        sb_url=sb_url, sb_key=sb_key, gh=gh,
+    )
     p = os.path.join(HD, ".env")
     with open(p, "w") as fh:
         fh.write(env_content)
     os.chmod(p, 0o600)
     print("~/.hermes/.env written")
-    print("  HERMES_YOLO_MODE=1       (process-wide approval bypass, frozen at import)")
+    print("  HERMES_YOLO_MODE=1       (process-wide approval bypass)")
     print("  HERMES_GATEWAY_SESSION=1 (flags gateway approval context)")
 
 
