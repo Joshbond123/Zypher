@@ -346,7 +346,7 @@ jobs:
           restart_ollama() {
             echo "Restarting local Qwen Ollama server..."
             kill -KILL ${OLLAMA_PID:-0} 2>/dev/null || true
-            pkill -KILL -f "ollama serve" 2>/dev/null || true
+            pkill -KILL -f "[o]llama serve" 2>/dev/null || true
             sleep 2
             export OLLAMA_HOST="127.0.0.1:${LOCAL_MODEL_PORT}"
             export OLLAMA_MODELS="/opt/ollama-models"
@@ -439,7 +439,7 @@ jobs:
           kill -TERM ${PAIRING_PID:-0} 2>/dev/null || true
           kill -TERM ${SIDECAR_PID:-0} 2>/dev/null || true
           pkill -TERM -f "hermes gateway run"        2>/dev/null || true
-          pkill -TERM -f "ollama serve"  2>/dev/null || true
+          pkill -TERM -f "[o]llama serve"  2>/dev/null || true
           pkill -TERM -f "hermes_pairing_watcher.py" 2>/dev/null || true
           pkill -TERM -f "hermes_sidecar.py"         2>/dev/null || true
           for i in $(seq 1 20); do
@@ -450,7 +450,7 @@ jobs:
           kill -KILL ${HERMES_PID:-0} 2>/dev/null || true
           kill -KILL ${OLLAMA_PID:-0} 2>/dev/null || true
           pkill -KILL -f "hermes gateway run"       2>/dev/null || true
-          pkill -KILL -f "ollama serve" 2>/dev/null || true
+          pkill -KILL -f "[o]llama serve" 2>/dev/null || true
           echo "Process cleanup complete"
 
       - name: Save memory and state (final WAL-safe flush to Supabase)

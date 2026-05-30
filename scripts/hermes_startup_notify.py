@@ -13,7 +13,10 @@ def send(msg):
     if not BOT or not CHAT:
         return
     data = urllib.parse.urlencode({"chat_id": CHAT, "text": msg, "parse_mode": "Markdown"}).encode()
-    urllib.request.urlopen(f"https://api.telegram.org/bot{BOT}/sendMessage", data=data, timeout=15)
+    try:
+        urllib.request.urlopen(f"https://api.telegram.org/bot{BOT}/sendMessage", data=data, timeout=15)
+    except Exception as exc:
+        print(f"WARN: startup notification failed: {exc}")
 
 
 send(
