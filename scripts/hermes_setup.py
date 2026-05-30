@@ -17,7 +17,7 @@ SK = os.path.join(HD, "skills")
 PROVIDER_NAME = "local-qwen-gguf"
 LOCAL_BASE_URL = "http://127.0.0.1:7860/v1"
 PRIMARY_MODEL = "Qwen3.5-9B-Uncensored-Q4_K_M"
-PRIMARY_CONTEXT = 8192
+PRIMARY_CONTEXT = 65536
 PROVIDER_TIMEOUT = 180
 LOCAL_API_KEY = "local-qwen"
 
