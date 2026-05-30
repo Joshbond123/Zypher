@@ -36,7 +36,7 @@ jobs:
       QWEN_MODEL_FILE: Qwen3.5-9B-Uncensored-Q4_K_M.gguf
       HERMES_MODEL_NAME: Qwen3.5-9B-Uncensored-Q4_K_M
       LOCAL_MODEL_PORT: "7860"
-      LOCAL_CTX_SIZE: "8192"
+      LOCAL_CTX_SIZE: "65536"
       OPENAI_API_KEY: local-qwen
       OPENROUTER_API_KEY: local-qwen
     steps:
