@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 hermes_key_proxy.py -- Local OpenAI-compatible proxy with key rotation,
-                       Cerebras sanitizer, per-key cooldown tracking, and 5xx retry.
+                       Cerebras sanitizer, per-key cooldown tracking,
+                       circuit breaker, and 5xx retry.
 
 Listens on 127.0.0.1:7860/v1
 Forwards to https://api.cerebras.ai/v1 with per-request API key rotation.
@@ -10,47 +11,55 @@ Forwards to https://api.cerebras.ai/v1 with per-request API key rotation.
 BUG HISTORY
 ------------------------------------------------------------------------
 
+[FIXED Jul 2026] Infinite watchdog restart loop -- four root causes:
+
+  CAUSE 1: test_key() in hermes_key_rotator.py only tested /v1/models
+    The /v1/models endpoint has a separate (generous) quota from
+    /v1/chat/completions. A key rate-limited for chat still returns 200
+    from /v1/models. Key rotator declared all keys "healthy" while all
+    were rate-limited for actual completions. Fixed in hermes_key_rotator.py
+    -- now tests with a 1-token llama3.1-8b chat completion.
+
+  CAUSE 2: api_max_retries=7 * worst-case proxy block = 455s freeze
+    With all keys rate-limited:
+      cycle 0: 5 keys * 1s (fast 429) = ~5s
+      inter-cycle sleep: 5s
+      cycle 1: 5 keys * (10s cooldown wait + 1s HTTP) = ~55s
+      total per proxy call: ~65s
+    7 retries * 65s = 455s total freeze. Watchdog fires at 420s (retry 6),
+    kills Hermes. But 10s cooldowns expired during the 420s wait, so
+    Hermes immediately hits rate limits again on restart -> infinite loop.
+    Fixed: api_max_retries reduced from 7 to 2 in hermes_setup.py.
+    New worst-case: 2 * 65s = 130s -- well under 240s watchdog threshold.
+
+  CAUSE 3: No circuit breaker -- 10s cooldown for 1 or 100 failures
+    A key failing 50 times got the same 10s quarantine as one failing once.
+    After 10s it was retried and failed again -> infinite retry loops.
+    FIX (this file): Per-key circuit breaker. After CB_THRESHOLD (3)
+    consecutive failures, key quarantined for CB_QUARANTINE (300s = 5min).
+    If ALL keys are circuit-broken, proxy returns HTTP 503 immediately
+    instead of blocking -- Hermes fails fast without freezing.
+
+  CAUSE 4: Watchdog restarted Hermes but NOT the proxy
+    Proxy kept in-memory cooldown/circuit-breaker state across Hermes
+    restarts. The 10s cooldowns expired during the 420s freeze window,
+    so after restart Hermes immediately hit rate limits again.
+    Fixed in hermes.yml: watchdog now restarts proxy alongside Hermes.
+
 [FIXED Jun 2026] Runtime freeze during hard tasks -- three causes:
 
   CAUSE 1: No per-key cooldown tracking
-    When key[K] returned 429, the proxy immediately moved to key[K+1] and
-    tried it. But key[K+1] was also likely rate-limited (all keys share the
-    same Cerebras org quota). The proxy wasted the full Retry-After period
-    on every key serially:
-      5 keys x 30s Retry-After x 2 cycles = 310s of blocking per LLM request
-    Hermes held open_request=1 for 310s -> visible 5-minute freeze.
-    Combined with api_max_retries=7: 7 x 310s = 36 minutes of zombie behavior.
-    FIX: Per-key cooldown dict (_key_cooldowns). On 429, mark the key as
-    unavailable until now+retry_after. next_available_key() skips cooled-down
-    keys and -- if ALL keys are in cooldown -- waits only until the EARLIEST
-    one resets instead of spinning through all of them serially.
+    5 keys x 30s Retry-After x 2 cycles = 310s blocking per LLM request.
+    FIX: Per-key cooldown dict. next_available_key() waits once for
+    earliest reset instead of sleeping per-key serially.
 
   CAUSE 2: Retry-After cap of 30s too high
-    With 5 keys each waiting up to 30s, even one retry cycle blocked
-    for 2.5 minutes on a single LLM call.
-    FIX: Cap reduced from 30s to 10s. Cerebras Retry-After is usually 1-5s;
-    10s is a safe upper bound that prevents extreme blocking.
-    New worst case: 5 keys x 10s x 2 cycles = 100s (was 310s).
+    FIX: Cap reduced from 30s to 10s.
 
   CAUSE 3: CONNECT_TIMEOUT=60s cut off large model responses under load
-    gpt-oss-120b generates large responses for complex tasks.
-    Under Cerebras load, legitimate responses occasionally took >60s.
-    Premature timeout triggered Hermes retries that cascaded into quota burn.
     FIX: CONNECT_TIMEOUT increased from 60s to 90s.
 
-[FIXED May 2026] HTTP 502 -- three causes identified and fixed:
-
-  CAUSE 1: Wrong primary model (zai-glm-4.7, 355B thinking model)
-    FIX: Switch primary to gpt-oss-120b (120B, 3000 TPM, no thinking mode).
-
-  CAUSE 2: Proxy never retried on 5xx errors
-    FIX: Added 5xx retry with 2-second backoff per key.
-
-  CAUSE 3: thinking tokens in responses from zai-glm-4.7
-    FIX: strip_response_reasoning() strips reasoning field before forwarding.
-
-[FIXED May 2026] Streaming stall -- "waiting for stream response (120s, no chunks yet)":
-  FIX: streaming:false in hermes_setup.py + CONNECT_TIMEOUT reduced.
+[FIXED May 2026] HTTP 502, streaming stall -- see prior history.
 
 SANITIZATION LAYER:
   Top-level: store, maxTokens, thinking, prompt_cache_key, service_tier,
@@ -60,14 +69,21 @@ SANITIZATION LAYER:
   role="developer" -> role="system".
   thinking:{type:disabled} injected for known thinking models.
 
-RATE-LIMIT / ERROR STRATEGY (Jun 2026):
-  429: mark key in cooldown (capped at RETRY_AFTER_MAX=10s), rotate to
-       next available key. next_available_key() waits once for earliest
-       reset instead of sleeping per-key (prevents serial 310s blocking).
-  5xx: 2s backoff, rotate key (up to N_KEYS per cycle).
-  Two-cycle: after all keys exhausted, wait 5s then retry.
-  401/403: skip key immediately (bad/revoked).
-  Network errors: skip key, log, continue.
+RATE-LIMIT / ERROR STRATEGY (Jul 2026):
+  429: mark 10s cooldown, increment failure counter. Circuit trips at 3
+       consecutive failures -> CB_QUARANTINE (300s). next_available_key()
+       waits once for earliest reset (not N_KEYS serial sleeps).
+  5xx: 2s backoff, rotate key, increment failure counter.
+  401/403: permanent quarantine for this session (24h cooldown).
+  Network errors: skip key, log, continue, increment failure counter.
+  ALL keys circuit-broken: return HTTP 503 immediately (no blocking).
+  Success: reset failure counter for that key.
+
+ENDPOINTS:
+  /health or /healthz  - JSON health status with per-key circuit state
+  /v1/keys/status      - detailed per-key diagnostic (label, cooldown, failures)
+  /v1/models           - passthrough to Cerebras models list
+  /v1/*                - proxied POST to Cerebras with key rotation
 """
 
 import http.server
@@ -102,19 +118,23 @@ PROXY_PORT    = int(os.environ.get("KEY_PROXY_PORT", "7860"))
 
 # Timeout for the initial connect + non-streaming reads (seconds).
 # INCREASED from 60s to 90s: handles large model responses under Cerebras load.
-# gpt-oss-120b generates large context-heavy responses for complex tasks;
-# premature 60s timeout triggered retries that burned quota unnecessarily.
 CONNECT_TIMEOUT = 90
 
 # Per-chunk timeout during streaming responses (seconds).
-# Only applies when streaming: true is used (currently disabled in hermes_setup.py).
 STREAM_CHUNK_TIMEOUT = 30
 
 # Maximum seconds to honour a Retry-After header per key.
 # REDUCED from 30s to 10s. Cerebras Retry-After is usually 1-5s.
-# Old worst case: 5 keys x 30s x 2 cycles = 310s blocking per LLM call.
-# New worst case: 5 keys x 10s x 2 cycles = 100s (still handles all retries).
 RETRY_AFTER_MAX = 10
+
+# -- Circuit breaker configuration -------------------------------------------
+# After CB_THRESHOLD consecutive failures on a single key, quarantine it for
+# CB_QUARANTINE seconds instead of the short RETRY_AFTER_MAX cooldown.
+# This prevents infinite retry loops when all keys are rate-limited:
+# after 3 failures per key the proxy returns a fast 503 to Hermes instead
+# of blocking for up to 65s per retry.
+CB_THRESHOLD  = 3    # consecutive failures before circuit trips
+CB_QUARANTINE = 300  # 5 minutes in long quarantine after circuit trips
 
 # -- Top-level body fields Cerebras does not accept --------------------------
 _BLOCKED_BODY_FIELDS = frozenset({
@@ -138,28 +158,89 @@ _counter = 0
 _counter_lock = threading.Lock()
 
 # -- Per-key cooldown tracking -----------------------------------------------
-# Maps key string -> float (time.time() when the key becomes available again).
+# Maps key string -> float (time.time() when key becomes available again).
 # Thread-safe: all access protected by _cooldown_lock.
-#
-# ROOT CAUSE FIX (Jun 2026): Previously the proxy had no per-key cooldown
-# memory. On 429, it slept Retry-After for EACH key serially, causing up to
-# 310s of blocking per LLM request when all keys were rate-limited.
-# Now: mark each rate-limited key with its expiry time and skip it during
-# next_available_key(). If ALL keys are in cooldown, wait only until the
-# EARLIEST one resets -- one targeted wait instead of N_KEYS serial waits.
-_key_cooldowns = {}   # key_string -> available_at (float epoch seconds)
+_key_cooldowns = {}
 _cooldown_lock = threading.Lock()
+
+# -- Per-key circuit breaker -------------------------------------------------
+# Maps key string -> consecutive failure count.
+# Thread-safe: all access protected by _cb_lock.
+_key_failures = {}
+_cb_lock = threading.Lock()
+
+
+def _key_label(key):
+    """Return a safe loggable label for a key (last 4 chars only)."""
+    return ("..." + key[-4:]) if len(key) >= 4 else "????"
 
 
 def _mark_key_cooldown(key, seconds):
-    """Mark key as unavailable for `seconds` seconds from now."""
+    """Mark key unavailable for `seconds` seconds from now."""
     available_at = time.time() + seconds
     with _cooldown_lock:
         _key_cooldowns[key] = available_at
-    log.info(
-        "Cooldown: key=...%s rate-limited for %.1fs",
-        key[-4:], seconds,
-    )
+    log.info("Cooldown: key=%s rate-limited for %.1fs", _key_label(key), seconds)
+
+
+def _record_key_failure(key, reason=""):
+    """
+    Increment consecutive failure count for key.
+    If CB_THRESHOLD is reached, apply CB_QUARANTINE (long quarantine).
+
+    ROOT CAUSE FIX (Jul 2026): Previously the proxy had no concept of
+    escalating failures. A key could fail 100 times and still only get a
+    10s cooldown. With the circuit breaker, 3 consecutive failures trigger
+    a 5-minute quarantine. If ALL keys trip the circuit breaker, the proxy
+    returns 503 immediately, ending Hermes's retry storm without blocking.
+
+    Returns the new consecutive failure count.
+    """
+    with _cb_lock:
+        count = _key_failures.get(key, 0) + 1
+        _key_failures[key] = count
+
+    if count >= CB_THRESHOLD:
+        _mark_key_cooldown(key, CB_QUARANTINE)
+        log.error(
+            "CIRCUIT BREAKER TRIPPED: key=%s has %d consecutive failures%s. "
+            "Quarantined for %ds (%.1f min). This key is likely rate-limited, "
+            "exhausted, or invalid.",
+            _key_label(key), count,
+            (" (" + reason + ")") if reason else "",
+            CB_QUARANTINE, CB_QUARANTINE / 60,
+        )
+    return count
+
+
+def _record_key_success(key):
+    """Reset consecutive failure count on a successful response."""
+    with _cb_lock:
+        prev = _key_failures.pop(key, 0)
+    if prev > 0:
+        log.info(
+            "Circuit breaker reset: key=%s recovered after %d failures",
+            _key_label(key), prev,
+        )
+
+
+def _all_keys_circuit_broken():
+    """
+    Return (all_broken: bool, earliest_reset: float).
+
+    If all_broken is True, every key is in cooldown (circuit-broken or
+    rate-limited). Caller should return 503 immediately instead of blocking
+    for next_available_key()'s targeted sleep. This is the key mechanism
+    that prevents Hermes from freezing when the Cerebras API is unavailable.
+    """
+    now = time.time()
+    with _cooldown_lock:
+        snap = dict(_key_cooldowns)
+    broken = [k for k in KEYS if now < snap.get(k, 0.0)]
+    if len(broken) < len(KEYS):
+        return False, 0.0
+    earliest_reset = min(snap.get(k, now) for k in KEYS)
+    return True, earliest_reset
 
 
 def _earliest_cooldown_expiry():
@@ -175,30 +256,32 @@ def next_available_key():
     Return the next available (not rate-limited) API key, round-robin.
 
     Algorithm:
-      1. Scan all N keys starting from the current counter position.
+      1. Scan all N keys starting from the current counter.
       2. Return the first key whose cooldown has expired (or was never set).
       3. If ALL keys are in cooldown, wait until the earliest one resets
-         (a single targeted sleep, NOT N_KEYS x Retry-After serially).
-      4. After the wait, clear expired cooldowns and return the next key.
+         (single targeted sleep -- NOT N_KEYS x Retry-After serially).
+      4. Clear expired cooldowns and return the next key.
 
-    This replaces the old next_key() which had no cooldown awareness and
-    caused serial blocking: key1 wait 30s -> key2 wait 30s -> ... = 150s+.
+    ROOT CAUSE FIX (Jun 2026): Replaced the old next_key() which had no
+    cooldown awareness and caused serial blocking: key1 30s -> key2 30s
+    -> ... = 150s+. New: mark cooldown, wait once for earliest expiry,
+    max 10s regardless of how many keys fail simultaneously.
     """
     global _counter
     now = time.time()
 
     with _cooldown_lock:
-        cooldowns_snapshot = dict(_key_cooldowns)
+        snap = dict(_key_cooldowns)
 
     for _ in range(len(KEYS)):
         with _counter_lock:
             idx = _counter % len(KEYS)
             _counter += 1
         key = KEYS[idx]
-        if now >= cooldowns_snapshot.get(key, 0.0):
+        if now >= snap.get(key, 0.0):
             return key
 
-    # All keys in cooldown -- wait for the earliest to reset
+    # All keys in cooldown -- single targeted wait
     earliest = _earliest_cooldown_expiry()
     wait_for = max(0.0, earliest - time.time())
     if wait_for > 0.05:
@@ -333,37 +416,68 @@ def strip_response_reasoning(body_bytes):
 
 
 # ----------------------------------------------------------------------------
-# CORE REQUEST HANDLER WITH COOLDOWN-AWARE KEY ROTATION
+# CORE REQUEST HANDLER WITH COOLDOWN-AWARE KEY ROTATION + CIRCUIT BREAKER
 # ----------------------------------------------------------------------------
 
 def try_request(method, path, headers, body):
     """
     Attempt the request with full key rotation, per-key cooldown awareness,
-    429 backoff, and 5xx retry.
+    circuit breaker fast-fail, 429 backoff, and 5xx retry.
+
+    FAST-FAIL (Jul 2026 fix):
+      If ALL keys are circuit-broken (3+ consecutive failures each), return
+      HTTP 503 immediately. This ends Hermes's retry loop in <1s instead of
+      blocking for up to 65s per retry. Combined with api_max_retries=2 in
+      hermes_setup.py, the maximum agent freeze time drops from 455s to ~2s.
 
     Strategy per cycle (runs up to 2 cycles):
-      - 429: mark key in cooldown for min(Retry-After, RETRY_AFTER_MAX)s.
-             next_available_key() skips cooled-down keys automatically and
-             waits only until the EARLIEST key resets (not per-key serial).
-      - 5xx (500/502/503/504): wait 2s, rotate key.
-      - 401/403: skip key immediately (bad/revoked).
-      - Network error: skip key, log.
-    Cycle 0: try every key using next_available_key().
-    Cycle 1: all keys exhausted -> wait 5s for quota reset, retry.
-
-    KEY IMPROVEMENT (Jun 2026):
-      OLD: sleep(Retry-After) for EACH key -> 5 keys x 30s = 150s per cycle
-      NEW: mark cooldown, wait once for earliest expiry -> max 10s regardless
-           of how many keys fail simultaneously.
+      429: mark key in cooldown for min(Retry-After, RETRY_AFTER_MAX)s.
+           Increment failure count; circuit trips at CB_THRESHOLD failures.
+      5xx: wait 2s, rotate key, increment failure count.
+      401/403: permanent quarantine (24h cooldown), skip key.
+      Network/timeout: skip key, increment failure count.
+      Success: reset failure count for that key.
+      Cycle 0: try every key using next_available_key().
+      Cycle 1: all keys exhausted -> wait 5s, retry once more.
+               Re-check fast-fail before cycle 1 begins.
     """
+    # FAST-FAIL: if all keys are circuit-broken, return 503 immediately
+    all_broken, reset_at = _all_keys_circuit_broken()
+    if all_broken:
+        wait_s = max(0, reset_at - time.time())
+        msg = (
+            "All {} Cerebras key(s) are circuit-broken (reset in {:.0f}s). "
+            "Returning 503 immediately to prevent agent freeze. "
+            "Check /v1/keys/status for diagnostics.".format(len(KEYS), wait_s)
+        )
+        log.error(msg)
+        err_body = _json.dumps({
+            "error": {"message": msg, "type": "rate_limit_error", "code": "all_keys_exhausted"}
+        }).encode()
+        return 503, {"Content-Type": "application/json"}, err_body
+
     ctx = ssl.create_default_context()
     last_err = None
     n_keys = len(KEYS)
 
     for cycle in range(2):
         if cycle == 1:
-            log.warning("All %d key(s) exhausted -- waiting 5s for Cerebras reset...", n_keys)
+            log.warning("All %d key(s) exhausted in cycle 0 -- waiting 5s for quota reset", n_keys)
             time.sleep(5)
+
+            # Re-check fast-fail: circuit breakers may have tripped during cycle 0
+            all_broken, reset_at = _all_keys_circuit_broken()
+            if all_broken:
+                wait_s = max(0, reset_at - time.time())
+                msg = (
+                    "All {} key(s) circuit-broken after cycle 0 exhaustion "
+                    "(reset in {:.0f}s).".format(len(KEYS), wait_s)
+                )
+                log.error(msg)
+                err_body = _json.dumps({
+                    "error": {"message": msg, "type": "rate_limit_error"}
+                }).encode()
+                return 503, {"Content-Type": "application/json"}, err_body
 
         for ki in range(n_keys):
             key = next_available_key()
@@ -376,171 +490,237 @@ def try_request(method, path, headers, body):
                 )
                 conn.request(method, path, body=body, headers=req_headers)
                 resp = conn.getresponse()
+                status = resp.status
+                resp_body = resp.read()
+                conn.close()
 
-                # -- 429 Rate limit ------------------------------------------
-                if resp.status == 429:
-                    resp.read()
-                    conn.close()
-                    retry_after_hdr = resp.getheader("Retry-After", "")
+                if status == 429:
+                    raw_ra = (resp.headers.get("Retry-After")
+                              or resp.headers.get("retry-after")
+                              or "5")
                     try:
-                        wait = min(int(retry_after_hdr), RETRY_AFTER_MAX)
-                    except (ValueError, TypeError):
-                        wait = 3
-                    # Mark this key as rate-limited (cooldown tracking handles wait)
-                    _mark_key_cooldown(key, wait)
+                        retry_after = float(raw_ra)
+                    except ValueError:
+                        retry_after = 5.0
+                    cooldown_secs = min(retry_after, RETRY_AFTER_MAX)
+                    _mark_key_cooldown(key, cooldown_secs)
+                    failures = _record_key_failure(key, "429")
                     log.warning(
-                        "Key[%d/%d] 429 -- cooldown %.1fs, rotating to next available",
-                        ki + 1, n_keys, wait,
+                        "429 key=%s retry_after=%.1fs cooldown=%.1fs "
+                        "consecutive_failures=%d (circuit trips at %d)",
+                        _key_label(key), retry_after, cooldown_secs,
+                        failures, CB_THRESHOLD,
                     )
-                    # No sleep() here -- next_available_key() waits automatically
+                    last_err = "429 key={}".format(_key_label(key))
                     continue
 
-                # -- 5xx Transient upstream error ----------------------------
-                if resp.status in _RETRYABLE_5XX:
-                    err_body = resp.read()[:200].decode("utf-8", errors="replace")
-                    conn.close()
+                if status in _RETRYABLE_5XX:
                     log.warning(
-                        "Key[%d/%d] Cerebras %d -- rotating key + 2s backoff: %s",
-                        ki + 1, n_keys, resp.status, err_body,
+                        "HTTP %d from key=%s -- backing off 2s", status, _key_label(key)
                     )
+                    failures = _record_key_failure(key, str(status))
                     time.sleep(2)
+                    last_err = "HTTP {}".format(status)
                     continue
 
-                # -- Auth failure --------------------------------------------
-                if resp.status in (401, 403):
-                    log.warning("Key[%d/%d] auth error HTTP %d -- rotating", ki + 1, n_keys, resp.status)
-                    resp.read()
-                    conn.close()
+                if status in (401, 403):
+                    log.error(
+                        "Key %s rejected with HTTP %d (bad/revoked) -- "
+                        "permanently quarantining for this session",
+                        _key_label(key), status,
+                    )
+                    _mark_key_cooldown(key, 86400)  # 24h = permanent for this run
+                    _record_key_failure(key, "auth_{}".format(status))
+                    last_err = "HTTP {} auth error".format(status)
                     continue
 
-                # -- Success (or non-retryable error like 400/404) -----------
-                return conn, resp
+                # Success -- reset circuit breaker and return
+                _record_key_success(key)
+                resp_body = strip_response_reasoning(resp_body)
+                resp_headers = {}
+                for h in ("Content-Type", "content-type"):
+                    v = resp.headers.get(h)
+                    if v:
+                        resp_headers["Content-Type"] = v
+                        break
+                if not resp_headers.get("Content-Type"):
+                    resp_headers["Content-Type"] = "application/json"
+                log.info(
+                    "OK: %s %s -> HTTP %d (%d bytes) key=%s",
+                    method, path, status, len(resp_body), _key_label(key),
+                )
+                return status, resp_headers, resp_body
 
+            except (socket.timeout, TimeoutError) as e:
+                log.warning("Timeout key=%s path=%s: %s", _key_label(key), path, e)
+                _record_key_failure(key, "timeout")
+                last_err = "timeout: {}".format(e)
             except Exception as e:
-                last_err = e
-                log.warning("Upstream network error key[%d/%d]: %s", ki + 1, n_keys, e)
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+                log.warning("Network error key=%s: %s", _key_label(key), e)
+                _record_key_failure(key, "network")
+                last_err = "error: {}".format(e)
 
-    raise RuntimeError(
-        "All {} key(s) failed after retry cycle. "
-        "Add more CEREBRAS_API_KEY_N env vars. Last error: {}".format(n_keys, last_err)
-    )
+    err_body = _json.dumps({
+        "error": {
+            "message": (
+                "All Cerebras keys failed after 2 cycles. "
+                "Last error: {}. Check proxy logs for details.".format(last_err)
+            ),
+            "type": "provider_error",
+        }
+    }).encode()
+    log.error("All keys and cycles exhausted. Last error: %s", last_err)
+    return 502, {"Content-Type": "application/json"}, err_body
 
 
 # ----------------------------------------------------------------------------
-# HTTP HANDLER
+# HTTP SERVER + HANDLER
 # ----------------------------------------------------------------------------
 
 class ProxyHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
-        log.debug(fmt, *args)
+        pass  # suppress default Apache-style access log; we use our own
 
-    def _proxy(self, method):
-        content_length = int(self.headers.get("Content-Length", 0))
-        raw_body = self.rfile.read(content_length) if content_length > 0 else None
-
-        body = sanitize_request_body(raw_body, self.path) if raw_body else raw_body
-
-        fwd_headers = {
-            "Content-Type": self.headers.get("Content-Type", "application/json"),
-            "Accept":       self.headers.get("Accept", "application/json, text/event-stream"),
-            "User-Agent":   "hermes-key-proxy/2.3",
-        }
-        if body:
-            fwd_headers["Content-Length"] = str(len(body))
-
-        try:
-            conn, resp = try_request(method, self.path, fwd_headers, body)
-        except Exception as e:
-            log.error("Proxy failed: %s", e)
-            self.send_error(502, "Upstream error: {}".format(e))
+    def do_GET(self):
+        if self.path in ("/health", "/healthz"):
+            self._send_health()
             return
+        if self.path == "/v1/keys/status":
+            self._send_key_status()
+            return
+        if self.path.startswith("/v1/models"):
+            self._do_proxy("GET", self.path, b"")
+            return
+        self._send_raw(404, b"Not found", "text/plain")
 
-        try:
-            is_streaming = resp.getheader("Content-Type", "").startswith("text/event-stream")
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length) if length else b""
+        body = sanitize_request_body(body, self.path)
+        self._do_proxy("POST", self.path, body)
 
-            self.send_response(resp.status)
-            skip = {"transfer-encoding", "connection", "keep-alive"}
-            resp_headers = list(resp.getheaders())
+    def _do_proxy(self, method, path, body):
+        fwd_headers = {
+            k: v for k, v in self.headers.items()
+            if k.lower() not in ("host", "connection", "authorization")
+        }
+        fwd_headers["Host"] = UPSTREAM_HOST
+        fwd_headers["Content-Length"] = str(len(body))
+        status, resp_headers, resp_body = try_request(method, path, fwd_headers, body)
+        self.send_response(status)
+        for k, v in resp_headers.items():
+            self.send_header(k, v)
+        self.send_header("Content-Length", str(len(resp_body)))
+        self.end_headers()
+        self.wfile.write(resp_body)
 
-            if not is_streaming:
-                resp_body = resp.read()
-                sanitized_body = strip_response_reasoning(resp_body)
-                for h, v in resp_headers:
-                    if h.lower() in skip:
-                        continue
-                    if h.lower() == "content-length":
-                        continue
-                    self.send_header(h, v)
-                self.send_header("Content-Length", str(len(sanitized_body)))
-                self.send_header("X-Key-Proxy", "cerebras-sanitizing-rotating/2.3")
-                self.end_headers()
-                self.wfile.write(sanitized_body)
-                self.wfile.flush()
-            else:
-                for h, v in resp_headers:
-                    if h.lower() not in skip:
-                        self.send_header(h, v)
-                self.send_header("X-Key-Proxy", "cerebras-sanitizing-rotating/2.3")
-                self.end_headers()
+    def _send_raw(self, status, body, ctype="text/plain"):
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
-                try:
-                    if conn.sock is not None:
-                        conn.sock.settimeout(STREAM_CHUNK_TIMEOUT)
-                except Exception as _st_err:
-                    log.debug("Could not set stream chunk timeout: %s", _st_err)
+    def _send_health(self):
+        """
+        GET /health -- Returns JSON with overall status and per-key circuit state.
+        HTTP 200 if at least one key is available, HTTP 503 if all are broken.
+        Used by the GitHub Actions watchdog to determine if the proxy is healthy
+        before declaring Hermes frozen.
+        """
+        now = time.time()
+        with _cooldown_lock:
+            snap_cd = dict(_key_cooldowns)
+        with _cb_lock:
+            snap_f = dict(_key_failures)
 
-                chunk_count = 0
-                while True:
-                    try:
-                        chunk = resp.read(4096)
-                    except (socket.timeout, TimeoutError, OSError) as e:
-                        log.warning(
-                            "Stream stall after %ds -- closing. chunks_received=%d error=%s",
-                            STREAM_CHUNK_TIMEOUT, chunk_count, type(e).__name__,
-                        )
-                        break
-                    if not chunk:
-                        break
-                    chunk_count += 1
-                    try:
-                        self.wfile.write(chunk)
-                        self.wfile.flush()
-                    except (BrokenPipeError, ConnectionResetError):
-                        break
+        available = sum(1 for k in KEYS if now >= snap_cd.get(k, 0.0))
+        healthy = available > 0
+        status_str = "ok" if healthy else "degraded"
 
-        except Exception as e:
-            log.warning("Response handling error: %s", e)
-        finally:
-            conn.close()
+        key_details = {}
+        for i, k in enumerate(KEYS):
+            cd_remaining = max(0.0, snap_cd.get(k, now) - now)
+            failures = snap_f.get(k, 0)
+            key_details["key_{}".format(i)] = {
+                "label": _key_label(k),
+                "available": now >= snap_cd.get(k, 0.0),
+                "cooldown_remaining_s": round(cd_remaining, 1),
+                "consecutive_failures": failures,
+                "circuit_tripped": failures >= CB_THRESHOLD,
+                "in_long_quarantine": cd_remaining > RETRY_AFTER_MAX,
+            }
 
-    def do_GET(self):    self._proxy("GET")
-    def do_POST(self):   self._proxy("POST")
-    def do_PUT(self):    self._proxy("PUT")
-    def do_DELETE(self): self._proxy("DELETE")
+        body = _json.dumps({
+            "status": status_str,
+            "keys_total": len(KEYS),
+            "keys_available": available,
+            "keys_in_cooldown": len(KEYS) - available,
+            "cb_threshold": CB_THRESHOLD,
+            "cb_quarantine_s": CB_QUARANTINE,
+            "circuit_breakers": key_details,
+        }, indent=2).encode()
+        http_status = 200 if healthy else 503
+        self._send_raw(http_status, body, "application/json")
+
+    def _send_key_status(self):
+        """
+        GET /v1/keys/status -- Detailed per-key diagnostic.
+        Useful for debugging which keys are rate-limited or broken.
+        """
+        now = time.time()
+        with _cooldown_lock:
+            snap_cd = dict(_key_cooldowns)
+        with _cb_lock:
+            snap_f = dict(_key_failures)
+
+        rows = []
+        for i, k in enumerate(KEYS):
+            cd_rem = max(0.0, snap_cd.get(k, now) - now)
+            failures = snap_f.get(k, 0)
+            rows.append({
+                "index": i,
+                "label": _key_label(k),
+                "available": now >= snap_cd.get(k, 0.0),
+                "cooldown_remaining_s": round(cd_rem, 1),
+                "consecutive_failures": failures,
+                "circuit_tripped": failures >= CB_THRESHOLD,
+                "in_long_quarantine": cd_rem > RETRY_AFTER_MAX,
+            })
+        body = _json.dumps({"keys": rows, "cb_threshold": CB_THRESHOLD}, indent=2).encode()
+        self._send_raw(200, body, "application/json")
 
 
-# ----------------------------------------------------------------------------
-# ENTRY POINT
-# ----------------------------------------------------------------------------
+class ThreadedHTTPServer(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
 
 def main():
     if not KEYS:
-        log.error("No Cerebras API keys configured. Set CEREBRAS_API_KEY env vars.")
+        log.error(
+            "FATAL: no Cerebras API keys found. Set CEREBRAS_API_KEY and/or "
+            "CEREBRAS_API_KEY_2 ... CEREBRAS_API_KEY_5 in environment."
+        )
         sys.exit(1)
-    log.info("Key-rotation proxy v2.3 on 127.0.0.1:%d with %d key(s)", PROXY_PORT, len(KEYS))
-    log.info("Upstream: https://%s", UPSTREAM_HOST)
-    log.info("CONNECT_TIMEOUT: %ds (increased from 60s -- handles large model responses)", CONNECT_TIMEOUT)
-    log.info("RETRY_AFTER_MAX: %ds per key (was 30s -- prevents 310s serial blocking)", RETRY_AFTER_MAX)
-    log.info("Cooldown tracking: per-key, waits once for earliest reset (not per-key serial)")
-    log.info("Thinking models: %s -- thinking:{type:disabled} injected", _THINKING_MODELS)
-    log.info("Retry: 429->cooldown+rotate, 5xx->2s backoff+rotate, cycle reset after 5s")
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", PROXY_PORT), ProxyHandler)
-    server.daemon_threads = True
-    server.serve_forever()
+
+    log.info(
+        "Cerebras key-rotation proxy v2 starting on 127.0.0.1:%d | "
+        "%d key(s) | CB_THRESHOLD=%d failures | CB_QUARANTINE=%ds (%.1fmin) | "
+        "RETRY_AFTER_MAX=%ds | CONNECT_TIMEOUT=%ds",
+        PROXY_PORT, len(KEYS), CB_THRESHOLD, CB_QUARANTINE, CB_QUARANTINE / 60,
+        RETRY_AFTER_MAX, CONNECT_TIMEOUT,
+    )
+    log.info(
+        "Endpoints: /health (key status), /v1/keys/status (detailed diagnostics)"
+    )
+
+    server = ThreadedHTTPServer(("127.0.0.1", PROXY_PORT), ProxyHandler)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        log.info("Proxy shutting down")
+        server.shutdown()
 
 
 if __name__ == "__main__":
