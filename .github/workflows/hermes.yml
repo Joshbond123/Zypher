@@ -342,11 +342,23 @@ jobs:
           # startup + cleanup inside the new 240-min job timeout.
           TIMEOUT=12000
           ELAPSED=0
-          INTERVAL=30
-          echo "Keep-alive: ${TIMEOUT}s total"
+          # FREEZE FIX (Jun 2026): Reduced from 30s to 20s for faster crash detection.
+          INTERVAL=20
+          # WATCHDOG THRESHOLD: if /tmp/hermes.log not modified for this many seconds,
+          # Hermes is considered frozen (alive but stuck) and force-restarted.
+          # = bash_tool_max(300s) + provider_timeout(90s) + buffer(30s) = 420s (7 min).
+          # A frozen agent still passes kill -0 (PID alive) but stops writing to the log.
+          # This catches: tool-call deadlocks, async hangs, provider retry storms,
+          # rate-limit cascades, browser automation freezes.
+          STALE_THRESHOLD=420
+          WATCHDOG_RESTARTS=0
+          echo "Keep-alive: ${TIMEOUT}s total | interval=${INTERVAL}s | stale_threshold=${STALE_THRESHOLD}s"
+
           while [ $ELAPSED -lt $TIMEOUT ]; do
             sleep $INTERVAL
             ELAPSED=$((ELAPSED+INTERVAL))
+
+            # ── Proxy health check + restart ─────────────────────────────────
             if ! kill -0 $PROXY_PID 2>/dev/null; then
               echo "[${ELAPSED}s] Key proxy died — restarting..."
               nohup python3 scripts/hermes_key_proxy.py >> /tmp/hermes-proxy.log 2>&1 &
@@ -361,8 +373,10 @@ jobs:
                   && echo "[${ELAPSED}s] Proxy back after ${i}s" && break || true
               done
             fi
+
+            # ── Hermes crash detection + restart ─────────────────────────────
             if ! kill -0 $HERMES_PID 2>/dev/null; then
-              echo "[${ELAPSED}s] Hermes died — restarting..."
+              echo "[${ELAPSED}s] Hermes crashed — restarting..."
               python3 scripts/hermes_preapprove.py 2>/dev/null || true
               nohup hermes gateway run --accept-hooks >> /tmp/hermes.log 2>&1 &
               HERMES_PID=$!
@@ -372,27 +386,74 @@ jobs:
               echo "[${ELAPSED}s] Hermes restarted PID=$HERMES_PID"
               sleep 10
             fi
+
+            # ── LIVENESS WATCHDOG (Jun 2026) ──────────────────────────────────
+            # Detects frozen Hermes: process is alive (kill -0 passes) but has
+            # produced no log output for STALE_THRESHOLD seconds.
+            #
+            # ROOT CAUSE: kill -0 only checks if the process exists. A frozen
+            # Hermes (stuck in tool-call deadlock, provider retry storm, browser
+            # hang, or async deadlock) still passes kill -0 but makes no progress.
+            # This watchdog catches the "alive but silent" state.
+            #
+            # Threshold = 420s: bash tool max (300s) + provider timeout (90s) +
+            # buffer (30s). Any legitimate silence longer than this indicates a freeze.
+            if kill -0 "$HERMES_PID" 2>/dev/null; then
+              LOG_MTIME=$(date -r /tmp/hermes.log +%s 2>/dev/null || echo 0)
+              if [ "$LOG_MTIME" -gt 0 ]; then
+                LOG_AGE=$(( $(date +%s) - LOG_MTIME ))
+                if [ "$LOG_AGE" -gt "$STALE_THRESHOLD" ]; then
+                  WATCHDOG_RESTARTS=$((WATCHDOG_RESTARTS+1))
+                  echo "[${ELAPSED}s] WATCHDOG #${WATCHDOG_RESTARTS}: Hermes frozen — log silent ${LOG_AGE}s > ${STALE_THRESHOLD}s"
+                  curl -sf -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                    -d "chat_id=${TELEGRAM_USER_ID}" \
+                    -d "text=Watchdog #${WATCHDOG_RESTARTS}: Zypher frozen (${LOG_AGE}s silence). Auto-restarting..." 2>/dev/null || true
+                  # Force-kill the frozen instance
+                  kill -KILL $HERMES_PID 2>/dev/null || true
+                  pkill -KILL -f "hermes gateway run" 2>/dev/null || true
+                  sleep 3
+                  python3 scripts/hermes_preapprove.py 2>/dev/null || true
+                  nohup hermes gateway run --accept-hooks >> /tmp/hermes.log 2>&1 &
+                  HERMES_PID=$!
+                  echo "HERMES_PID=$HERMES_PID" >> $GITHUB_ENV
+                  echo "[${ELAPSED}s] WATCHDOG: Hermes restarted PID=$HERMES_PID"
+                  curl -sf -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                    -d "chat_id=${TELEGRAM_USER_ID}" \
+                    -d "text=Watchdog: Zypher restarted successfully (was frozen ${LOG_AGE}s). Run #${GITHUB_RUN_ID}." 2>/dev/null || true
+                  sleep 20
+                fi
+              fi
+            fi
+
+            # ── Pairing watcher restart ──────────────────────────────────────
             if ! kill -0 $PAIRING_PID 2>/dev/null; then
               nohup python3 scripts/hermes_pairing_watcher.py >> /tmp/hermes-pairing.log 2>&1 &
               PAIRING_PID=$!
               echo "PAIRING_PID=$PAIRING_PID" >> $GITHUB_ENV
             fi
+
+            # ── Sidecar restart ──────────────────────────────────────────────
             if ! kill -0 $SIDECAR_PID 2>/dev/null; then
               echo "[${ELAPSED}s] Sidecar died — restarting..."
               nohup python3 scripts/hermes_sidecar.py >> /tmp/hermes-sidecar.log 2>&1 &
               SIDECAR_PID=$!
               echo "SIDECAR_PID=$SIDECAR_PID" >> $GITHUB_ENV
             fi
+
+            # ── Periodic memory flush (every 300s) ──────────────────────────
             [ $((ELAPSED % 300)) -eq 0 ] && {
               python3 scripts/hermes_sidecar.py --flush-memory 2>/dev/null || true
               echo "[${ELAPSED}s] Memory + state.db flushed to Supabase"
             } || true
+
+            # ── Periodic log tail (every 600s) ───────────────────────────────
             [ $((ELAPSED % 600)) -eq 0 ] && {
               echo "=== hermes.log tail ===" && tail -5 /tmp/hermes.log 2>/dev/null || true
               echo "=== proxy.log tail ===" && tail -3 /tmp/hermes-proxy.log 2>/dev/null || true
+              echo "[${ELAPSED}s] Watchdog restarts this session: ${WATCHDOG_RESTARTS}"
             } || true
           done
-          echo "Session rotation complete"
+          echo "Session rotation complete (watchdog_restarts=${WATCHDOG_RESTARTS})"
 
       # FIX-3: "Stop all processes" now runs BEFORE "Save memory and state".
       # Previously the Supabase flush ran while Hermes was still active. Any
