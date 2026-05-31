@@ -67,13 +67,13 @@ PROXY_PORT = int(os.environ.get("GROQ_PROXY_PORT", "18765"))
 
 MAX_OUTPUT_TOKENS   = 2048
 PRE_TRIM_BYTES      = 18_000
-MAX_MSG_CHARS       = 1_000
+MAX_MSG_CHARS       = 2_000
 MAX_ARGS_CHARS      = 500
 MAX_TOOL_DESC_CHARS = 80
 MAX_TRIM_PASSES     = 4
 THINKING_MODELS      = ("qwen/", "qwen3", "deepseek-r1")
 
-MAX_SYS_CHARS_BY_PASS = {0: 2_500, 1: 1_500, 2: 900, 3: 500, 4: 300}
+MAX_SYS_CHARS_BY_PASS = {0: 4_000, 1: 2_000, 2: 1_200, 3: 600, 4: 300}
 KEEP_MSGS_BY_PASS     = {0: 4,     1: 3,     2: 2,   3: 1,   4: 1}
 KEEP_TOOLS_BY_PASS    = {0: 24,    1: 12,    2: 6,   3: 0,   4: 0}
 
