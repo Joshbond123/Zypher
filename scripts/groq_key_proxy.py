@@ -65,17 +65,17 @@ GROQ_BASE  = "https://api.groq.com/openai"
 PROXY_HOST = "127.0.0.1"
 PROXY_PORT = int(os.environ.get("GROQ_PROXY_PORT", "18765"))
 
-MAX_OUTPUT_TOKENS   = 4096
-PRE_TRIM_BYTES      = 80_000
-MAX_MSG_CHARS       = 4_000
-MAX_ARGS_CHARS      = 1_500
-MAX_TOOL_DESC_CHARS = 200
-MAX_TRIM_PASSES     = 3
+MAX_OUTPUT_TOKENS   = 768
+PRE_TRIM_BYTES      = 18_000
+MAX_MSG_CHARS       = 1_000
+MAX_ARGS_CHARS      = 500
+MAX_TOOL_DESC_CHARS = 80
+MAX_TRIM_PASSES     = 4
 THINKING_MODELS      = ("qwen/", "qwen3", "deepseek-r1")
 
-MAX_SYS_CHARS_BY_PASS = {0: 8_000, 1: 6_000, 2: 4_000, 3: 2_000}
-KEEP_MSGS_BY_PASS     = {0: 10,    1: 6,     2: 4,     3: 2    }
-KEEP_TOOLS_BY_PASS    = {0: 999,   1: 40,    2: 20,    3: 10   }
+MAX_SYS_CHARS_BY_PASS = {0: 2_500, 1: 1_500, 2: 900, 3: 500, 4: 300}
+KEEP_MSGS_BY_PASS     = {0: 4,     1: 3,     2: 2,   3: 1,   4: 1}
+KEEP_TOOLS_BY_PASS    = {0: 24,    1: 12,    2: 6,   3: 0,   4: 0}
 
 _SOFT_413_PATTERNS = [
     "request entity too large",
@@ -220,6 +220,26 @@ def _trim_tools(tools, trim_pass):
     return out, cut
 
 
+def _valid_tail_messages(conv_msgs, req_id, trim_pass):
+    """Keep a valid OpenAI chat tail after aggressive trimming.
+
+    Blindly keeping the last N messages can leave an orphan `tool` message with
+    no preceding assistant tool call, which Groq rejects before it can answer.
+    Drop leading orphan tool outputs; if nothing conversational remains, insert a
+    tiny user nudge so Telegram still receives a response.
+    """
+    dropped = 0
+    while conv_msgs and conv_msgs[0].get("role") == "tool":
+        conv_msgs = conv_msgs[1:]
+        dropped += 1
+    if dropped:
+        log.info("req#%d pass%d: dropped %d orphan leading tool msg(s)", req_id, trim_pass, dropped)
+    if not conv_msgs:
+        log.info("req#%d pass%d: inserted minimal user nudge after trimming", req_id, trim_pass)
+        return [{"role": "user", "content": "Reply concisely to the latest Telegram message. Prior oversized tool output was omitted."}]
+    return conv_msgs
+
+
 # ── Trim payload ───────────────────────────────────────────────────────────────
 
 def _trim(payload, trim_pass, req_id):
@@ -269,6 +289,8 @@ def _trim(payload, trim_pass, req_id):
         dropped   = len(conv_msgs) - keep_n
         conv_msgs = conv_msgs[-keep_n:]
         log.info("req#%d pass%d: dropped %d msgs, kept %d", req_id, trim_pass, dropped, keep_n)
+
+    conv_msgs = _valid_tail_messages(conv_msgs, req_id, trim_pass)
 
     new_payload = {**payload, "messages": sys_msgs + conv_msgs}
 
@@ -348,9 +370,24 @@ def _prepare(body_bytes, req_id):
     payload = _trim(payload, 0, req_id)
 
     body_out = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    # Groq free-tier/org token-per-minute limits can be far below the model's
+    # 128K context window.  Do not wait for an upstream 413 before shrinking:
+    # keep the serialized request under a conservative byte budget so fallback
+    # and compression calls do not receive the same oversized payload.
+    trim_pass = 0
+    while len(body_out) > PRE_TRIM_BYTES and trim_pass < MAX_TRIM_PASSES:
+        trim_pass += 1
+        log.warning(
+            "req#%d: body %d bytes exceeds safe budget %d -> proactive trim pass %d/%d",
+            req_id, len(body_out), PRE_TRIM_BYTES, trim_pass, MAX_TRIM_PASSES,
+        )
+        payload = _trim(payload, trim_pass, req_id)
+        body_out = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        _snapshot(payload, req_id, f"after-proactive-trim{trim_pass}")
+
     if len(body_out) > PRE_TRIM_BYTES:
-        log.warning("req#%d: body still %d bytes after pass-0", req_id, len(body_out))
-        _snapshot(payload, req_id, "after-pass0")
+        log.warning("req#%d: body still %d bytes after proactive trims", req_id, len(body_out))
     return body_out
 
 
@@ -526,7 +563,7 @@ if __name__ == "__main__":
     log.info("  options stripped       -> Groq never receives Ollama-only options")
     log.info("  soft-413 detect        -> Groq 400 context errors trigger trim+retry")
     log.info("Config:")
-    log.info("  pre-flight    : body > %d bytes", PRE_TRIM_BYTES)
+    log.info("  safe budget   : body <= %d bytes before upstream", PRE_TRIM_BYTES)
     log.info("  per-msg       : %d chars", MAX_MSG_CHARS)
     log.info("  tool desc     : %d chars", MAX_TOOL_DESC_CHARS)
     log.info("  sys/pass      : %s", MAX_SYS_CHARS_BY_PASS)

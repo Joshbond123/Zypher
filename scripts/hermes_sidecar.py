@@ -29,6 +29,7 @@ LOG_FILE="/tmp/hermes.log"
 HERMES_HOME=os.path.expanduser("~/.hermes")
 MEMORY_DIR=os.path.join(HERMES_HOME,"memories")
 STATE_DB=os.path.join(HERMES_HOME,"state.db")
+PERSIST_STATE_DB=os.environ.get("HERMES_PERSIST_STATE_DB","0").lower() in ("1","true","yes")
 SKILLS_DIR=os.path.join(HERMES_HOME,"skills")
 SOUL_MD=os.path.join(HERMES_HOME,"SOUL.md")
 
@@ -134,6 +135,9 @@ def flush_statedb():
     Backup ~/.hermes/state.db to Supabase using WAL-safe sqlite3.backup() API.
     Runs every STATEDB_FLUSH_INTERVAL iterations (5 min) to minimize data loss.
     """
+    if not PERSIST_STATE_DB:
+        log.debug("state.db persistence disabled — skipping session DB flush")
+        return
     if not os.path.exists(STATE_DB):
         log.debug("state.db not found — skipping")
         return

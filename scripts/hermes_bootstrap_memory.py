@@ -35,6 +35,7 @@ RUN_ID=os.environ.get("GITHUB_RUN_ID","local")
 HERMES_HOME=os.path.expanduser("~/.hermes")
 MEM=os.path.join(HERMES_HOME,"memories")
 STATE_DB=os.path.join(HERMES_HOME,"state.db")
+PERSIST_STATE_DB=os.environ.get("HERMES_PERSIST_STATE_DB","0").lower() in ("1","true","yes")
 SKILLS_DIR=os.path.join(HERMES_HOME,"skills")
 SOUL_MD=os.path.join(HERMES_HOME,"SOUL.md")
 ARTIFACT_DIR="/tmp/memory-restore"
@@ -190,6 +191,14 @@ def restore_statedb():
     After restore: checkpoint, activate WAL, remove stale WAL files.
     """
     print("state.db: starting restore...")
+    if not PERSIST_STATE_DB:
+        remove_wal_files(STATE_DB)
+        try:
+            os.remove(STATE_DB)
+        except FileNotFoundError:
+            pass
+        print("state.db: restore disabled — starting fresh to prevent session/tool-output context bloat")
+        return
 
     # 1. Artifact (flat path first, then recursive)
     artifact_db = find_in_artifact("state.db")

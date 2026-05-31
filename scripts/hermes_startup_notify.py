@@ -21,7 +21,7 @@ BOT = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT = os.environ.get("TELEGRAM_USER_ID", "")
 RUN = os.environ.get("GITHUB_RUN_ID", "")
 MODEL = os.environ.get("HERMES_MODEL_NAME", "llama-3.3-70b-versatile")
-CTX = os.environ.get("LOCAL_CTX_SIZE", "65536")
+CTX = os.environ.get("LOCAL_CTX_SIZE", "16384")
 
 
 def send(msg):

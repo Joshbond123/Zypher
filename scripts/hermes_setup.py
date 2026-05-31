@@ -24,9 +24,9 @@ v5 MODEL SWITCH (2026-05):
   the model is ever switched back to a thinking model.
 
 Context configuration (unchanged from v4):
-  - context_length: 65536 (effective; model max is 131072)
-  - Compression threshold: 0.35 -> fires at ~22K tokens
-  - 65536 is the minimum that satisfies Hermes >= 64K startup check
+  - context_length: 16384 (deliberately below Groq free-tier TPM pressure)
+  - Compression threshold: 0.20 -> fires early at ~3K tokens
+  - Proxy also enforces an 18KB serialized request budget
 
 Memory limits (tightened for v5):
   - memory_char_limit: 600 (was 800)
@@ -48,7 +48,7 @@ LOCAL_BASE_URL = f"http://127.0.0.1:{PROXY_PORT}/v1"
 # v5: switched from qwen/qwen3-32b (thinking) to llama-3.3-70b-versatile (no thinking)
 PRIMARY_MODEL   = "llama-3.3-70b-versatile"
 FALLBACK_MODEL  = "llama-3.1-8b-instant"
-PRIMARY_CONTEXT = 65536
+PRIMARY_CONTEXT = 16384
 PROVIDER_TIMEOUT = 120
 LOCAL_API_KEY   = "groq-proxy"
 
@@ -87,7 +87,7 @@ model:
   provider: {provider}
   default: {primary}
   context_length: {context}
-  temperature: 0.7
+  temperature: 0.3
   streaming: true
 
 # Ordered fallback chain. The fallback is intentionally a different Groq
@@ -105,7 +105,7 @@ agent:
   gateway_notify_interval: 30
   gateway_timeout: 13200
   gateway_timeout_warning: 3600
-  api_max_retries: 3
+  api_max_retries: 1
   tool_use_enforcement: true
 
 approvals:
@@ -116,13 +116,15 @@ approvals:
 
 compression:
   enabled: true
-  threshold: 0.35
+  threshold: 0.20
+  target_ratio: 0.15
+  protect_last_n: 6
 
 memory:
   memory_enabled: true
   user_profile_enabled: true
-  memory_char_limit: 600
-  user_char_limit: 400
+  memory_char_limit: 400
+  user_char_limit: 300
 
 gateway:
   platforms:
@@ -131,24 +133,24 @@ gateway:
       botToken: "{tok}"
       dmPolicy: open
       streamMode: block
-      gateway_restart_notification: true
+      gateway_restart_notification: false
 
 tools:
   bash:
     enabled: true
-    timeoutSec: 300
+    timeoutSec: 120
   web_search:
     provider: tavily
     enabled: true
   web_fetch:
     enabled: true
-    maxChars: 12000
+    maxChars: 3000
   browser:
     enabled: true
     headless: true
     executablePath: /usr/bin/google-chrome-stable
-    timeoutMs: 30000
-    navigationTimeoutMs: 30000
+    timeoutMs: 20000
+    navigationTimeoutMs: 20000
 """.format(
         primary=PRIMARY_MODEL,
         fallback=FALLBACK_MODEL,
@@ -167,11 +169,11 @@ tools:
     print("  fallback           : {}".format(FALLBACK_MODEL))
     print("  provider           : {}".format(PROVIDER_NAME))
     print("  base_url           : {}".format(LOCAL_BASE_URL))
-    print("  context_length     : {:,} (effective; model max 131072)".format(PRIMARY_CONTEXT))
-    print("  compression thresh : 0.35 ({:,} tokens)".format(int(PRIMARY_CONTEXT * 0.35)))
-    print("  memory_char_limit  : 600 chars")
-    print("  user_char_limit    : 400 chars")
-    print("  web_fetch maxChars : 12000 chars")
+    print("  context_length     : {:,} (effective request budget; model max 131072)".format(PRIMARY_CONTEXT))
+    print("  compression thresh : 0.20 ({:,} tokens)".format(int(PRIMARY_CONTEXT * 0.20)))
+    print("  memory_char_limit  : 400 chars")
+    print("  user_char_limit    : 300 chars")
+    print("  web_fetch maxChars : 3000 chars")
     print("  request_timeout    : {}s".format(PROVIDER_TIMEOUT))
 
 

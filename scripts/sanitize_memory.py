@@ -13,15 +13,15 @@ WHY THIS EXISTS (May 2026):
   compression loop without ever reaching the proxy. Sanitizing the source files
   prevents that internal loop from ever triggering.
 
-LIMITS (conservative — designed to leave 90%+ of the 131K-token window free):
-  SOUL.md      : 3 000 chars  (~750 tokens)
-  Each skill   : 1 500 chars  (~375 tokens)
-  MEMORY.md    : 2 000 chars  (~500 tokens)
-  USER.md      : 1 000 chars  (~250 tokens)
-  Max skills   : 10 files     (15 000 chars total = ~3 750 tokens)
+LIMITS (conservative — designed for Groq free-tier TPM/request budgets):
+  SOUL.md      : 1 200 chars  (~300 tokens)
+  Each skill   :   800 chars  (~200 tokens)
+  MEMORY.md    : 1 000 chars  (~250 tokens)
+  USER.md      :   600 chars  (~150 tokens)
+  Max skills   : 5 files      (~1 000 tokens total)
 
-  Total worst-case system prompt: ~23 000 chars ≈ 5 750 tokens
-  Remaining for conversation    : 131 072 − 4 096 (max_tokens) − 5 750 ≈ 121 226 tokens
+  Text memory budget is kept under ~1.6K tokens so Hermes built-in instructions,
+  tool schemas, recent messages, and output budget can fit below low Groq TPM caps.
 """
 import os
 import sys
@@ -33,11 +33,11 @@ SKILLS_DIR   = os.path.join(HERMES_HOME, "skills")
 MEMORY_MD    = os.path.join(MEMORIES_DIR, "MEMORY.md")
 USER_MD      = os.path.join(MEMORIES_DIR, "USER.md")
 
-SOUL_LIMIT   = 3_000
-SKILL_LIMIT  = 1_500
-MAX_SKILLS   = 10
-MEMORY_LIMIT = 2_000
-USER_LIMIT   = 1_000
+SOUL_LIMIT   = 1_200
+SKILL_LIMIT  = 800
+MAX_SKILLS   = 5
+MEMORY_LIMIT = 1_000
+USER_LIMIT   = 600
 
 NOTICE = "\n\n[…content truncated by sanitize_memory.py to prevent Groq 413]"
 
@@ -135,9 +135,9 @@ def sanitize():
     print(f"  Skills total  : {skill_total:>6} chars")
     print(f"  ─────────────────────────")
     print(f"  TOTAL         : {total_chars:>6} chars  ≈ {total_tokens} tokens")
-    print(f"  Budget used   : {total_tokens}/{131072} tokens ({total_tokens/131072*100:.1f}%)")
-    if total_chars > 20_000:
-        print("  WARNING: system prompt exceeds 20K chars — may still cause 413")
+    print(f"  Budget used   : {total_tokens}/6000 free-tier TPM tokens ({total_tokens/6000*100:.1f}%)")
+    if total_chars > 6_000:
+        print("  WARNING: memory/system files exceed 6K chars — may still cause Groq TPM 413")
         sys.exit(1)
     else:
         print("  OK: system prompt within safe limits")

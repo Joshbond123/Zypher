@@ -230,8 +230,10 @@ jobs:
             [ -f "$SRC" ] && cp "$SRC" ~/.hermes/memories/USER.md \
               && echo "restored: USER.md from $SRC" && break || true
           done
-          [ -f "$R/state.db" ] && cp "$R/state.db" ~/.hermes/state.db \
-            && echo "restored: state.db" || echo "state.db: not in artifact"
+          # Do not restore state.db. It contains verbatim sessions/tool outputs and
+          # was the source of recurring Groq 413/compression-reset loops.
+          rm -f ~/.hermes/state.db ~/.hermes/state.db-wal ~/.hermes/state.db-shm
+          echo "state.db: skipped (fresh session DB; MEMORY.md/USER.md persist)"
           [ -f "$R/skills.tar.gz" ] && \
             tar xzf "$R/skills.tar.gz" -C ~/.hermes/skills/ 2>/dev/null \
             && echo "restored: skills" || true
@@ -312,7 +314,7 @@ jobs:
           TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
           GITHUB_RUN_ID: ${{ github.run_id }}
           HERMES_MODEL_NAME: ${{ env.GROQ_MODEL_NAME }}
-          LOCAL_CTX_SIZE: "65536"
+          LOCAL_CTX_SIZE: "16384"
         run: python3 scripts/hermes_startup_notify.py
 
       - name: Start Supabase sidecar
@@ -348,10 +350,10 @@ jobs:
           TIMEOUT=12000
           ELAPSED=0
           INTERVAL=20
-          # Groq is fast (~300-500 tok/s). If log is silent 300s something is wrong.
-          STALE_THRESHOLD=300
+          # Log silence is normal while polling Telegram. Restart only dead processes;
+          # stale-log restarts caused repeated session resets during idle periods.
           WATCHDOG_RESTARTS=0
-          echo "Keep-alive: ${TIMEOUT}s | interval=${INTERVAL}s | stale=${STALE_THRESHOLD}s"
+          echo "Keep-alive: ${TIMEOUT}s | interval=${INTERVAL}s | process-watchdog=enabled stale-log-restart=disabled"
           echo "Provider: Groq ${GROQ_MODEL_NAME} via 5-key rotation proxy :${GROQ_PROXY_PORT}"
 
           restart_proxy() {
@@ -388,28 +390,6 @@ jobs:
               echo "HERMES_PID=$HERMES_PID" >> $GITHUB_ENV
               echo "[${ELAPSED}s] Hermes restarted PID=$HERMES_PID"
               sleep 10
-            fi
-
-            if kill -0 "${HERMES_PID:-0}" 2>/dev/null; then
-              LOG_MTIME=$(date -r /tmp/hermes.log +%s 2>/dev/null || echo 0)
-              if [ "$LOG_MTIME" -gt 0 ]; then
-                LOG_AGE=$(( $(date +%s) - LOG_MTIME ))
-                if [ "$LOG_AGE" -gt "$STALE_THRESHOLD" ]; then
-                  WATCHDOG_RESTARTS=$((WATCHDOG_RESTARTS+1))
-                  echo "[${ELAPSED}s] WATCHDOG #${WATCHDOG_RESTARTS}: frozen ${LOG_AGE}s > ${STALE_THRESHOLD}s"
-                  curl -sf -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-                    -d "chat_id=${TELEGRAM_USER_ID}" \
-                    -d "text=Watchdog #${WATCHDOG_RESTARTS}: Zypher frozen (${LOG_AGE}s silence). Auto-restarting with Groq ${GROQ_MODEL_NAME}." 2>/dev/null || true
-                  kill -KILL ${HERMES_PID:-0} 2>/dev/null || true
-                  pkill -KILL -f "hermes gateway run" 2>/dev/null || true
-                  restart_proxy || true
-                  python3 scripts/hermes_preapprove.py 2>/dev/null || true
-                  nohup hermes gateway run --accept-hooks >> /tmp/hermes.log 2>&1 &
-                  HERMES_PID=$!
-                  echo "HERMES_PID=$HERMES_PID" >> $GITHUB_ENV
-                  sleep 20
-                fi
-              fi
             fi
 
             if ! kill -0 ${PAIRING_PID:-0} 2>/dev/null; then

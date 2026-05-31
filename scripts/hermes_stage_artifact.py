@@ -28,10 +28,15 @@ from datetime import datetime, timezone
 HERMES_HOME = os.path.expanduser("~/.hermes")
 MEM_DIR     = os.path.join(HERMES_HOME, "memories")
 STATE_DB    = os.path.join(HERMES_HOME, "state.db")
+PERSIST_STATE_DB = os.environ.get("HERMES_PERSIST_STATE_DB", "0").lower() in ("1", "true", "yes")
 SKILLS_DIR  = os.path.join(HERMES_HOME, "skills")
 SOUL_MD     = os.path.join(HERMES_HOME, "SOUL.md")
 
 STAGING_DIR = "/tmp/hermes-artifact"
+# Always start from an empty staging directory so an intentionally skipped
+# state.db from a prior local/test run cannot be uploaded accidentally.
+if os.path.isdir(STAGING_DIR):
+    shutil.rmtree(STAGING_DIR)
 os.makedirs(STAGING_DIR, exist_ok=True)
 
 now = datetime.now(timezone.utc).isoformat()
@@ -158,9 +163,12 @@ def write_manifest():
     print("  STAGED manifest.txt")
 
 
-# -- Step 1: Stage state.db via WAL-safe sqlite3.backup() -------------------
-print("\n[1/4] Staging state.db (WAL-safe backup)...")
-stage_statedb(STATE_DB, "state.db")
+# -- Step 1: state.db intentionally not persisted by default -----------------
+print("\n[1/4] Staging state.db (disabled by default)...")
+if PERSIST_STATE_DB:
+    stage_statedb(STATE_DB, "state.db")
+else:
+    print("  SKIP state.db: HERMES_PERSIST_STATE_DB is disabled; text memory persists without session bloat")
 
 # -- Step 2: Copy flat text files -------------------------------------------
 print("\n[2/4] Staging files...")
