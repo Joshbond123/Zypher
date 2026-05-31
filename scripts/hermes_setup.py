@@ -56,8 +56,11 @@ PRIMARY_MODEL = "qwen/qwen3-32b"
 #   limit means it only compresses at 75% = ~98K tokens. At that token count the
 #   payload JSON is large enough that Groq rejects the compression API call with 413,
 #   breaking the entire compression + fallback loop. Setting to 65536 keeps Hermes
-#   in safe territory: compression fires at 0.45 * 65536 ≈ 29K tokens — well within
-#   the Groq payload limit for all key tiers.
+#   in safe territory: compression fires at threshold * 65536 — well within the
+#   Groq payload limit for all key tiers.
+#
+# NOTE: 65536 is the MINIMUM value that satisfies Hermes's startup check (>= 64K).
+# Do NOT lower this further.
 PRIMARY_CONTEXT = 65536
 
 # Cloud inference is fast — use a reasonable timeout.
@@ -127,13 +130,13 @@ approvals:
 
 compression:
   enabled: true
-  threshold: 0.45
+  threshold: 0.40
 
 memory:
   memory_enabled: true
   user_profile_enabled: true
-  memory_char_limit: 1000
-  user_char_limit: 700
+  memory_char_limit: 800
+  user_char_limit: 600
 
 gateway:
   platforms:
