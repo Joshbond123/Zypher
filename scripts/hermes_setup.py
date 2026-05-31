@@ -1,28 +1,23 @@
 #!/usr/bin/env python3
-"""Write Hermes config.yaml and .env for local Qwen GGUF inference.
+"""Write Hermes config.yaml and .env for Groq API inference via local key-rotation proxy.
 
-Hermes talks to a local Ollama OpenAI-compatible server. The GitHub Actions
-workflow downloads Qwen2.5-3B-Instruct-Q4_K_M.gguf, creates an Ollama model,
-and exposes it to Hermes at http://127.0.0.1:7860/v1.
+Architecture:
+  Hermes → local groq proxy (127.0.0.1:18765) → Groq API (qwen/qwen3-32b)
 
-ROOT CAUSE FIX (2026-05-30):
-  PRIMARY_CONTEXT was hardcoded to 65536. The Qwen2.5-3B model handles this
-  pre-allocate a ~7GB KV cache (65536 tokens * ~112KB/token), consuming nearly
-  all available RAM on GitHub Actions (16GB). The result:
-    - Inference for 8 tokens: 43 seconds (vs 13s with 4096 context)
-    - A real response (200-500 tokens): 15-35 minutes on CPU
-    - Hermes request_timeout_seconds=600 fires at 10 minutes
-    - "Primary model failed" -> fallback (same model) -> also times out
-    - Watchdog (360s log-silence threshold) kills Hermes mid-inference
-    - Restart loop, endless "provider failed after retries" messages
+The proxy (scripts/groq_key_proxy.py) rotates GROQ_KEY_1..N on every request,
+handles 429 rate-limit retries, and forwards streaming SSE responses faithfully.
 
-  Fix: Read PRIMARY_CONTEXT from LOCAL_CTX_SIZE environment variable.
-  The workflow sets LOCAL_CTX_SIZE=4096, reducing KV cache to ~450MB and
-  making inference ~8-16x faster. Hermes responses now complete well within
-  both the provider timeout (600s) and watchdog threshold (1800s).
+Why Groq vs local Ollama:
+  Local 9B model at 65536 context: ~0.5 tok/s → 5-30 min responses → watchdog kills.
+  Local 3B model at 65536 context: ~4-8 tok/s → 15-60 sec responses → borderline.
+  Groq qwen3-32b: ~300-500 tok/s → 1-5 sec responses → instant from user perspective.
 
-  There is NO Hermes minimum context requirement of 64K. That was a
-  misreading of a Hermes performance recommendation, not a hard constraint.
+Context configuration:
+  - qwen/qwen3-32b has 131072 token context window on Groq
+  - Setting model.ollama_num_ctx: 131072 satisfies Hermes's per-turn 64K check
+    (check returns OK when value >= 65536) and prevents Hermes from querying
+    the proxy's /api/show endpoint (explicit config skips auto-detection)
+  - Setting model.context_length: 131072 satisfies the startup validation check
 """
 import os
 import sys
@@ -33,21 +28,22 @@ MEMDIR = os.path.join(HD, "memories")
 WS = os.path.join(HD, "workspace")
 SK = os.path.join(HD, "skills")
 
-PROVIDER_NAME = "local-qwen-gguf"
-LOCAL_BASE_URL = "http://127.0.0.1:7860/v1"
-PRIMARY_MODEL = "Qwen2.5-3B-Instruct-Q4_K_M"
+PROVIDER_NAME = "local-groq"
+PROXY_PORT = os.environ.get("GROQ_PROXY_PORT", "18765")
+LOCAL_BASE_URL = f"http://127.0.0.1:{PROXY_PORT}/v1"
+PRIMARY_MODEL = "qwen/qwen3-32b"
 
-# Both context_length AND ollama_num_ctx must be >= 64,000.
-# Hermes checks agent._ollama_num_ctx at every conversation turn and blocks
-# tool use if it is below MINIMUM_CONTEXT_LENGTH (64,000). There is no bypass.
-# Setting both to 65536 satisfies both the startup validation and the per-turn check.
-PRIMARY_CONTEXT = 65536
+# qwen/qwen3-32b has a 131072 context window on Groq.
+# Setting both context_length and ollama_num_ctx to 131072:
+#   1. Satisfies Hermes startup check (>= 64K)
+#   2. Satisfies per-turn conversation check (>= 65536)
+#   3. Prevents auto-detection query to /api/show on our proxy
+PRIMARY_CONTEXT = 131072
 
-# Increase provider timeout to 1800s to handle slower CPU inference at 65536 context.
-# At 65536 context, Qwen2.5-3B generates ~4-8 tok/s on CPU (vs 0.5-2 for 9B).
-# A 200-token response can take 100-400 seconds — well within 1800s.
-PROVIDER_TIMEOUT = 1800
-LOCAL_API_KEY = "local-qwen"
+# Cloud inference is fast — use a reasonable timeout.
+# 60s is generous even for a 1000-token response at 300 tok/s.
+PROVIDER_TIMEOUT = 120
+LOCAL_API_KEY = "groq-proxy"
 
 
 def ensure_dirs():
@@ -63,13 +59,10 @@ def write_config():
 # Hermes v0.15.x
 #
 # PRIMARY:  {primary}
-# RUNTIME:  Ollama, GGUF Q4_K_M, local OpenAI-compatible API
-# ENDPOINT: {base_url}
-# CONTEXT:  {context} tokens (set via LOCAL_CTX_SIZE env var)
-#
-# IMPORTANT: context_length={context} is intentional.
-#   65536 context was causing ~7GB KV cache, OOM, and 15-35 min inference times.
-#   4096 context gives ~450MB KV cache and 30-120 second inference times.
+# RUNTIME:  Groq API via local key-rotation proxy (groq_key_proxy.py)
+# ENDPOINT: {base_url}  →  https://api.groq.com/openai/v1
+# CONTEXT:  {context} tokens (qwen/qwen3-32b native context window)
+# SPEED:    ~300-500 tok/s (cloud GPU) → 1-5 second responses
 
 name: Zypher
 
@@ -89,10 +82,6 @@ model:
   temperature: 0.3
   streaming: true
 
-# Fallback is identical to primary (same local model).
-# When the local model is healthy, both primary and fallback work.
-# When it is unhealthy (OOM, restart), both fail -- this is expected.
-# The watchdog (1800s) handles recovery by restarting Ollama + Hermes.
 fallback_model:
   provider: {provider}
   model: {primary}
@@ -103,7 +92,7 @@ agent:
   gateway_notify_interval: 30
   gateway_timeout: 13200
   gateway_timeout_warning: 3600
-  api_max_retries: 2
+  api_max_retries: 3
   tool_use_enforcement: true
 
 approvals:
@@ -163,14 +152,11 @@ tools:
     print("  provider           : {}".format(PROVIDER_NAME))
     print("  base_url           : {}".format(LOCAL_BASE_URL))
     print("  primary model      : {}".format(PRIMARY_MODEL))
-    print("  fallback model     : {} (same local model)".format(PRIMARY_MODEL))
     print("  context_length     : {:,}".format(PRIMARY_CONTEXT))
-    print("  ollama_num_ctx     : {:,} (same — Hermes requires >= 64K on both)".format(PRIMARY_CONTEXT))
-    print("  streaming          : true")
+    print("  ollama_num_ctx     : {:,} (satisfies Hermes >= 64K check)".format(PRIMARY_CONTEXT))
     print("  request_timeout    : {}s".format(PROVIDER_TIMEOUT))
-    print("  api_max_retries    : 2")
-    print("  approvals.mode     : off")
-    print("  bash.timeoutSec    : 300s")
+    print("  api_max_retries    : 3")
+    print("  streaming          : true")
 
 
 def write_env():
@@ -181,41 +167,44 @@ def write_env():
     sb_key = os.environ.get("SUPABASE_SERVICE_KEY", "")
     gh = os.environ.get("GITHUB_TOKEN", "")
     uid = os.environ.get("TELEGRAM_USER_ID", "6317345496")
-    env_content = (
-        "OPENAI_API_KEY={api_key}\n"
-        "OPENROUTER_API_KEY={api_key}\n"
-        "HERMES_MODEL_PROVIDER={provider}\n"
-        "HERMES_MODEL_NAME={model}\n"
-        "HERMES_MODEL_BASE_URL={base_url}\n"
-        "TELEGRAM_HOME_CHANNEL={uid}\n"
-        "TELEGRAM_HOME_CHANNEL_NAME=Zypher Home\n"
-        "TELEGRAM_ALLOWED_USERS={uid}\n"
-        "TELEGRAM_BOT_TOKEN={tok}\n"
-        "TAVILY_API_KEY={tav}\n"
-        "SUPABASE_URL={sb_url}\n"
-        "SUPABASE_SERVICE_KEY={sb_key}\n"
-        "GITHUB_TOKEN={gh}\n"
-        "HERMES_YOLO_MODE=1\n"
-        "HERMES_GATEWAY_SESSION=1\n"
-    ).format(
-        api_key=LOCAL_API_KEY,
-        provider=PROVIDER_NAME,
-        model=PRIMARY_MODEL,
-        base_url=LOCAL_BASE_URL,
-        uid=uid,
-        tok=tok,
-        tav=tav,
-        sb_url=sb_url,
-        sb_key=sb_key,
-        gh=gh,
-    )
+
+    # Collect Groq keys for env file
+    groq_keys = []
+    for i in range(1, 20):
+        k = os.environ.get(f"GROQ_KEY_{i}", "").strip()
+        if k:
+            groq_keys.append((f"GROQ_KEY_{i}", k))
+
+    lines = [
+        f"OPENAI_API_KEY={LOCAL_API_KEY}",
+        f"OPENROUTER_API_KEY={LOCAL_API_KEY}",
+        f"HERMES_MODEL_PROVIDER={PROVIDER_NAME}",
+        f"HERMES_MODEL_NAME={PRIMARY_MODEL}",
+        f"HERMES_MODEL_BASE_URL={LOCAL_BASE_URL}",
+        f"TELEGRAM_HOME_CHANNEL={uid}",
+        "TELEGRAM_HOME_CHANNEL_NAME=Zypher Home",
+        f"TELEGRAM_ALLOWED_USERS={uid}",
+        f"TELEGRAM_BOT_TOKEN={tok}",
+        f"TAVILY_API_KEY={tav}",
+        f"SUPABASE_URL={sb_url}",
+        f"SUPABASE_SERVICE_KEY={sb_key}",
+        f"GITHUB_TOKEN={gh}",
+        "HERMES_YOLO_MODE=1",
+        "HERMES_GATEWAY_SESSION=1",
+        f"GROQ_PROXY_PORT={PROXY_PORT}",
+    ]
+    for key_name, key_val in groq_keys:
+        lines.append(f"{key_name}={key_val}")
+
+    env_content = "\n".join(lines) + "\n"
     p = os.path.join(HD, ".env")
     with open(p, "w") as fh:
         fh.write(env_content)
     os.chmod(p, 0o600)
     print("~/.hermes/.env written")
-    print("  OPENAI_API_KEY={} (local Ollama placeholder)".format(LOCAL_API_KEY))
+    print("  OPENAI_API_KEY={} (proxy placeholder)".format(LOCAL_API_KEY))
     print("  HERMES_MODEL_NAME={}".format(PRIMARY_MODEL))
+    print("  GROQ keys embedded: {}".format(len(groq_keys)))
     print("  HERMES_GATEWAY_SESSION=1")
 
 
