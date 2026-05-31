@@ -35,7 +35,7 @@ SK = os.path.join(HD, "skills")
 
 PROVIDER_NAME = "local-qwen-gguf"
 LOCAL_BASE_URL = "http://127.0.0.1:7860/v1"
-PRIMARY_MODEL = "Qwen3.5-9B-Uncensored-Q4_K_M"
+PRIMARY_MODEL = "Qwen2.5-3B-Instruct-Q4_K_M"
 
 # Both context_length AND ollama_num_ctx must be >= 64,000.
 # Hermes checks agent._ollama_num_ctx at every conversation turn and blocks
