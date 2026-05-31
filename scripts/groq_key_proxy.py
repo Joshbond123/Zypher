@@ -20,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import requests
 
-GROQ_BASE = "https://api.groq.com/openai/v1"
+GROQ_BASE = "https://api.groq.com/openai"  # path already contains /v1 prefix
 PROXY_HOST = "127.0.0.1"
 PROXY_PORT = int(os.environ.get("GROQ_PROXY_PORT", "18765"))
 
