@@ -65,7 +65,7 @@ GROQ_BASE  = "https://api.groq.com/openai"
 PROXY_HOST = "127.0.0.1"
 PROXY_PORT = int(os.environ.get("GROQ_PROXY_PORT", "18765"))
 
-MAX_OUTPUT_TOKENS   = 768
+MAX_OUTPUT_TOKENS   = 2048
 PRE_TRIM_BYTES      = 18_000
 MAX_MSG_CHARS       = 1_000
 MAX_ARGS_CHARS      = 500
@@ -464,13 +464,19 @@ class GroqProxyHandler(BaseHTTPRequestHandler):
                     self._err(503, f"Upstream failed: {e}")
                     return
 
-                if resp.status_code == 429 and attempt < len(_keys) - 1:
-                    log.warning("req#%d: 429 on %s - rotating", req_id, hint)
+                if resp.status_code == 429:
                     try:
                         resp.close()
                     except Exception:
                         pass
-                    continue
+                    if attempt < len(_keys) - 1:
+                        log.warning("req#%d: 429 on %s - rotating key", req_id, hint)
+                        continue
+                    # Last key also 429 — do NOT fall through to _stream().
+                    # Streaming a raw 429 back to Hermes confuses its error
+                    # classifier. Break so the outer "All keys exhausted" _err fires.
+                    log.warning("req#%d: 429 on last key %s - all exhausted", req_id, hint)
+                    break
 
                 if resp.status_code in (400, 413, 422):
                     try:
