@@ -1,6 +1,27 @@
 #!/usr/bin/env python3
 """Write Hermes config.yaml and .env for Groq API inference via local key-rotation proxy.
 
+v7 ROOT CAUSE FIX (May 2026):
+  PRIMARY_MODEL swapped from llama-3.3-70b-versatile to llama-3.1-8b-instant.
+
+  WHY: llama-3.3-70b-versatile has only 6,000 TPM on Groq free tier.
+  Hermes Agent makes 3-5 API calls per user message (tool planning + execution
+  + summarization). Each call uses ~3,800 tokens. Two calls exhaust the entire
+  6,000 TPM quota for ALL keys simultaneously — causing 429 on every key,
+  Hermes retries (api_max_retries: 1), still 429, falls back to llama-3.1-8b-instant
+  which hits the same rate-limited keys and also fails.
+  User sees "provider failed after retries" twice per message.
+
+  llama-3.1-8b-instant:
+    - 30,000 TPM on Groq free tier (5x more)
+    - Same 128K context window
+    - Full tool use support
+    - Handles multi-call agent workloads without hitting TPM limits
+
+  llama-3.3-70b-versatile demoted to fallback:
+    - Will activate when primary has a transient issue
+    - Higher quality responses when bandwidth allows
+
 Architecture:
   Hermes -> local groq proxy (127.0.0.1:18765) -> Groq API (llama-3.3-70b-versatile)
 
@@ -46,8 +67,8 @@ PROXY_PORT    = os.environ.get("GROQ_PROXY_PORT", "18765")
 LOCAL_BASE_URL = f"http://127.0.0.1:{PROXY_PORT}/v1"
 
 # v5: switched from qwen/qwen3-32b (thinking) to llama-3.3-70b-versatile (no thinking)
-PRIMARY_MODEL   = "llama-3.3-70b-versatile"
-FALLBACK_MODEL  = "llama-3.1-8b-instant"
+PRIMARY_MODEL   = "llama-3.1-8b-instant"
+FALLBACK_MODEL  = "llama-3.3-70b-versatile"
 PRIMARY_CONTEXT = 131072
 PROVIDER_TIMEOUT = 120
 LOCAL_API_KEY   = "groq-proxy"
@@ -111,7 +132,7 @@ agent:
   gateway_notify_interval: 30
   gateway_timeout: 13200
   gateway_timeout_warning: 3600
-  api_max_retries: 1
+  api_max_retries: 3
   tool_use_enforcement: true
 
 approvals:
@@ -215,6 +236,7 @@ def write_env():
         "HERMES_YOLO_MODE=1",
         "HERMES_GATEWAY_SESSION=1",
         f"GROQ_PROXY_PORT={PROXY_PORT}",
+        "HERMES_STREAM_READ_TIMEOUT=1800",
     ]
     for key_name, key_val in groq_keys:
         lines.append(f"{key_name}={key_val}")
