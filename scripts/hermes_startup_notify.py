@@ -20,8 +20,8 @@ import urllib.request
 BOT = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT = os.environ.get("TELEGRAM_USER_ID", "")
 RUN = os.environ.get("GITHUB_RUN_ID", "")
-MODEL = os.environ.get("HERMES_MODEL_NAME", "Qwen3.5-9B-Uncensored-Q4_K_M")
-CTX = os.environ.get("LOCAL_CTX_SIZE", "4096")
+MODEL = os.environ.get("HERMES_MODEL_NAME", "llama-3.3-70b-versatile")
+CTX = os.environ.get("LOCAL_CTX_SIZE", "65536")
 
 
 def send(msg):
@@ -49,10 +49,10 @@ def send(msg):
 send(
     f"Zypher is online (Run #{RUN})\n\n"
     f"Framework: Hermes Agent\n"
-    f"Provider: local Ollama OpenAI-compatible server\n"
+    f"Provider: Groq via local key-rotation proxy\n"
     f"Model: {MODEL}\n"
     f"Context: {CTX} tokens\n"
-    f"Auth: local placeholder key\n"
+    f"Auth: local proxy bearer + GROQ_KEY_N rotation\n"
     f"Tools: bash, web_search, browser\n\n"
     f"Ready. Send me anything."
 )

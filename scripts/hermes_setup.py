@@ -47,6 +47,7 @@ LOCAL_BASE_URL = f"http://127.0.0.1:{PROXY_PORT}/v1"
 
 # v5: switched from qwen/qwen3-32b (thinking) to llama-3.3-70b-versatile (no thinking)
 PRIMARY_MODEL   = "llama-3.3-70b-versatile"
+FALLBACK_MODEL  = "llama-3.1-8b-instant"
 PRIMARY_CONTEXT = 65536
 PROVIDER_TIMEOUT = 120
 LOCAL_API_KEY   = "groq-proxy"
@@ -86,13 +87,17 @@ model:
   provider: {provider}
   default: {primary}
   context_length: {context}
-  ollama_num_ctx: {context}
   temperature: 0.7
   streaming: true
 
-fallback_model:
-  provider: {provider}
-  model: {primary}
+# Ordered fallback chain. The fallback is intentionally a different Groq
+# production model so Hermes does not fail over to the same backend/model
+# that just failed. The proxy still rotates all configured GROQ_KEY_N keys.
+fallback_providers:
+  - provider: {provider}
+    model: {fallback}
+    base_url: {base_url}
+    key_env: OPENAI_API_KEY
 
 agent:
   max_turns: 200
@@ -146,6 +151,7 @@ tools:
     navigationTimeoutMs: 30000
 """.format(
         primary=PRIMARY_MODEL,
+        fallback=FALLBACK_MODEL,
         context=PRIMARY_CONTEXT,
         provider=PROVIDER_NAME,
         base_url=LOCAL_BASE_URL,
@@ -158,6 +164,7 @@ tools:
         fh.write(cfg)
     print("config.yaml written -> {}".format(p))
     print("  model              : {}  (v5: non-thinking)".format(PRIMARY_MODEL))
+    print("  fallback           : {}".format(FALLBACK_MODEL))
     print("  provider           : {}".format(PROVIDER_NAME))
     print("  base_url           : {}".format(LOCAL_BASE_URL))
     print("  context_length     : {:,} (effective; model max 131072)".format(PRIMARY_CONTEXT))

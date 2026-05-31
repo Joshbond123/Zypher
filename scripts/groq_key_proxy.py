@@ -71,6 +71,7 @@ MAX_MSG_CHARS       = 4_000
 MAX_ARGS_CHARS      = 1_500
 MAX_TOOL_DESC_CHARS = 200
 MAX_TRIM_PASSES     = 3
+THINKING_MODELS      = ("qwen/", "qwen3", "deepseek-r1")
 
 MAX_SYS_CHARS_BY_PASS = {0: 8_000, 1: 6_000, 2: 4_000, 3: 2_000}
 KEEP_MSGS_BY_PASS     = {0: 10,    1: 6,     2: 4,     3: 2    }
@@ -301,6 +302,11 @@ def _snapshot(payload, req_id, label):
 
 # ── Prepare request ────────────────────────────────────────────────────────────
 
+def _is_thinking_model(model):
+    m = str(model or "").lower()
+    return any(marker in m for marker in THINKING_MODELS)
+
+
 def _prepare(body_bytes, req_id):
     if not body_bytes:
         return body_bytes
@@ -311,10 +317,24 @@ def _prepare(body_bytes, req_id):
     if "messages" not in payload:
         return body_bytes
 
-    # Inject reasoning_effort=none to disable thinking (qwen3-32b and other CoT models)
-    if payload.get("reasoning_effort") != "none":
-        payload["reasoning_effort"] = "none"
-        log.info("req#%d: injected reasoning_effort=none (thinking disabled)", req_id)
+    # Hermes adds Ollama-only `options` when ollama_num_ctx is configured. Groq's
+    # OpenAI-compatible API rejects that field with HTTP 400 `property 'options'
+    # is unsupported`, which Hermes treats as a provider failure and retries.
+    if "options" in payload:
+        payload.pop("options", None)
+        log.info("req#%d: stripped unsupported Ollama options", req_id)
+
+    # Only thinking models need reasoning suppression. Do not send
+    # reasoning_effort to ordinary Groq chat models; some providers reject
+    # unknown/unsupported top-level fields.
+    if _is_thinking_model(payload.get("model")):
+        if payload.get("reasoning_effort") != "none":
+            payload["reasoning_effort"] = "none"
+            log.info("req#%d: injected reasoning_effort=none (thinking disabled)", req_id)
+    else:
+        if "reasoning_effort" in payload:
+            payload.pop("reasoning_effort", None)
+            log.info("req#%d: removed reasoning_effort for non-reasoning model", req_id)
 
     # Cap max_tokens
     mt = payload.get("max_tokens")
@@ -500,9 +520,10 @@ if __name__ == "__main__":
     for i, k in enumerate(_keys, 1):
         log.info("  [%d] %s...%s", i, k[:8], k[-4:])
     log.info("Fixes (v5 vs v4):")
-    log.info("  reasoning_effort=none  -> thinking/CoT disabled for all requests")
+    log.info("  reasoning_effort=none  -> only for thinking model requests")
     log.info("  reasoning_content strip -> stored CoT tokens removed from history")
     log.info("  tools trimmed          -> descriptions capped, excess tools dropped")
+    log.info("  options stripped       -> Groq never receives Ollama-only options")
     log.info("  soft-413 detect        -> Groq 400 context errors trigger trim+retry")
     log.info("Config:")
     log.info("  pre-flight    : body > %d bytes", PRE_TRIM_BYTES)

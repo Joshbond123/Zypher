@@ -32,7 +32,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 240
     env:
-      GROQ_MODEL_NAME: "qwen/qwen3-32b"
+      GROQ_MODEL_NAME: "llama-3.3-70b-versatile"
       GROQ_PROXY_PORT: "18765"
       GROQ_PROXY_URL: "http://127.0.0.1:18765/v1"
       OPENAI_API_KEY: groq-proxy
@@ -199,11 +199,12 @@ jobs:
           GROQ_PROXY_PORT: ${{ env.GROQ_PROXY_PORT }}
         run: |
           set -euo pipefail
-          echo "Testing Groq proxy → Groq API → qwen/qwen3-32b..."
+          echo "Testing Groq proxy → Groq API → ${GROQ_MODEL_NAME}..."
+          PAYLOAD=$(jq -nc --arg model "$GROQ_MODEL_NAME" '{model:$model,messages:[{role:"user",content:"Reply OK"}],max_tokens:8,stream:false}')
           RESPONSE=$(curl -sf "http://127.0.0.1:${GROQ_PROXY_PORT}/v1/chat/completions" \
             -H "Authorization: Bearer groq-proxy" \
             -H "Content-Type: application/json" \
-            -d '{"model":"qwen/qwen3-32b","messages":[{"role":"user","content":"Reply OK"}],"max_tokens":8,"stream":false}' \
+            -d "$PAYLOAD" \
             --max-time 30) || { echo "Curl failed — proxy log:"; cat /tmp/groq-proxy.log || true; exit 1; }
           echo "Raw response: $RESPONSE"
           echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); t=d['choices'][0]['message']['content'].strip(); print('Model replied:',repr(t)); print('Groq preflight PASSED')" \
@@ -309,8 +310,8 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
           GITHUB_RUN_ID: ${{ github.run_id }}
-          HERMES_MODEL_NAME: ${{ env.HERMES_MODEL_NAME }}
-          LOCAL_CTX_SIZE: ${{ env.LOCAL_CTX_SIZE }}
+          HERMES_MODEL_NAME: ${{ env.GROQ_MODEL_NAME }}
+          LOCAL_CTX_SIZE: "65536"
         run: python3 scripts/hermes_startup_notify.py
 
       - name: Start Supabase sidecar
@@ -350,7 +351,7 @@ jobs:
           STALE_THRESHOLD=300
           WATCHDOG_RESTARTS=0
           echo "Keep-alive: ${TIMEOUT}s | interval=${INTERVAL}s | stale=${STALE_THRESHOLD}s"
-          echo "Provider: Groq qwen/qwen3-32b via 5-key rotation proxy :${GROQ_PROXY_PORT}"
+          echo "Provider: Groq ${GROQ_MODEL_NAME} via 5-key rotation proxy :${GROQ_PROXY_PORT}"
 
           restart_proxy() {
             echo "Restarting Groq key-rotation proxy..."
@@ -397,7 +398,7 @@ jobs:
                   echo "[${ELAPSED}s] WATCHDOG #${WATCHDOG_RESTARTS}: frozen ${LOG_AGE}s > ${STALE_THRESHOLD}s"
                   curl -sf -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
                     -d "chat_id=${TELEGRAM_USER_ID}" \
-                    -d "text=Watchdog #${WATCHDOG_RESTARTS}: Zypher frozen (${LOG_AGE}s silence). Auto-restarting with Groq qwen3-32b." 2>/dev/null || true
+                    -d "text=Watchdog #${WATCHDOG_RESTARTS}: Zypher frozen (${LOG_AGE}s silence). Auto-restarting with Groq ${GROQ_MODEL_NAME}." 2>/dev/null || true
                   kill -KILL ${HERMES_PID:-0} 2>/dev/null || true
                   pkill -KILL -f "hermes gateway run" 2>/dev/null || true
                   restart_proxy || true
@@ -475,7 +476,7 @@ jobs:
         run: |
           curl -sf -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d "chat_id=${TELEGRAM_USER_ID}" \
-            -d "text=Zypher session rotating. Run #${GITHUB_RUN_ID} ended. Next scheduled run will start automatically with Groq qwen3-32b via 5-key rotation proxy." || true
+            -d "text=Zypher session rotating. Run #${GITHUB_RUN_ID} ended. Next scheduled run will start automatically with Groq ${GROQ_MODEL_NAME} via 5-key rotation proxy." || true
 
       - name: Stage memory artifact
         if: always()
