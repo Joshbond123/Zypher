@@ -32,9 +32,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 240
     env:
-      QWEN_MODEL_REPO: LEONW24/Qwen3.5-9B-Uncensored
-      QWEN_MODEL_FILE: Qwen3.5-9B-Uncensored-Q4_K_M.gguf
-      HERMES_MODEL_NAME: Qwen3.5-9B-Uncensored-Q4_K_M
+      QWEN_MODEL_REPO: bartowski/Qwen2.5-3B-Instruct-GGUF
+      QWEN_MODEL_FILE: Qwen2.5-3B-Instruct-Q4_K_M.gguf
+      HERMES_MODEL_NAME: Qwen2.5-3B-Instruct-Q4_K_M
       LOCAL_MODEL_PORT: "7860"
       # ROOT CAUSE FIX: Reduced from 65536 to 4096.
       # 65536-token context pre-allocates ~7GB KV cache on a 9B model,
@@ -49,6 +49,7 @@ jobs:
       OPENROUTER_API_KEY: local-qwen
       # Prevent Ollama from serving concurrent requests that would exhaust RAM.
       OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_FLASH_ATTENTION: "1"
       OLLAMA_MAX_LOADED_MODELS: "1"
     steps:
       - name: Checkout repository
