@@ -37,7 +37,7 @@ jobs:
       HERMES_MODEL_NAME: Qwen2.5-3B-Instruct-Q4_K_M
       LOCAL_MODEL_PORT: "7860"
       # ROOT CAUSE FIX: Reduced from 65536 to 4096.
-      # 65536-token context pre-allocates ~7GB KV cache on a 9B model,
+      # 65536-token context pre-allocates ~2.5GB KV cache on a 3B model,
       # consuming nearly all of the 16GB GitHub Actions runner RAM.
       # Result: 43s for 8 tokens, 15-35 min for a full response, 600s
       # provider timeout fires, "primary model failed", fallback also
@@ -506,7 +506,7 @@ jobs:
         run: |
           curl -sf -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d "chat_id=${TELEGRAM_USER_ID}" \
-            -d "text=Zypher session rotating. Run #${GITHUB_RUN_ID} ended. Next scheduled run will start automatically with local Qwen3.5-9B GGUF." || true
+            -d "text=Zypher session rotating. Run #${GITHUB_RUN_ID} ended. Next scheduled run will start automatically with local Qwen2.5-3B GGUF." || true
 
       - name: Stage memory artifact
         if: always()
