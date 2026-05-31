@@ -264,6 +264,11 @@ jobs:
           TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
         run: python3 scripts/hermes_preapprove.py
 
+
+      - name: Sanitize memory files (cap SOUL.md + skills to prevent 413)
+        run: |
+          python3 scripts/sanitize_memory.py || true
+
       - name: Start Hermes gateway
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -285,6 +290,8 @@ jobs:
           sleep 35
           echo "=== Hermes startup log (first 100 lines) ==="
           head -100 /tmp/hermes.log || true
+          echo "=== Groq proxy log at gateway start ==="
+          cat /tmp/groq-proxy.log || true
 
       - name: Start pairing auto-approver
         env:
