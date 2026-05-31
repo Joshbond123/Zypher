@@ -5,19 +5,35 @@ Architecture:
   Hermes → local groq proxy (127.0.0.1:18765) → Groq API (qwen/qwen3-32b)
 
 The proxy (scripts/groq_key_proxy.py) rotates GROQ_KEY_1..N on every request,
-handles 429 rate-limit retries, and forwards streaming SSE responses faithfully.
+handles 429 rate-limit retries, and — critically — intercepts 413 responses to
+progressively trim the messages array before they ever reach Hermes as an error.
 
 Why Groq vs local Ollama:
   Local 9B model at 65536 context: ~0.5 tok/s → 5-30 min responses → watchdog kills.
   Local 3B model at 65536 context: ~4-8 tok/s → 15-60 sec responses → borderline.
   Groq qwen3-32b: ~300-500 tok/s → 1-5 sec responses → instant from user perspective.
 
-Context configuration:
-  - qwen/qwen3-32b has 131072 token context window on Groq
-  - Setting model.ollama_num_ctx: 131072 satisfies Hermes's per-turn 64K check
-    (check returns OK when value >= 65536) and prevents Hermes from querying
-    the proxy's /api/show endpoint (explicit config skips auto-detection)
-  - Setting model.context_length: 131072 satisfies the startup validation check
+Context configuration (FIX 2026-05):
+  - qwen/qwen3-32b has 131072 token context window on Groq.
+  - PREVIOUSLY: context_length was set to 131072. Hermes only triggers compression at
+    threshold=0.75 → ~98K tokens used. By that point, the payload is already so large
+    that the compression API call itself returns 413, locking into the error loop:
+      413 → compression attempt → 413 → fallback → 413 → session reset
+  - FIX: effective context_length reduced to 65536 (still satisfies Hermes >= 64K check).
+    Compression threshold lowered to 0.45 → fires at ~29K tokens (~30% of model max).
+    This ensures compression always happens well before the Groq API payload limit.
+  - The proxy (groq_key_proxy.py) provides a second line of defense: if a request ever
+    reaches 413, the proxy trims the messages array and retries transparently.
+
+Memory injection limits (FIX 2026-05):
+  - memory_char_limit reduced from 2200 → 1000 chars
+  - user_char_limit reduced from 1375 → 700 chars
+  - These are injected into every single request; smaller = fewer baseline tokens.
+
+web_fetch limit (FIX 2026-05):
+  - maxChars reduced from 60000 → 15000 chars (~3750 tokens).
+  - A single web_fetch at 60K chars = ~15K tokens dumped into conversation history.
+  - At 65K effective context, a few web fetches fill the entire window instantly.
 """
 import os
 import sys
@@ -33,15 +49,19 @@ PROXY_PORT = os.environ.get("GROQ_PROXY_PORT", "18765")
 LOCAL_BASE_URL = f"http://127.0.0.1:{PROXY_PORT}/v1"
 PRIMARY_MODEL = "qwen/qwen3-32b"
 
-# qwen/qwen3-32b has a 131072 context window on Groq.
-# Setting both context_length and ollama_num_ctx to 131072:
-#   1. Satisfies Hermes startup check (>= 64K)
-#   2. Satisfies per-turn conversation check (>= 65536)
-#   3. Prevents auto-detection query to /api/show on our proxy
-PRIMARY_CONTEXT = 131072
+# Effective context window exposed to Hermes.
+#
+# WHY 65536 NOT 131072:
+#   The Groq API supports 131072 tokens for qwen3-32b, but setting Hermes to that
+#   limit means it only compresses at 75% = ~98K tokens. At that token count the
+#   payload JSON is large enough that Groq rejects the compression API call with 413,
+#   breaking the entire compression + fallback loop. Setting to 65536 keeps Hermes
+#   in safe territory: compression fires at 0.45 * 65536 ≈ 29K tokens — well within
+#   the Groq payload limit for all key tiers.
+PRIMARY_CONTEXT = 65536
 
 # Cloud inference is fast — use a reasonable timeout.
-# 60s is generous even for a 1000-token response at 300 tok/s.
+# 120s is generous even for a 1000-token response at 300 tok/s.
 PROVIDER_TIMEOUT = 120
 LOCAL_API_KEY = "groq-proxy"
 
@@ -61,8 +81,12 @@ def write_config():
 # PRIMARY:  {primary}
 # RUNTIME:  Groq API via local key-rotation proxy (groq_key_proxy.py)
 # ENDPOINT: {base_url}  →  https://api.groq.com/openai/v1
-# CONTEXT:  {context} tokens (qwen/qwen3-32b native context window)
+# CONTEXT:  {context} tokens (effective limit; model max is 131072)
 # SPEED:    ~300-500 tok/s (cloud GPU) → 1-5 second responses
+#
+# FIX (2026-05): context_length reduced from 131072 → 65536 to prevent 413 errors.
+# Compression threshold reduced from 0.75 → 0.45 to fire well before payload limits.
+# See hermes_setup.py header for full root-cause analysis.
 
 name: Zypher
 
@@ -87,7 +111,7 @@ fallback_model:
   model: {primary}
 
 agent:
-  max_turns: 500
+  max_turns: 200
   clarify_timeout: 30
   gateway_notify_interval: 30
   gateway_timeout: 13200
@@ -103,13 +127,13 @@ approvals:
 
 compression:
   enabled: true
-  threshold: 0.75
+  threshold: 0.45
 
 memory:
   memory_enabled: true
   user_profile_enabled: true
-  memory_char_limit: 2200
-  user_char_limit: 1375
+  memory_char_limit: 1000
+  user_char_limit: 700
 
 gateway:
   platforms:
@@ -129,7 +153,7 @@ tools:
     enabled: true
   web_fetch:
     enabled: true
-    maxChars: 60000
+    maxChars: 15000
   browser:
     enabled: true
     headless: true
@@ -152,9 +176,14 @@ tools:
     print("  provider           : {}".format(PROVIDER_NAME))
     print("  base_url           : {}".format(LOCAL_BASE_URL))
     print("  primary model      : {}".format(PRIMARY_MODEL))
-    print("  context_length     : {:,}".format(PRIMARY_CONTEXT))
+    print("  context_length     : {:,} (effective; model max 131072)".format(PRIMARY_CONTEXT))
     print("  ollama_num_ctx     : {:,} (satisfies Hermes >= 64K check)".format(PRIMARY_CONTEXT))
+    print("  compression thresh : 0.45 ({:,} tokens)".format(int(PRIMARY_CONTEXT * 0.45)))
+    print("  memory_char_limit  : 1000 chars")
+    print("  user_char_limit    : 700 chars")
+    print("  web_fetch maxChars : 15000 chars (~3750 tokens)")
     print("  request_timeout    : {}s".format(PROVIDER_TIMEOUT))
+    print("  max_turns          : 200")
     print("  api_max_retries    : 3")
     print("  streaming          : true")
 
