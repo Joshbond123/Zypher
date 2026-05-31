@@ -1,45 +1,54 @@
 #!/usr/bin/env python3
 """
 Thread-safe Groq API key rotation proxy for Hermes agent.
-413 Context Guardian Edition — v4.
+413 Eradicator Edition — v5.
 
-ROOT CAUSE TIMELINE
-===================
-v1 (broken — May 2026 run #249):
-  • Trimmed only by MESSAGE COUNT, never by content size.
-  • Returned None immediately when conv_msgs <= 2 (fresh session → no trim → 413).
-  • System prompt never touched.
-  • No max_tokens injection.
+ROOT CAUSE ANALYSIS (definitive, May 2026)
+==========================================
 
-v2 (broken — same run, same code as v1, just different threshold):
-  • Same bugs as v1.
+v1-v3: Various truncation bugs (message count only, skipped list-format content, etc.)
+v4: Fixed content format handling (string + list). Still failing. Three remaining issues:
 
-v3 (still broken — run #252):
-  • Fixed max_tokens injection. ✓
-  • Fixed pre-flight trim on large body. ✓
-  • Truncated string-format content. ✓
-  • MISSED: content in LIST format (OpenAI structured content) was silently SKIPPED.
-    Any message with content=[{"type":"text","text":"..."}] passed through untouched.
-    Hermes sends tool results (bash, browser outputs) and sometimes system messages
-    in list format. A single nmap/gobuster result stored as list-format content bypasses
-    all truncation and keeps triggering Groq 413.
-  • MISSED: content=None (assistant messages that only have tool_calls) caused
-    `_truncate(None, ...)` to fail silently or pass through a None.
+ISSUE 1 — Thinking tokens (primary killer):
+  qwen/qwen3-32b is a "thinking" model. Every response contains a reasoning
+  chain (5K-30K tokens) that Groq returns in a SEPARATE field `reasoning_content`
+  alongside the regular `content` field. Hermes v0.15.x stores this field in
+  conversation history. v4 only trimmed `content`; `reasoning_content` passed
+  through intact. After 3-4 turns the assistant messages alone were 50-200 KB
+  of stored thinking tokens.
 
-v4 (this version — definitive fix):
-  • Handles ALL three content formats for every message role:
-      - content: None (or missing) → leave as-is
-      - content: "string" → truncate to limit
-      - content: [{"type":"text","text":"..."}, ...] → truncate the "text" field
-        in each list item; non-text items (image_url, etc.) are kept as-is
-  • Handles `tool_calls` array in assistant messages:
-      - Each function call's `arguments` string truncated to MAX_ARGS_CHARS
-  • Added per-request diagnostic log line showing every message role, content
-    format, and byte size — so future failures are immediately diagnosable.
-  • PRE_TRIM_BYTES lowered from 300KB to 100KB — ensures pre-flight fires for
-    realistic Hermes payloads (skills + SOUL.md + bash outputs often reach 50-150KB)
-  • Reactive passes now lower MAX_SYS_CHARS further per pass (10K→5K→2K)
-    so extremely large skill payloads are also handled.
+ISSUE 2 — Tools array never trimmed:
+  Hermes creates custom skills as tool definitions. Each new skill adds a JSON
+  schema (description + parameters) to every request. After skill-heavy use,
+  the tools array alone can be 30-80 KB. v4 only touched `messages`.
+
+ISSUE 3 — Broken compression loop:
+  When the proxy returned 413 after 3 passes, Hermes tried to compress
+  (summarize) the conversation. That compression call ALSO went through the
+  proxy, which trimmed it to only 2 messages. The compression model summarized
+  a fragment. The summary was useless. Context stayed large. Next turn: 413
+  again. Infinite loop → session reset.
+
+v5 FIXES
+--------
+  FIX 1 — Disable thinking entirely:
+    Inject reasoning_effort="none" into every chat completion request.
+    Also strip reasoning_content already stored in conversation history.
+
+  FIX 2 — Trim tools array:
+    On every pass, truncate each tool description to MAX_TOOL_DESC_CHARS.
+    On aggressive passes, drop tools beyond the top N.
+
+  FIX 3 — Handle Groq 400 "context too large" like a 413:
+    Groq sometimes returns HTTP 400 (not 413) with body containing
+    "context_length_exceeded" or "Request entity too large".
+    v5 detects these and applies the same trim-and-retry loop.
+
+MODEL SWITCH (hermes_setup.py companion change):
+  Primary model changed from qwen/qwen3-32b (thinking model) to
+  llama-3.3-70b-versatile (no thinking, 131K context, fast responses).
+  This eliminates ISSUE 1 at the model level. The proxy reasoning_effort
+  injection stays as a safety net for any thinking model.
 """
 
 import itertools
@@ -52,44 +61,43 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import requests
 
-# ── Groq endpoint ──────────────────────────────────────────────────────────────
-GROQ_BASE = "https://api.groq.com/openai"   # self.path starts with /v1/...
-
-# ── Proxy config ───────────────────────────────────────────────────────────────
+GROQ_BASE  = "https://api.groq.com/openai"
 PROXY_HOST = "127.0.0.1"
 PROXY_PORT = int(os.environ.get("GROQ_PROXY_PORT", "18765"))
 
-# ── Context guardian constants ─────────────────────────────────────────────────
-MAX_OUTPUT_TOKENS = 4096      # injected if unset or larger
-PRE_TRIM_BYTES    = 100_000   # pre-flight trim threshold (100 KB — catches realistic Hermes payloads)
-MAX_MSG_CHARS     = 5_000     # per-message string content limit
-MAX_ARGS_CHARS    = 2_000     # per-tool-call arguments limit
-MAX_SYS_CHARS_BY_PASS = {     # system message limit per pass (gets more aggressive)
-    0: 10_000,   # as-prepared (pre-flight or pass-0)
-    1: 10_000,   # reactive pass 1
-    2:  5_000,   # reactive pass 2 — more aggressive
-    3:  2_000,   # reactive pass 3 — most aggressive
-}
-KEEP_MSGS_BY_PASS = {
-    0: 12,
-    1:  8,
-    2:  4,
-    3:  2,
-}
-MAX_TRIM_PASSES = 3
+MAX_OUTPUT_TOKENS   = 4096
+PRE_TRIM_BYTES      = 80_000
+MAX_MSG_CHARS       = 4_000
+MAX_ARGS_CHARS      = 1_500
+MAX_TOOL_DESC_CHARS = 200
+MAX_TRIM_PASSES     = 3
 
-# ── Logging ────────────────────────────────────────────────────────────────────
+MAX_SYS_CHARS_BY_PASS = {0: 8_000, 1: 6_000, 2: 4_000, 3: 2_000}
+KEEP_MSGS_BY_PASS     = {0: 10,    1: 6,     2: 4,     3: 2    }
+KEEP_TOOLS_BY_PASS    = {0: 999,   1: 40,    2: 20,    3: 10   }
+
+_SOFT_413_PATTERNS = [
+    "request entity too large",
+    "payload too large",
+    "context_length_exceeded",
+    "maximum context length",
+    "too many tokens",
+    "tokens in your request exceeds",
+    "input is too long",
+    "reduce the length",
+]
+
 logging.basicConfig(
-    level    = logging.INFO,
-    format   = "[groq-proxy %(asctime)s] %(message)s",
-    datefmt  = "%H:%M:%S",
-    stream   = sys.stdout,
-    force    = True,
+    level=logging.INFO,
+    format="[groq-proxy %(asctime)s] %(message)s",
+    datefmt="%H:%M:%S",
+    stream=sys.stdout,
+    force=True,
 )
 log = logging.getLogger("groq-proxy")
 
-# ── Key management ─────────────────────────────────────────────────────────────
-def _load_keys() -> list:
+
+def _load_keys():
     keys = []
     for i in range(1, 20):
         k = os.environ.get(f"GROQ_KEY_{i}", "").strip()
@@ -99,16 +107,18 @@ def _load_keys() -> list:
         raise RuntimeError("No Groq API keys. Set GROQ_KEY_1, GROQ_KEY_2, ...")
     return keys
 
+
 _keys      = _load_keys()
 _key_cycle = itertools.cycle(_keys)
 _lock      = threading.Lock()
+_req_count = 0
+_req_lock  = threading.Lock()
 
-_request_count = 0
-_req_lock      = threading.Lock()
 
-def _next_key() -> str:
+def _next_key():
     with _lock:
         return next(_key_cycle)
+
 
 _HOP_BY_HOP = frozenset([
     "host", "connection", "keep-alive", "proxy-authenticate",
@@ -116,367 +126,322 @@ _HOP_BY_HOP = frozenset([
     "upgrade", "authorization",
 ])
 
+
 # ── Content helpers ────────────────────────────────────────────────────────────
 
-def _truncate_str(text: str, limit: int) -> tuple:
-    """Return (truncated_text, was_truncated)."""
+def _trunc(text, limit):
     if len(text) <= limit:
         return text, False
-    return text[:limit] + f"\n[…{len(text) - limit} chars trimmed by proxy]", True
+    return text[:limit] + f"...[{len(text)-limit}c cut]", True
 
 
-def _content_size(content) -> int:
-    """Return the best estimate of a content field's character size."""
-    if content is None:
+def _content_size(c):
+    if c is None:
         return 0
-    if isinstance(content, str):
-        return len(content)
-    if isinstance(content, list):
-        total = 0
-        for item in content:
-            if isinstance(item, dict):
-                total += len(item.get("text", "") or "")
-        return total
-    return len(str(content))
+    if isinstance(c, str):
+        return len(c)
+    if isinstance(c, list):
+        return sum(len((i.get("text") or "") if isinstance(i, dict) else "") for i in c)
+    return len(str(c))
 
 
-def _truncate_content(content, limit: int, role: str) -> tuple:
-    """
-    Truncate a message content field regardless of its format.
-    Handles:
-      • None / missing         → returned unchanged
-      • str                    → simple truncation
-      • list of content parts  → truncate "text" fields in each part
-    Returns (new_content, was_truncated).
-    """
+def _trunc_content(content, limit):
     if content is None:
         return content, False
-
     if isinstance(content, str):
-        return _truncate_str(content, limit)
-
+        return _trunc(content, limit)
     if isinstance(content, list):
-        new_parts = []
-        cut_any   = False
+        parts, cut = [], False
         for item in content:
             if isinstance(item, dict) and item.get("type") == "text":
-                text = item.get("text") or ""
-                trimmed, cut = _truncate_str(text, limit)
-                cut_any = cut_any or cut
-                new_parts.append({**item, "text": trimmed})
+                t, c = _trunc(item.get("text") or "", limit)
+                cut = cut or c
+                parts.append({**item, "text": t})
             else:
-                # image_url, audio, etc. — keep as-is
-                new_parts.append(item)
-        return new_parts, cut_any
-
-    # Unexpected type — convert to string and truncate
-    s = str(content)
-    trimmed, cut = _truncate_str(s, limit)
-    return trimmed, cut
+                parts.append(item)
+        return parts, cut
+    t, c = _trunc(str(content), limit)
+    return t, c
 
 
-def _truncate_tool_calls(tool_calls: list) -> tuple:
-    """
-    Truncate the `arguments` string in each tool_call.
-    Returns (new_tool_calls, was_truncated).
-    """
-    if not isinstance(tool_calls, list):
-        return tool_calls, False
-    new_calls = []
-    cut_any   = False
-    for tc in tool_calls:
+def _trunc_tool_calls(tcs):
+    if not isinstance(tcs, list):
+        return tcs, False
+    out, cut = [], False
+    for tc in tcs:
         if not isinstance(tc, dict):
-            new_calls.append(tc)
+            out.append(tc)
             continue
-        fn = tc.get("function", {})
+        fn   = tc.get("function", {})
         args = fn.get("arguments", "")
         if isinstance(args, str) and len(args) > MAX_ARGS_CHARS:
-            args    = args[:MAX_ARGS_CHARS] + "…[args trimmed]"
-            cut_any = True
-            fn      = {**fn, "arguments": args}
-            tc      = {**tc, "function": fn}
-        new_calls.append(tc)
-    return new_calls, cut_any
+            args = args[:MAX_ARGS_CHARS] + "...[args cut]"
+            cut  = True
+            fn   = {**fn, "arguments": args}
+            tc   = {**tc, "function": fn}
+        out.append(tc)
+    return out, cut
+
+
+def _strip_reasoning(msg):
+    """Remove reasoning_content entirely — it is thinking-chain tokens, never needed in requests."""
+    if "reasoning_content" not in msg:
+        return msg, False
+    rc = msg.get("reasoning_content")
+    if not rc:
+        return msg, False
+    new_msg = {k: v for k, v in msg.items() if k != "reasoning_content"}
+    return new_msg, True
+
+
+def _trim_tools(tools, trim_pass):
+    if not isinstance(tools, list) or not tools:
+        return tools, False
+    keep_n = KEEP_TOOLS_BY_PASS.get(trim_pass, 10)
+    out, cut = [], False
+    for t in tools:
+        if not isinstance(t, dict):
+            out.append(t)
+            continue
+        fn   = t.get("function") or t
+        desc = fn.get("description") or ""
+        if len(desc) > MAX_TOOL_DESC_CHARS:
+            short = desc[:MAX_TOOL_DESC_CHARS] + "..."
+            cut   = True
+            if "function" in t:
+                t = {**t, "function": {**fn, "description": short}}
+            else:
+                t = {**t, "description": short}
+        out.append(t)
+    if len(out) > keep_n:
+        cut = True
+        out = out[:keep_n]
+    return out, cut
 
 
 # ── Trim payload ───────────────────────────────────────────────────────────────
 
-def _trim_payload(payload: dict, trim_pass: int, req_id: int) -> dict:
-    """
-    Return a new payload dict with reduced message sizes.
-
-    Applied layers (cumulative, applied every pass):
-      L1: Truncate every non-system message content (string OR list) to MAX_MSG_CHARS.
-      L2: Truncate tool_calls.function.arguments in assistant messages.
-      L3: Truncate system message content (string OR list) to MAX_SYS_CHARS_BY_PASS[trim_pass].
-      L4: Drop oldest non-system messages based on KEEP_MSGS_BY_PASS[trim_pass].
-    """
-    messages = payload.get("messages", [])
-    if not isinstance(messages, list):
+def _trim(payload, trim_pass, req_id):
+    msgs = payload.get("messages", [])
+    if not isinstance(msgs, list):
         return payload
 
-    sys_limit  = MAX_SYS_CHARS_BY_PASS.get(trim_pass, 2_000)
-    keep_n     = KEEP_MSGS_BY_PASS.get(trim_pass, 2)
-    new_msgs   = []
-    l1_count = l2_count = l3_count = 0
+    sys_lim = MAX_SYS_CHARS_BY_PASS.get(trim_pass, 2_000)
+    keep_n  = KEEP_MSGS_BY_PASS.get(trim_pass, 2)
+    new_msgs = []
+    rc_cut = cnt_cut = args_cut = sys_cut = 0
 
-    for msg in messages:
-        role    = msg.get("role", "unknown")
-        content = msg.get("content")
+    for msg in msgs:
+        role = msg.get("role", "?")
+
+        # Strip reasoning_content (qwen3 / other thinking model output)
+        msg, c = _strip_reasoning(msg)
+        if c:
+            rc_cut += 1
 
         if role == "system":
-            # L3: system message (string or list)
-            new_content, cut = _truncate_content(content, sys_limit, role)
-            if cut:
-                l3_count += 1
-                log.info(
-                    "req#%d pass%d L3: system %d→%d chars (limit=%d)",
-                    req_id, trim_pass, _content_size(content), _content_size(new_content), sys_limit,
-                )
-            new_msgs.append({**msg, "content": new_content})
+            nc, c = _trunc_content(msg.get("content"), sys_lim)
+            if c:
+                sys_cut += 1
+            new_msgs.append({**msg, "content": nc})
         else:
-            # L1: truncate content
-            new_content, cut1 = _truncate_content(content, MAX_MSG_CHARS, role)
-            if cut1:
-                l1_count += 1
-                log.info(
-                    "req#%d pass%d L1: %s content %d→%d chars",
-                    req_id, trim_pass, role, _content_size(content), _content_size(new_content),
-                )
-            new_msg = {**msg, "content": new_content}
-
-            # L2: truncate tool_calls arguments
+            nc, c = _trunc_content(msg.get("content"), MAX_MSG_CHARS)
+            if c:
+                cnt_cut += 1
+            nm = {**msg, "content": nc}
             if "tool_calls" in msg:
-                new_tc, cut2 = _truncate_tool_calls(msg["tool_calls"])
-                if cut2:
-                    l2_count += 1
-                    log.info("req#%d pass%d L2: %s tool_calls trimmed", req_id, trim_pass, role)
-                new_msg = {**new_msg, "tool_calls": new_tc}
+                ntc, c = _trunc_tool_calls(msg["tool_calls"])
+                if c:
+                    args_cut += 1
+                nm = {**nm, "tool_calls": ntc}
+            new_msgs.append(nm)
 
-            new_msgs.append(new_msg)
-
-    if l1_count or l2_count or l3_count:
+    if rc_cut or cnt_cut or args_cut or sys_cut:
         log.info(
-            "req#%d pass%d content trim: L1=%d L2=%d L3=%d",
-            req_id, trim_pass, l1_count, l2_count, l3_count,
+            "req#%d pass%d: rc_stripped=%d content_cut=%d args_cut=%d sys_cut=%d",
+            req_id, trim_pass, rc_cut, cnt_cut, args_cut, sys_cut,
         )
 
-    # L4: drop oldest non-system messages
     sys_msgs  = [m for m in new_msgs if m.get("role") == "system"]
     conv_msgs = [m for m in new_msgs if m.get("role") != "system"]
-
     if len(conv_msgs) > keep_n:
         dropped   = len(conv_msgs) - keep_n
         conv_msgs = conv_msgs[-keep_n:]
-        log.info(
-            "req#%d pass%d L4: dropped %d oldest non-system msg(s), kept %d",
-            req_id, trim_pass, dropped, keep_n,
-        )
+        log.info("req#%d pass%d: dropped %d msgs, kept %d", req_id, trim_pass, dropped, keep_n)
 
-    return {**payload, "messages": sys_msgs + conv_msgs}
+    new_payload = {**payload, "messages": sys_msgs + conv_msgs}
+
+    if "tools" in new_payload:
+        nt, c = _trim_tools(new_payload["tools"], trim_pass)
+        if c:
+            log.info("req#%d pass%d: tools -> %d", req_id, trim_pass, len(nt))
+        new_payload["tools"] = nt
+
+    return new_payload
 
 
-# ── Diagnostic per-request log ─────────────────────────────────────────────────
-
-def _log_request_snapshot(payload: dict, req_id: int, label: str):
-    """Log a compact snapshot of the payload for diagnostics."""
-    messages = payload.get("messages", [])
-    total_chars = 0
+def _snapshot(payload, req_id, label):
+    msgs  = payload.get("messages", [])
+    tools = payload.get("tools", [])
+    total = 0
     parts = []
-    for m in messages:
+    for m in msgs:
         role = m.get("role", "?")
-        content = m.get("content")
-        csize = _content_size(content)
-        cfmt  = "null" if content is None else ("list" if isinstance(content, list) else "str")
-        tc    = f"+tc{len(m['tool_calls'])}" if m.get("tool_calls") else ""
-        parts.append(f"{role}({cfmt},{csize}c{tc})")
-        total_chars += csize
-    log.info(
-        "req#%d %s: %d msgs, ~%d chars total | %s",
-        req_id, label, len(messages), total_chars, " | ".join(parts),
-    )
+        csz  = _content_size(m.get("content"))
+        rcsz = len(str(m.get("reasoning_content") or ""))
+        fmt  = "null" if m.get("content") is None else ("list" if isinstance(m.get("content"), list) else "str")
+        tc   = f"+tc{len(m['tool_calls'])}" if m.get("tool_calls") else ""
+        rc   = f"+RC{rcsz}" if rcsz else ""
+        parts.append(f"{role}({fmt},{csz}{tc}{rc})")
+        total += csz + rcsz
+    tool_chars = sum(len(str((t.get("function") or t).get("description") or "")) for t in tools if isinstance(t, dict))
+    log.info("req#%d %s: %d msgs %d tools ~%dc+%dc(tools) | %s",
+             req_id, label, len(msgs), len(tools), total, tool_chars, " ".join(parts))
 
 
-# ── Request preparation ────────────────────────────────────────────────────────
+# ── Prepare request ────────────────────────────────────────────────────────────
 
-def _prepare_request(body_bytes: bytes, req_id: int):
-    """
-    Prepare every chat-completions request before forwarding:
-      1. Parse JSON.
-      2. Log diagnostic snapshot (role/format/size per message).
-      3. Inject/cap max_tokens.
-      4. Pre-flight trim if body > PRE_TRIM_BYTES.
-    """
+def _prepare(body_bytes, req_id):
     if not body_bytes:
-        return body_bytes, False
-
+        return body_bytes
     try:
         payload = json.loads(body_bytes.decode("utf-8", errors="replace"))
     except Exception:
-        return body_bytes, False
-
+        return body_bytes
     if "messages" not in payload:
-        return body_bytes, False
+        return body_bytes
 
-    # Log snapshot BEFORE any modification
-    _log_request_snapshot(payload, req_id, "incoming")
+    # Inject reasoning_effort=none to disable thinking (qwen3-32b and other CoT models)
+    if payload.get("reasoning_effort") != "none":
+        payload["reasoning_effort"] = "none"
+        log.info("req#%d: injected reasoning_effort=none (thinking disabled)", req_id)
 
-    modified = False
-
-    # 1. Inject / cap max_tokens
-    current_mt = payload.get("max_tokens")
-    if current_mt is None or (isinstance(current_mt, int) and current_mt > MAX_OUTPUT_TOKENS):
+    # Cap max_tokens
+    mt = payload.get("max_tokens")
+    if mt is None or (isinstance(mt, int) and mt > MAX_OUTPUT_TOKENS):
         payload["max_tokens"] = MAX_OUTPUT_TOKENS
-        modified = True
-        log.info("req#%d: max_tokens %s→%d", req_id, repr(current_mt), MAX_OUTPUT_TOKENS)
+        log.info("req#%d: max_tokens %s->%d", req_id, repr(mt), MAX_OUTPUT_TOKENS)
 
-    # 2. Pre-flight trim
-    body_after_mt = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    if len(body_after_mt) > PRE_TRIM_BYTES:
-        log.warning(
-            "req#%d: pre-flight body %d bytes > %d — trimming (pass=0)",
-            req_id, len(body_after_mt), PRE_TRIM_BYTES,
-        )
-        payload  = _trim_payload(payload, trim_pass=0, req_id=req_id)
-        modified = True
-        _log_request_snapshot(payload, req_id, "after-preflight")
+    _snapshot(payload, req_id, "incoming")
 
-    if not modified:
-        return body_bytes, False
+    # Always run pass-0: strips reasoning_content + trims tools descriptions
+    payload = _trim(payload, 0, req_id)
 
-    return json.dumps(payload, ensure_ascii=False).encode("utf-8"), True
+    body_out = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    if len(body_out) > PRE_TRIM_BYTES:
+        log.warning("req#%d: body still %d bytes after pass-0", req_id, len(body_out))
+        _snapshot(payload, req_id, "after-pass0")
+    return body_out
 
 
-# ── Request handler ────────────────────────────────────────────────────────────
+# ── Handler ────────────────────────────────────────────────────────────────────
 
 class GroqProxyHandler(BaseHTTPRequestHandler):
-    server_version = "HermesGroqProxy/4.0"
+    server_version = "HermesGroqProxy/5.0"
 
     def log_message(self, fmt, *args):
-        pass  # suppress default httpd noise
+        pass
+
+    def _is_too_large(self, status, body_text):
+        if status == 413:
+            return True
+        if status in (400, 422):
+            bl = body_text.lower()
+            return any(p in bl for p in _SOFT_413_PATTERNS)
+        return False
 
     def _forward(self):
-        global _request_count
+        global _req_count
         with _req_lock:
-            _request_count += 1
-            req_id = _request_count
+            _req_count += 1
+            req_id = _req_count
 
-        length       = int(self.headers.get("Content-Length", 0) or 0)
-        raw_body     = self.rfile.read(length) if length > 0 else None
-        content_type = self.headers.get("Content-Type", "application/json")
-        is_chat      = "/chat/completions" in self.path
+        length   = int(self.headers.get("Content-Length", 0) or 0)
+        raw_body = self.rfile.read(length) if length > 0 else None
+        ctype    = self.headers.get("Content-Type", "application/json")
+        is_chat  = "/chat/completions" in self.path
 
-        fwd_headers = {
-            k: v for k, v in self.headers.items()
-            if k.lower() not in _HOP_BY_HOP
-        }
-        fwd_headers["Content-Type"] = content_type
-        fwd_headers["User-Agent"]   = "hermes-groq-proxy/4.0"
+        fwd = {k: v for k, v in self.headers.items() if k.lower() not in _HOP_BY_HOP}
+        fwd["Content-Type"] = ctype
+        fwd["User-Agent"]   = "hermes-groq-proxy/5.0"
+        target = GROQ_BASE + self.path
 
-        target_url = GROQ_BASE + self.path
+        current_body = _prepare(raw_body, req_id) if (is_chat and raw_body) else raw_body
 
-        # Prepare (diagnostic log + max_tokens + optional pre-flight trim)
-        if is_chat and raw_body:
-            current_body, was_prepared = _prepare_request(raw_body, req_id)
-            if was_prepared:
-                log.info("req#%d: prepared body %d→%d bytes", req_id, len(raw_body), len(current_body))
-        else:
-            current_body = raw_body
-
-        # Outer loop: reactive trim passes (0 = as-prepared, 1-3 = after 413)
         for trim_pass in range(MAX_TRIM_PASSES + 1):
             if trim_pass > 0:
-                log.warning("req#%d: 413 received — reactive trim pass %d/%d", req_id, trim_pass, MAX_TRIM_PASSES)
+                log.warning("req#%d: too-large -> reactive trim pass %d/%d", req_id, trim_pass, MAX_TRIM_PASSES)
                 if is_chat and current_body:
                     try:
-                        payload      = json.loads(current_body.decode("utf-8", errors="replace"))
-                        payload      = _trim_payload(payload, trim_pass=trim_pass, req_id=req_id)
-                        current_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-                        _log_request_snapshot(payload, req_id, f"after-reactive-trim-{trim_pass}")
-                        log.info("req#%d: reactive trim pass %d: body now %d bytes", req_id, trim_pass, len(current_body))
-                    except Exception as exc:
-                        log.warning("req#%d: reactive trim parse error: %s", req_id, exc)
-                        self._send_error(413, "Payload too large — trim parse failed")
+                        p            = json.loads(current_body.decode("utf-8", errors="replace"))
+                        p            = _trim(p, trim_pass, req_id)
+                        current_body = json.dumps(p, ensure_ascii=False).encode("utf-8")
+                        _snapshot(p, req_id, f"after-trim{trim_pass}")
+                        log.info("req#%d: body now %d bytes", req_id, len(current_body))
+                    except Exception as e:
+                        log.warning("req#%d: trim error: %s", req_id, e)
+                        self._err(413, "Payload too large - trim failed")
                         return
                 else:
-                    self._send_error(413, "Request payload too large — not a chat request or empty body")
+                    self._err(413, "Cannot trim non-chat or empty body")
                     return
 
-            # Inner loop: key rotation (handles 429)
-            max_tries = len(_keys)
-            got_413   = False
-
-            for attempt in range(max_tries):
-                api_key  = _next_key()
-                key_hint = f"{api_key[:8]}...{api_key[-4:]}"
-                fwd_headers["Authorization"]  = f"Bearer {api_key}"
-                fwd_headers["Content-Length"] = str(len(current_body) if current_body else 0)
-
-                log.info(
-                    "req#%d %s %s key=%s trim=%d attempt=%d/%d body=%db",
-                    req_id, self.command, self.path, key_hint,
-                    trim_pass, attempt + 1, max_tries,
-                    len(current_body) if current_body else 0,
-                )
-
+            too_large = False
+            for attempt in range(len(_keys)):
+                key  = _next_key()
+                hint = f"{key[:8]}...{key[-4:]}"
+                fwd["Authorization"]  = f"Bearer {key}"
+                fwd["Content-Length"] = str(len(current_body) if current_body else 0)
+                log.info("req#%d %s key=%s pass=%d attempt=%d body=%db",
+                         req_id, self.path, hint, trim_pass, attempt+1,
+                         len(current_body) if current_body else 0)
                 try:
                     resp = requests.request(
-                        method  = self.command,
-                        url     = target_url,
-                        headers = fwd_headers,
-                        data    = current_body,
-                        stream  = True,
-                        timeout = 180,
+                        method=self.command, url=target, headers=fwd,
+                        data=current_body, stream=True, timeout=180,
                     )
-                except requests.RequestException as exc:
-                    log.warning("req#%d upstream error: %s", req_id, exc)
-                    if attempt < max_tries - 1:
+                except requests.RequestException as e:
+                    log.warning("req#%d upstream: %s", req_id, e)
+                    if attempt < len(_keys) - 1:
                         continue
-                    self._send_error(503, f"Upstream connection failed: {exc}")
+                    self._err(503, f"Upstream failed: {e}")
                     return
 
-                if resp.status_code == 429 and attempt < max_tries - 1:
-                    log.warning("req#%d: 429 on key %s — rotating", req_id, key_hint)
+                if resp.status_code == 429 and attempt < len(_keys) - 1:
+                    log.warning("req#%d: 429 on %s - rotating", req_id, hint)
                     try:
                         resp.close()
                     except Exception:
                         pass
                     continue
 
-                if resp.status_code == 413:
+                if resp.status_code in (400, 413, 422):
                     try:
                         err_body = b"".join(resp.iter_content(8192)).decode("utf-8", errors="replace")
-                        log.warning("req#%d: Groq 413 body: %s", req_id, err_body[:500])
+                        log.warning("req#%d: Groq %d: %s", req_id, resp.status_code, err_body[:800])
                     except Exception:
-                        pass
+                        err_body = ""
                     try:
                         resp.close()
                     except Exception:
                         pass
-                    got_413 = True
-                    break  # exit key loop → next trim pass
+                    if self._is_too_large(resp.status_code, err_body):
+                        too_large = True
+                        break
+                    self._raw(resp.status_code, err_body.encode("utf-8"))
+                    return
 
-                # Success or other error code — stream back
-                self._stream_response(resp, req_id)
+                self._stream(resp, req_id)
                 return
 
-            if not got_413:
-                self._send_error(429, "All API keys exhausted after rate-limit retries")
+            if not too_large:
+                self._err(429, "All keys exhausted")
                 return
 
-        # All trim passes exhausted
-        log.error(
-            "req#%d: all %d trim passes exhausted — returning 413. "
-            "Check snapshot logs above for content format/size.",
-            req_id, MAX_TRIM_PASSES,
-        )
-        self._send_error(
-            413,
-            f"Request too large after {MAX_TRIM_PASSES} trim passes. "
-            f"Check /tmp/groq-proxy.log for message size diagnostics.",
-        )
+        log.error("req#%d: all %d passes exhausted - 413", req_id, MAX_TRIM_PASSES)
+        self._err(413, f"Too large after {MAX_TRIM_PASSES} passes - see /tmp/groq-proxy.log")
 
-    def _stream_response(self, resp, req_id):
+    def _stream(self, resp, req_id):
         self.send_response(resp.status_code)
         for k, v in resp.headers.items():
             if k.lower() in ("transfer-encoding", "connection", "keep-alive", "content-encoding"):
@@ -484,48 +449,41 @@ class GroqProxyHandler(BaseHTTPRequestHandler):
             self.send_header(k, v)
         self.send_header("Connection", "close")
         self.end_headers()
-
-        bytes_sent = 0
+        n = 0
         try:
             for chunk in resp.iter_content(chunk_size=512):
                 if chunk:
                     self.wfile.write(chunk)
                     self.wfile.flush()
-                    bytes_sent += len(chunk)
+                    n += len(chunk)
         except (BrokenPipeError, ConnectionResetError):
-            log.debug("req#%d: client disconnected mid-stream", req_id)
+            pass
         finally:
             try:
                 resp.close()
             except Exception:
                 pass
+        log.info("req#%d: HTTP %d %d bytes", req_id, resp.status_code, n)
 
-        log.info("req#%d: done HTTP %d (%d bytes)", req_id, resp.status_code, bytes_sent)
-
-    def _send_error(self, code, msg):
-        body = json.dumps({"error": {"message": msg, "type": "proxy_error"}}).encode()
+    def _raw(self, code, body):
         self.send_response(code)
-        self.send_header("Content-Type",   "application/json")
+        self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Connection",     "close")
+        self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
+
+    def _err(self, code, msg):
+        self._raw(code, json.dumps({"error": {"message": msg, "type": "proxy_error"}}).encode())
 
     do_GET = do_POST = do_DELETE = do_PUT = do_PATCH = _forward
 
 
-# ── Threaded server ────────────────────────────────────────────────────────────
-
 class ThreadedHTTPServer(HTTPServer):
     def process_request(self, request, client_address):
-        t = threading.Thread(
-            target = self._handle_thread,
-            args   = (request, client_address),
-            daemon = True,
-        )
-        t.start()
+        threading.Thread(target=self._ht, args=(request, client_address), daemon=True).start()
 
-    def _handle_thread(self, request, client_address):
+    def _ht(self, request, client_address):
         try:
             self.finish_request(request, client_address)
         except Exception:
@@ -534,28 +492,24 @@ class ThreadedHTTPServer(HTTPServer):
             self.shutdown_request(request)
 
 
-# ── Entry point ────────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
     log.info("=" * 65)
-    log.info("Groq API Key Rotation Proxy  v4 — Context Guardian Edition")
-    log.info("Listening  : %s:%d", PROXY_HOST, PROXY_PORT)
-    log.info("Target     : %s", GROQ_BASE)
-    log.info("Keys       : %d loaded (round-robin)", len(_keys))
+    log.info("Groq Proxy v5 -- 413 Eradicator Edition")
+    log.info("Listening : %s:%d -> %s", PROXY_HOST, PROXY_PORT, GROQ_BASE)
+    log.info("Keys      : %d loaded", len(_keys))
     for i, k in enumerate(_keys, 1):
         log.info("  [%d] %s...%s", i, k[:8], k[-4:])
-    log.info("Protections:")
-    log.info("  max_tokens cap  : %d", MAX_OUTPUT_TOKENS)
-    log.info("  pre-flight trim : body > %d bytes", PRE_TRIM_BYTES)
-    log.info("  per-msg limit   : %d chars (string OR list format)", MAX_MSG_CHARS)
-    log.info("  args limit      : %d chars per tool_call", MAX_ARGS_CHARS)
-    log.info("  sys limit/pass  : %s", MAX_SYS_CHARS_BY_PASS)
-    log.info("  keep msgs/pass  : %s", KEEP_MSGS_BY_PASS)
-    log.info("  reactive passes : %d", MAX_TRIM_PASSES)
-    log.info("  content formats : string + list[{type,text}] + None")
+    log.info("Fixes (v5 vs v4):")
+    log.info("  reasoning_effort=none  -> thinking/CoT disabled for all requests")
+    log.info("  reasoning_content strip -> stored CoT tokens removed from history")
+    log.info("  tools trimmed          -> descriptions capped, excess tools dropped")
+    log.info("  soft-413 detect        -> Groq 400 context errors trigger trim+retry")
+    log.info("Config:")
+    log.info("  pre-flight    : body > %d bytes", PRE_TRIM_BYTES)
+    log.info("  per-msg       : %d chars", MAX_MSG_CHARS)
+    log.info("  tool desc     : %d chars", MAX_TOOL_DESC_CHARS)
+    log.info("  sys/pass      : %s", MAX_SYS_CHARS_BY_PASS)
+    log.info("  msgs/pass     : %s", KEEP_MSGS_BY_PASS)
+    log.info("  tools/pass    : %s", KEEP_TOOLS_BY_PASS)
     log.info("=" * 65)
-    server = ThreadedHTTPServer((PROXY_HOST, PROXY_PORT), GroqProxyHandler)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        log.info("Proxy shutting down.")
+    ThreadedHTTPServer((PROXY_HOST, PROXY_PORT), GroqProxyHandler).serve_forever()
