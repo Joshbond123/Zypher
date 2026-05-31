@@ -26,6 +26,7 @@ on:
 
 concurrency:
   group: zypher-singleton
+  cancel-in-progress: true
 
 jobs:
   run-agent:
