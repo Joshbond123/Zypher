@@ -238,12 +238,13 @@ jobs:
             tar xzf "$R/skills.tar.gz" -C ~/.hermes/skills/ 2>/dev/null \
             && echo "restored: skills" || true
           python3 scripts/hermes_bootstrap_memory.py || true
-          if [ ! -s ~/.hermes/SOUL.md ]; then
+          # ROOT CAUSE FIX (May 2026): Always overwrite SOUL.md from AGENTS.md.
+            # Previously SOUL.md was only written when missing. A stale/bad SOUL.md
+            # stored in Supabase/artifact (with Rule #8 AGENTS.md self-reference +
+            # "confirm scope" rule) would persist forever, ignoring AGENTS.md fixes.
+            # AGENTS.md is the single source of truth for agent identity and rules.
             cp AGENTS.md ~/.hermes/SOUL.md
-            echo "SOUL.md: initialized from AGENTS.md (no prior SOUL.md in artifact)"
-          else
-            echo "SOUL.md: retained from artifact/Supabase ($(wc -c < ~/.hermes/SOUL.md)b)"
-          fi
+            echo "SOUL.md: refreshed from AGENTS.md ($(wc -c < ~/.hermes/SOUL.md)b) — always-overwrite policy"
           echo "=== Memory layout after bootstrap ==="
           find ~/.hermes -maxdepth 2 -type f | sort
 
