@@ -2,71 +2,54 @@
 """Write Hermes config.yaml and .env for Groq API inference via local key-rotation proxy.
 
 Architecture:
-  Hermes → local groq proxy (127.0.0.1:18765) → Groq API (qwen/qwen3-32b)
+  Hermes -> local groq proxy (127.0.0.1:18765) -> Groq API (llama-3.3-70b-versatile)
 
-The proxy (scripts/groq_key_proxy.py) rotates GROQ_KEY_1..N on every request,
-handles 429 rate-limit retries, and — critically — intercepts 413 responses to
-progressively trim the messages array before they ever reach Hermes as an error.
+v5 MODEL SWITCH (2026-05):
+  Changed from qwen/qwen3-32b -> llama-3.3-70b-versatile.
 
-Why Groq vs local Ollama:
-  Local 9B model at 65536 context: ~0.5 tok/s → 5-30 min responses → watchdog kills.
-  Local 3B model at 65536 context: ~4-8 tok/s → 15-60 sec responses → borderline.
-  Groq qwen3-32b: ~300-500 tok/s → 1-5 sec responses → instant from user perspective.
+  WHY: qwen3-32b is a THINKING model. Every response includes a reasoning chain
+  stored in reasoning_content (5K-30K tokens per turn). These tokens accumulated
+  in Hermes conversation history, growing the payload by 50-200 KB after just
+  3-4 turns. Even with proxy truncation of `content`, `reasoning_content` passed
+  through untouched in v4.
 
-Context configuration (FIX 2026-05):
-  - qwen/qwen3-32b has 131072 token context window on Groq.
-  - PREVIOUSLY: context_length was set to 131072. Hermes only triggers compression at
-    threshold=0.75 → ~98K tokens used. By that point, the payload is already so large
-    that the compression API call itself returns 413, locking into the error loop:
-      413 → compression attempt → 413 → fallback → 413 → session reset
-  - FIX: effective context_length reduced to 65536 (still satisfies Hermes >= 64K check).
-    Compression threshold lowered to 0.45 → fires at ~29K tokens (~30% of model max).
-    This ensures compression always happens well before the Groq API payload limit.
-  - The proxy (groq_key_proxy.py) provides a second line of defense: if a request ever
-    reaches 413, the proxy trims the messages array and retries transparently.
+  llama-3.3-70b-versatile:
+    - 131,072 token context window (same as qwen3-32b on Groq)
+    - NO thinking/reasoning mode -> responses are concise and focused
+    - ~400-600 tok/s on Groq -> still fast
+    - Does not produce reasoning_content -> conversation history stays small
+    - Well-tested on tool-use and agentic tasks
 
-Memory injection limits (FIX 2026-05):
-  - memory_char_limit reduced from 2200 → 1000 chars
-  - user_char_limit reduced from 1375 → 700 chars
-  - These are injected into every single request; smaller = fewer baseline tokens.
+  The proxy (v5) also injects reasoning_effort="none" as a safety net in case
+  the model is ever switched back to a thinking model.
 
-web_fetch limit (FIX 2026-05):
-  - maxChars reduced from 60000 → 15000 chars (~3750 tokens).
-  - A single web_fetch at 60K chars = ~15K tokens dumped into conversation history.
-  - At 65K effective context, a few web fetches fill the entire window instantly.
+Context configuration (unchanged from v4):
+  - context_length: 65536 (effective; model max is 131072)
+  - Compression threshold: 0.35 -> fires at ~22K tokens
+  - 65536 is the minimum that satisfies Hermes >= 64K startup check
+
+Memory limits (tightened for v5):
+  - memory_char_limit: 600 (was 800)
+  - user_char_limit: 400 (was 600)
 """
 import os
 import sys
 
 HOME = os.path.expanduser("~")
-HD = os.path.join(HOME, ".hermes")
+HD   = os.path.join(HOME, ".hermes")
 MEMDIR = os.path.join(HD, "memories")
-WS = os.path.join(HD, "workspace")
-SK = os.path.join(HD, "skills")
+WS   = os.path.join(HD, "workspace")
+SK   = os.path.join(HD, "skills")
 
 PROVIDER_NAME = "local-groq"
-PROXY_PORT = os.environ.get("GROQ_PROXY_PORT", "18765")
+PROXY_PORT    = os.environ.get("GROQ_PROXY_PORT", "18765")
 LOCAL_BASE_URL = f"http://127.0.0.1:{PROXY_PORT}/v1"
-PRIMARY_MODEL = "qwen/qwen3-32b"
 
-# Effective context window exposed to Hermes.
-#
-# WHY 65536 NOT 131072:
-#   The Groq API supports 131072 tokens for qwen3-32b, but setting Hermes to that
-#   limit means it only compresses at 75% = ~98K tokens. At that token count the
-#   payload JSON is large enough that Groq rejects the compression API call with 413,
-#   breaking the entire compression + fallback loop. Setting to 65536 keeps Hermes
-#   in safe territory: compression fires at threshold * 65536 — well within the
-#   Groq payload limit for all key tiers.
-#
-# NOTE: 65536 is the MINIMUM value that satisfies Hermes's startup check (>= 64K).
-# Do NOT lower this further.
+# v5: switched from qwen/qwen3-32b (thinking) to llama-3.3-70b-versatile (no thinking)
+PRIMARY_MODEL   = "llama-3.3-70b-versatile"
 PRIMARY_CONTEXT = 65536
-
-# Cloud inference is fast — use a reasonable timeout.
-# 120s is generous even for a 1000-token response at 300 tok/s.
 PROVIDER_TIMEOUT = 120
-LOCAL_API_KEY = "groq-proxy"
+LOCAL_API_KEY   = "groq-proxy"
 
 
 def ensure_dirs():
@@ -78,18 +61,16 @@ def write_config():
     ensure_dirs()
     tok = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 
-    cfg = """# ~/.hermes/config.yaml - Zypher Agent (auto-generated by hermes_setup.py)
+    cfg = """# ~/.hermes/config.yaml - Zypher Agent (auto-generated by hermes_setup.py v5)
 # Hermes v0.15.x
 #
 # PRIMARY:  {primary}
 # RUNTIME:  Groq API via local key-rotation proxy (groq_key_proxy.py)
-# ENDPOINT: {base_url}  →  https://api.groq.com/openai/v1
+# ENDPOINT: {base_url}  ->  https://api.groq.com/openai/v1
 # CONTEXT:  {context} tokens (effective limit; model max is 131072)
-# SPEED:    ~300-500 tok/s (cloud GPU) → 1-5 second responses
 #
-# FIX (2026-05): context_length reduced from 131072 → 65536 to prevent 413 errors.
-# Compression threshold reduced from 0.75 → 0.45 to fire well before payload limits.
-# See hermes_setup.py header for full root-cause analysis.
+# v5 CHANGE: switched from qwen/qwen3-32b (thinking model, causes 413 via
+# reasoning_content bloat) to llama-3.3-70b-versatile (no thinking mode).
 
 name: Zypher
 
@@ -106,7 +87,7 @@ model:
   default: {primary}
   context_length: {context}
   ollama_num_ctx: {context}
-  temperature: 0.3
+  temperature: 0.7
   streaming: true
 
 fallback_model:
@@ -130,13 +111,13 @@ approvals:
 
 compression:
   enabled: true
-  threshold: 0.40
+  threshold: 0.35
 
 memory:
   memory_enabled: true
   user_profile_enabled: true
-  memory_char_limit: 800
-  user_char_limit: 600
+  memory_char_limit: 600
+  user_char_limit: 400
 
 gateway:
   platforms:
@@ -156,7 +137,7 @@ tools:
     enabled: true
   web_fetch:
     enabled: true
-    maxChars: 15000
+    maxChars: 12000
   browser:
     enabled: true
     headless: true
@@ -176,31 +157,26 @@ tools:
     with open(p, "w") as fh:
         fh.write(cfg)
     print("config.yaml written -> {}".format(p))
+    print("  model              : {}  (v5: non-thinking)".format(PRIMARY_MODEL))
     print("  provider           : {}".format(PROVIDER_NAME))
     print("  base_url           : {}".format(LOCAL_BASE_URL))
-    print("  primary model      : {}".format(PRIMARY_MODEL))
     print("  context_length     : {:,} (effective; model max 131072)".format(PRIMARY_CONTEXT))
-    print("  ollama_num_ctx     : {:,} (satisfies Hermes >= 64K check)".format(PRIMARY_CONTEXT))
-    print("  compression thresh : 0.45 ({:,} tokens)".format(int(PRIMARY_CONTEXT * 0.45)))
-    print("  memory_char_limit  : 1000 chars")
-    print("  user_char_limit    : 700 chars")
-    print("  web_fetch maxChars : 15000 chars (~3750 tokens)")
+    print("  compression thresh : 0.35 ({:,} tokens)".format(int(PRIMARY_CONTEXT * 0.35)))
+    print("  memory_char_limit  : 600 chars")
+    print("  user_char_limit    : 400 chars")
+    print("  web_fetch maxChars : 12000 chars")
     print("  request_timeout    : {}s".format(PROVIDER_TIMEOUT))
-    print("  max_turns          : 200")
-    print("  api_max_retries    : 3")
-    print("  streaming          : true")
 
 
 def write_env():
     ensure_dirs()
-    tok = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-    tav = os.environ.get("TAVILY_API_KEY", "") or os.environ.get("TAVILY_API_KEY_2", "")
+    tok    = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    tav    = os.environ.get("TAVILY_API_KEY", "") or os.environ.get("TAVILY_API_KEY_2", "")
     sb_url = os.environ.get("SUPABASE_URL", "")
     sb_key = os.environ.get("SUPABASE_SERVICE_KEY", "")
-    gh = os.environ.get("GITHUB_TOKEN", "")
-    uid = os.environ.get("TELEGRAM_USER_ID", "6317345496")
+    gh     = os.environ.get("GITHUB_TOKEN", "")
+    uid    = os.environ.get("TELEGRAM_USER_ID", "6317345496")
 
-    # Collect Groq keys for env file
     groq_keys = []
     for i in range(1, 20):
         k = os.environ.get(f"GROQ_KEY_{i}", "").strip()
@@ -234,10 +210,8 @@ def write_env():
         fh.write(env_content)
     os.chmod(p, 0o600)
     print("~/.hermes/.env written")
-    print("  OPENAI_API_KEY={} (proxy placeholder)".format(LOCAL_API_KEY))
     print("  HERMES_MODEL_NAME={}".format(PRIMARY_MODEL))
     print("  GROQ keys embedded: {}".format(len(groq_keys)))
-    print("  HERMES_GATEWAY_SESSION=1")
 
 
 if __name__ == "__main__":
@@ -246,4 +220,4 @@ if __name__ == "__main__":
         write_config()
     if cmd in ("write-env", "all"):
         write_env()
-    print("hermes_setup.py complete")
+    print("hermes_setup.py v5 complete")
