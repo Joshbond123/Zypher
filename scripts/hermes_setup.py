@@ -48,7 +48,7 @@ LOCAL_BASE_URL = f"http://127.0.0.1:{PROXY_PORT}/v1"
 # v5: switched from qwen/qwen3-32b (thinking) to llama-3.3-70b-versatile (no thinking)
 PRIMARY_MODEL   = "llama-3.3-70b-versatile"
 FALLBACK_MODEL  = "llama-3.1-8b-instant"
-PRIMARY_CONTEXT = 16384
+PRIMARY_CONTEXT = 131072
 PROVIDER_TIMEOUT = 120
 LOCAL_API_KEY   = "groq-proxy"
 
@@ -72,6 +72,12 @@ def write_config():
 #
 # v5 CHANGE: switched from qwen/qwen3-32b (thinking model, causes 413 via
 # reasoning_content bloat) to llama-3.3-70b-versatile (no thinking mode).
+#
+# v6 FIX: context_length raised from 16384 to 131072.
+#   Hermes Agent v0.15.x requires context_length >= 64,000. Setting it to
+#   16384 caused ValueError("...below the minimum 64,000 required by Hermes
+#   Agent") on every Telegram message. The groq_key_proxy already enforces
+#   an 18KB byte budget per Groq request — that is the real TPM guard.
 
 name: Zypher
 
@@ -116,8 +122,8 @@ approvals:
 
 compression:
   enabled: true
-  threshold: 0.20
-  target_ratio: 0.15
+  threshold: 0.05
+  target_ratio: 0.04
   protect_last_n: 6
 
 memory:
@@ -169,8 +175,8 @@ tools:
     print("  fallback           : {}".format(FALLBACK_MODEL))
     print("  provider           : {}".format(PROVIDER_NAME))
     print("  base_url           : {}".format(LOCAL_BASE_URL))
-    print("  context_length     : {:,} (effective request budget; model max 131072)".format(PRIMARY_CONTEXT))
-    print("  compression thresh : 0.20 ({:,} tokens)".format(int(PRIMARY_CONTEXT * 0.20)))
+    print("  context_length     : {:,} (model actual max; proxy enforces 18KB/request)".format(PRIMARY_CONTEXT))
+    print("  compression thresh : 0.05 ({:,} tokens — fires before proxy trim)".format(int(PRIMARY_CONTEXT * 0.05)))
     print("  memory_char_limit  : 400 chars")
     print("  user_char_limit    : 300 chars")
     print("  web_fetch maxChars : 3000 chars")
