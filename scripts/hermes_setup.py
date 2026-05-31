@@ -2,11 +2,11 @@
 """Write Hermes config.yaml and .env for local Qwen GGUF inference.
 
 Hermes talks to a local Ollama OpenAI-compatible server. The GitHub Actions
-workflow downloads Qwen3.5-9B-Uncensored-Q4_K_M.gguf, creates an Ollama model,
+workflow downloads Qwen2.5-3B-Instruct-Q4_K_M.gguf, creates an Ollama model,
 and exposes it to Hermes at http://127.0.0.1:7860/v1.
 
 ROOT CAUSE FIX (2026-05-30):
-  PRIMARY_CONTEXT was hardcoded to 65536. This caused the Qwen3.5-9B model to
+  PRIMARY_CONTEXT was hardcoded to 65536. The Qwen2.5-3B model handles this
   pre-allocate a ~7GB KV cache (65536 tokens * ~112KB/token), consuming nearly
   all available RAM on GitHub Actions (16GB). The result:
     - Inference for 8 tokens: 43 seconds (vs 13s with 4096 context)
@@ -44,7 +44,7 @@ PRIMARY_MODEL = "Qwen2.5-3B-Instruct-Q4_K_M"
 PRIMARY_CONTEXT = 65536
 
 # Increase provider timeout to 1800s to handle slower CPU inference at 65536 context.
-# At 65536 context, Qwen3.5-9B generates ~0.5-2 tok/s on CPU.
+# At 65536 context, Qwen2.5-3B generates ~4-8 tok/s on CPU (vs 0.5-2 for 9B).
 # A 200-token response can take 100-400 seconds — well within 1800s.
 PROVIDER_TIMEOUT = 1800
 LOCAL_API_KEY = "local-qwen"
