@@ -32,25 +32,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 240
     env:
-      QWEN_MODEL_REPO: bartowski/Qwen2.5-3B-Instruct-GGUF
-      QWEN_MODEL_FILE: Qwen2.5-3B-Instruct-Q4_K_M.gguf
-      HERMES_MODEL_NAME: Qwen2.5-3B-Instruct-Q4_K_M
-      LOCAL_MODEL_PORT: "7860"
-      # ROOT CAUSE FIX: Reduced from 65536 to 4096.
-      # 65536-token context pre-allocates ~2.5GB KV cache on a 3B model,
-      # consuming nearly all of the 16GB GitHub Actions runner RAM.
-      # Result: 43s for 8 tokens, 15-35 min for a full response, 600s
-      # provider timeout fires, "primary model failed", fallback also
-      # times out (same model), watchdog kills at 360s of log silence.
-      # 4096 context = ~450MB KV cache, 30-120s responses -- fully within
-      # the 600s provider timeout and 1800s watchdog threshold.
-      LOCAL_CTX_SIZE: "65536"
-      OPENAI_API_KEY: local-qwen
-      OPENROUTER_API_KEY: local-qwen
-      # Prevent Ollama from serving concurrent requests that would exhaust RAM.
-      OLLAMA_NUM_PARALLEL: "1"
-      OLLAMA_FLASH_ATTENTION: "1"
-      OLLAMA_MAX_LOADED_MODELS: "1"
+      GROQ_MODEL_NAME: "qwen/qwen3-32b"
+      GROQ_PROXY_PORT: "18765"
+      GROQ_PROXY_URL: "http://127.0.0.1:18765/v1"
+      OPENAI_API_KEY: groq-proxy
+      OPENROUTER_API_KEY: groq-proxy
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -142,69 +128,37 @@ jobs:
       - name: Install Hermes Agent
         run: pip install hermes-agent --upgrade -q
 
-      - name: Install Ollama runtime
+      - name: Start Groq key-rotation proxy
+        env:
+          GROQ_KEY_1: ${{ secrets.GROQ_KEY_1 }}
+          GROQ_KEY_2: ${{ secrets.GROQ_KEY_2 }}
+          GROQ_KEY_3: ${{ secrets.GROQ_KEY_3 }}
+          GROQ_KEY_4: ${{ secrets.GROQ_KEY_4 }}
+          GROQ_KEY_5: ${{ secrets.GROQ_KEY_5 }}
+          GROQ_PROXY_PORT: ${{ env.GROQ_PROXY_PORT }}
         run: |
           set -euo pipefail
-          curl -fsSL https://ollama.com/install.sh | sh
-          ollama --version
-
-      - name: Download Qwen3.5 GGUF model
-        run: |
-          set -euo pipefail
-          mkdir -p /opt/models/qwen
-          hf download "$QWEN_MODEL_REPO" "$QWEN_MODEL_FILE" \
-            --local-dir /opt/models/qwen
-          mv "/opt/models/qwen/$QWEN_MODEL_FILE" /opt/models/qwen/model.gguf
-          test -s /opt/models/qwen/model.gguf
-          du -h /opt/models/qwen/model.gguf
-          df -h
-
-      - name: Start local Qwen Ollama OpenAI-compatible server
-        run: |
-          set -euo pipefail
-          export OLLAMA_HOST="127.0.0.1:${LOCAL_MODEL_PORT}"
-          export OLLAMA_MODELS="/opt/ollama-models"
-          # Persist these for the keep-alive step's restart_ollama() function
-          echo "OLLAMA_HOST=127.0.0.1:${LOCAL_MODEL_PORT}" >> $GITHUB_ENV
-          echo "OLLAMA_MODELS=/opt/ollama-models" >> $GITHUB_ENV
-          mkdir -p "$OLLAMA_MODELS"
-          nohup ollama serve > /tmp/ollama.log 2>&1 &
-          OLLAMA_PID=$!
-          echo "OLLAMA_PID=$OLLAMA_PID" >> $GITHUB_ENV
-          echo "Ollama PID=$OLLAMA_PID"
-          SERVER_READY=0
-          for i in $(seq 1 90); do
-            sleep 2
-            if curl -sf "http://${OLLAMA_HOST}/api/version" -o /dev/null 2>/dev/null; then
-              echo "Ollama ready after $((i*2))s"
-              SERVER_READY=1
+          nohup python3 scripts/groq_key_proxy.py > /tmp/groq-proxy.log 2>&1 &
+          PROXY_PID=$!
+          echo "PROXY_PID=$PROXY_PID" >> $GITHUB_ENV
+          echo "Groq proxy PID=$PROXY_PID"
+          READY=0
+          for i in $(seq 1 30); do
+            sleep 1
+            if curl -sf "http://127.0.0.1:${GROQ_PROXY_PORT}/v1/models" \
+                -H "Authorization: Bearer groq-proxy" -o /dev/null 2>/dev/null; then
+              echo "Proxy ready after ${i}s"
+              READY=1
               break
             fi
-            if ! kill -0 "$OLLAMA_PID" 2>/dev/null; then
-              echo "FATAL: Ollama exited"
-              cat /tmp/ollama.log || true
+            if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+              echo "FATAL: Groq proxy exited unexpectedly"
+              cat /tmp/groq-proxy.log || true
               exit 1
             fi
           done
-          if [ "$SERVER_READY" -eq 0 ]; then
-            echo "FATAL: Ollama did not become ready"
-            cat /tmp/ollama.log || true
-            exit 1
-          fi
-          # Build Modelfile — 4096 context uses ~450MB KV cache vs ~7GB for 65536.
-          # num_thread 4 uses all vCPUs on the GitHub Actions runner.
-          {
-            echo 'FROM /opt/models/qwen/model.gguf'
-            echo "PARAMETER num_ctx ${LOCAL_CTX_SIZE}"
-            echo 'PARAMETER num_thread 4'
-            echo 'PARAMETER temperature 0.3'
-            echo 'PARAMETER top_p 0.9'
-          } > /opt/models/qwen/Modelfile
-          ollama create "$HERMES_MODEL_NAME" -f /opt/models/qwen/Modelfile
-          ollama list
-          curl -sf "http://${OLLAMA_HOST}/v1/models" -H "Authorization: Bearer local-qwen" | jq .
-          echo "=== Ollama startup log ==="
-          tail -120 /tmp/ollama.log || true
+          [ "$READY" -eq 1 ] || { echo "FATAL: Proxy not ready"; cat /tmp/groq-proxy.log; exit 1; }
+          echo "=== Proxy startup log ===" && cat /tmp/groq-proxy.log || true
 
       - name: Configure Hermes directories
         run: mkdir -p ~/.hermes/memories ~/.hermes/workspace ~/.hermes/skills
@@ -213,7 +167,12 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
-          LOCAL_CTX_SIZE: ${{ env.LOCAL_CTX_SIZE }}
+          GROQ_PROXY_PORT: ${{ env.GROQ_PROXY_PORT }}
+          GROQ_KEY_1: ${{ secrets.GROQ_KEY_1 }}
+          GROQ_KEY_2: ${{ secrets.GROQ_KEY_2 }}
+          GROQ_KEY_3: ${{ secrets.GROQ_KEY_3 }}
+          GROQ_KEY_4: ${{ secrets.GROQ_KEY_4 }}
+          GROQ_KEY_5: ${{ secrets.GROQ_KEY_5 }}
         run: |
           python3 scripts/hermes_setup.py write-config
           echo "=== ~/.hermes/config.yaml ===" && cat ~/.hermes/config.yaml
@@ -227,10 +186,33 @@ jobs:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           GITHUB_TOKEN: ${{ secrets.GH_PAT }}
           TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
+          GROQ_PROXY_PORT: ${{ env.GROQ_PROXY_PORT }}
+          GROQ_KEY_1: ${{ secrets.GROQ_KEY_1 }}
+          GROQ_KEY_2: ${{ secrets.GROQ_KEY_2 }}
+          GROQ_KEY_3: ${{ secrets.GROQ_KEY_3 }}
+          GROQ_KEY_4: ${{ secrets.GROQ_KEY_4 }}
+          GROQ_KEY_5: ${{ secrets.GROQ_KEY_5 }}
         run: python3 scripts/hermes_setup.py write-env
 
-      - name: Local Qwen preflight (model validation)
-        run: python3 scripts/hermes_local_model_preflight.py
+      - name: Groq API preflight (connection validation)
+        env:
+          GROQ_PROXY_PORT: ${{ env.GROQ_PROXY_PORT }}
+        run: |
+          set -euo pipefail
+          echo "Testing Groq proxy → Groq API → qwen/qwen3-32b..."
+          RESPONSE=$(curl -sf "http://127.0.0.1:${GROQ_PROXY_PORT}/v1/chat/completions" \
+            -H "Authorization: Bearer groq-proxy" \
+            -H "Content-Type: application/json" \
+            -d '{"model":"qwen/qwen3-32b","messages":[{"role":"user","content":"Reply with exactly: PREFLIGHT_OK"}],"max_tokens":10,"stream":false}' \
+            --max-time 30)
+          echo "Response: $RESPONSE"
+          echo "$RESPONSE" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+text = d['choices'][0]['message']['content'].strip()
+print(f'Model reply: {text!r}')
+print('Groq preflight PASSED')
+" || { echo 'Preflight FAILED — check proxy logs'; cat /tmp/groq-proxy.log || true; exit 1; }
 
       - name: Bootstrap memory and state
         env:
@@ -352,59 +334,46 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           HERMES_YOLO_MODE: "1"
           HERMES_GATEWAY_SESSION: "1"
+          GROQ_KEY_1: ${{ secrets.GROQ_KEY_1 }}
+          GROQ_KEY_2: ${{ secrets.GROQ_KEY_2 }}
+          GROQ_KEY_3: ${{ secrets.GROQ_KEY_3 }}
+          GROQ_KEY_4: ${{ secrets.GROQ_KEY_4 }}
+          GROQ_KEY_5: ${{ secrets.GROQ_KEY_5 }}
+          GROQ_PROXY_PORT: ${{ env.GROQ_PROXY_PORT }}
         run: |
           TIMEOUT=12000
           ELAPSED=0
           INTERVAL=20
-          # ROOT CAUSE FIX: Raised from 360s to 1800s (30 minutes).
-          #
-          # The watchdog fires when /tmp/hermes.log is not written for
-          # STALE_THRESHOLD seconds. This is valid for detecting truly frozen
-          # processes, but 360s was far too short:
-          #
-          #   With LOCAL_CTX_SIZE=65536:
-          #     - Preflight (8 tokens):  43 seconds
-          #     - Full response (300 tokens): ~1600 seconds = 26 minutes
-          #     - Watchdog fires at 360s, killing mid-inference every time
-          #
-          #   With LOCAL_CTX_SIZE=4096 (fixed):
-          #     - Preflight (8 tokens):  ~12 seconds
-          #     - Full response (300 tokens): ~75-150 seconds
-          #     - 1800s watchdog gives 12x headroom -- no false triggers
-          #
-          # 1800s (30 min) is a genuine "frozen process" signal for any
-          # reasonable task, even multi-step bash/browser work.
-          STALE_THRESHOLD=1800
+          # Groq is fast (~300-500 tok/s). If log is silent 300s something is wrong.
+          STALE_THRESHOLD=300
           WATCHDOG_RESTARTS=0
-          echo "Keep-alive: ${TIMEOUT}s total | interval=${INTERVAL}s | stale_threshold=${STALE_THRESHOLD}s"
+          echo "Keep-alive: ${TIMEOUT}s | interval=${INTERVAL}s | stale=${STALE_THRESHOLD}s"
+          echo "Provider: Groq qwen/qwen3-32b via 5-key rotation proxy :${GROQ_PROXY_PORT}"
 
-          restart_ollama() {
-            echo "Restarting local Qwen Ollama server..."
-            kill -KILL ${OLLAMA_PID:-0} 2>/dev/null || true
-            pkill -KILL -f "[o]llama serve" 2>/dev/null || true
-            sleep 2
-            export OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:${LOCAL_MODEL_PORT}}"
-            export OLLAMA_MODELS="${OLLAMA_MODELS:-/opt/ollama-models}"
-            nohup ollama serve >> /tmp/ollama.log 2>&1 &
-            OLLAMA_PID=$!
-            echo "OLLAMA_PID=$OLLAMA_PID" >> $GITHUB_ENV
-            for i in $(seq 1 90); do
-              sleep 2
-              curl -sf "http://${OLLAMA_HOST}/v1/models" \
-                -H "Authorization: Bearer local-qwen" -o /dev/null 2>/dev/null \
-                && echo "Ollama back after $((i*2))s" && return 0
+          restart_proxy() {
+            echo "Restarting Groq key-rotation proxy..."
+            kill -KILL ${PROXY_PID:-0} 2>/dev/null || true
+            pkill -KILL -f "groq_key_proxy.py" 2>/dev/null || true
+            sleep 1
+            nohup python3 scripts/groq_key_proxy.py >> /tmp/groq-proxy.log 2>&1 &
+            PROXY_PID=$!
+            echo "PROXY_PID=$PROXY_PID" >> $GITHUB_ENV
+            for i in $(seq 1 30); do
+              sleep 1
+              curl -sf "http://127.0.0.1:${GROQ_PROXY_PORT}/v1/models" \
+                -H "Authorization: Bearer groq-proxy" -o /dev/null 2>/dev/null \
+                && echo "Proxy back after ${i}s" && return 0
             done
-            echo "FATAL: Ollama failed to restart"
-            return 1
+            echo "WARN: Proxy restart timed out"; return 1
           }
 
           while [ $ELAPSED -lt $TIMEOUT ]; do
             sleep $INTERVAL
             ELAPSED=$((ELAPSED+INTERVAL))
 
-            if ! kill -0 ${OLLAMA_PID:-0} 2>/dev/null; then
-              echo "[${ELAPSED}s] Ollama died — restarting..."
-              restart_ollama || true
+            if ! kill -0 ${PROXY_PID:-0} 2>/dev/null; then
+              echo "[${ELAPSED}s] Proxy died — restarting..."
+              restart_proxy || true
             fi
 
             if ! kill -0 ${HERMES_PID:-0} 2>/dev/null; then
@@ -423,18 +392,17 @@ jobs:
                 LOG_AGE=$(( $(date +%s) - LOG_MTIME ))
                 if [ "$LOG_AGE" -gt "$STALE_THRESHOLD" ]; then
                   WATCHDOG_RESTARTS=$((WATCHDOG_RESTARTS+1))
-                  echo "[${ELAPSED}s] WATCHDOG #${WATCHDOG_RESTARTS}: Hermes frozen — log silent ${LOG_AGE}s > ${STALE_THRESHOLD}s"
+                  echo "[${ELAPSED}s] WATCHDOG #${WATCHDOG_RESTARTS}: frozen ${LOG_AGE}s > ${STALE_THRESHOLD}s"
                   curl -sf -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
                     -d "chat_id=${TELEGRAM_USER_ID}" \
-                    -d "text=Watchdog #${WATCHDOG_RESTARTS}: Zypher frozen (${LOG_AGE}s silence). Auto-restarting with local Qwen." 2>/dev/null || true
+                    -d "text=Watchdog #${WATCHDOG_RESTARTS}: Zypher frozen (${LOG_AGE}s silence). Auto-restarting with Groq qwen3-32b." 2>/dev/null || true
                   kill -KILL ${HERMES_PID:-0} 2>/dev/null || true
                   pkill -KILL -f "hermes gateway run" 2>/dev/null || true
-                  restart_ollama || true
+                  restart_proxy || true
                   python3 scripts/hermes_preapprove.py 2>/dev/null || true
                   nohup hermes gateway run --accept-hooks >> /tmp/hermes.log 2>&1 &
                   HERMES_PID=$!
                   echo "HERMES_PID=$HERMES_PID" >> $GITHUB_ENV
-                  echo "[${ELAPSED}s] WATCHDOG: Hermes restarted PID=$HERMES_PID"
                   sleep 20
                 fi
               fi
@@ -447,7 +415,6 @@ jobs:
             fi
 
             if ! kill -0 ${SIDECAR_PID:-0} 2>/dev/null; then
-              echo "[${ELAPSED}s] Sidecar died — restarting..."
               nohup python3 scripts/hermes_sidecar.py >> /tmp/hermes-sidecar.log 2>&1 &
               SIDECAR_PID=$!
               echo "SIDECAR_PID=$SIDECAR_PID" >> $GITHUB_ENV
@@ -455,13 +422,13 @@ jobs:
 
             [ $((ELAPSED % 300)) -eq 0 ] && {
               python3 scripts/hermes_sidecar.py --flush-memory 2>/dev/null || true
-              echo "[${ELAPSED}s] Memory + state.db flushed to Supabase"
+              echo "[${ELAPSED}s] Memory flushed to Supabase"
             } || true
 
             [ $((ELAPSED % 600)) -eq 0 ] && {
               echo "=== hermes.log tail ===" && tail -5 /tmp/hermes.log 2>/dev/null || true
-              echo "=== ollama.log tail ===" && tail -8 /tmp/ollama.log 2>/dev/null || true
-              echo "[${ELAPSED}s] Watchdog restarts this session: ${WATCHDOG_RESTARTS}"
+              echo "=== groq-proxy.log tail ===" && tail -5 /tmp/groq-proxy.log 2>/dev/null || true
+              echo "[${ELAPSED}s] Watchdog restarts: ${WATCHDOG_RESTARTS}"
             } || true
           done
           echo "Session rotation complete (watchdog_restarts=${WATCHDOG_RESTARTS})"
@@ -470,11 +437,11 @@ jobs:
         if: always()
         run: |
           kill -TERM ${HERMES_PID:-0}  2>/dev/null || true
-          kill -TERM ${OLLAMA_PID:-0}   2>/dev/null || true
+          kill -TERM ${PROXY_PID:-0}   2>/dev/null || true
           kill -TERM ${PAIRING_PID:-0} 2>/dev/null || true
           kill -TERM ${SIDECAR_PID:-0} 2>/dev/null || true
           pkill -TERM -f "hermes gateway run"        2>/dev/null || true
-          pkill -TERM -f "[o]llama serve"  2>/dev/null || true
+          pkill -TERM -f "groq_key_proxy.py"         2>/dev/null || true
           pkill -TERM -f "hermes_pairing_watcher.py" 2>/dev/null || true
           pkill -TERM -f "hermes_sidecar.py"         2>/dev/null || true
           for i in $(seq 1 20); do
@@ -483,9 +450,9 @@ jobs:
               || { echo "Hermes exited after ${i}s"; break; }
           done
           kill -KILL ${HERMES_PID:-0} 2>/dev/null || true
-          kill -KILL ${OLLAMA_PID:-0} 2>/dev/null || true
-          pkill -KILL -f "hermes gateway run"       2>/dev/null || true
-          pkill -KILL -f "[o]llama serve" 2>/dev/null || true
+          kill -KILL ${PROXY_PID:-0}  2>/dev/null || true
+          pkill -KILL -f "hermes gateway run"  2>/dev/null || true
+          pkill -KILL -f "groq_key_proxy.py"   2>/dev/null || true
           echo "Process cleanup complete"
 
       - name: Save memory and state (final WAL-safe flush to Supabase)
@@ -506,7 +473,7 @@ jobs:
         run: |
           curl -sf -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d "chat_id=${TELEGRAM_USER_ID}" \
-            -d "text=Zypher session rotating. Run #${GITHUB_RUN_ID} ended. Next scheduled run will start automatically with local Qwen2.5-3B GGUF." || true
+            -d "text=Zypher session rotating. Run #${GITHUB_RUN_ID} ended. Next scheduled run will start automatically with Groq qwen3-32b via 5-key rotation proxy." || true
 
       - name: Stage memory artifact
         if: always()
